@@ -28,3 +28,9 @@ CMakeSettings.json
 # Local agent work products (backups, saved training states)
 *.bak
 *.state
+
+# The local agent work products: briefings, dispatches and the audit
+# trail. They stay in the repository's HISTORY (they are the record of
+# how the work was reviewed) but they are not part of the published
+# tree: they carry the local paths of the machine that produced them.
+.agents/

@@ -44,3 +44,11 @@ build.bat test
 build.bat clean
 ```
 Удаляет все временные артефакты и директории сборки.
+
+---
+
+## License
+
+MIT -- see [LICENSE](LICENSE). The repository history keeps the
+review trail (the `.agents/` audit artifacts); the published tree
+does not.
