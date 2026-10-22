@@ -701,6 +701,9 @@
       what matters): about 41% of the unseen contexts are physically out of
       reach at the shipped k, and truncating to k=32 costs about 3.5 points of
       the ceiling.
+      **[SUPERSEDED by F21: this curve was re-measured on the engine's own
+      tables with the F21 evaluation window, and the F21 numbers are the ones
+      to quote -- the two curves are NOT the same measurement.]**
     - **The "empty candidate set" fallback is unreachable.** The unigram
       table is never empty once the corpus had a single transition, so an
       unseen context falls back to the 32 most frequent successors, NOT to the
@@ -744,7 +747,9 @@
     the real split the candidate set of k=32 holds the correct successor for
     58.9% of the held-out contexts (k=4: 48.2%, k=64: 60.4%, k=256: 62.1%,
     no limit: 62.5%) -- and the trigram level alone answers 58.7% of the
-    contexts. The coverage and the trigram's hit rate are the same number, so
+    contexts.
+    **[SUPERSEDED by F21: the curve was re-measured on the engine's own
+    tables; the F21 numbers are the ones to quote.]** The coverage and the trigram's hit rate are the same number, so
     the contexts the counts cannot answer are the ones whose context was never
     seen at all: raising k buys about 3.5 points of ceiling and costs
     linearly in the decision, and making the candidate set the UNION of the
@@ -826,18 +831,69 @@
     cost where it does not fire.
   * **The decision is now a COUNTS x NETWORK MIXTURE; the weight is a
     measured knob.** The candidate lists carry their training counts; the
-    score is `ternary_dot + HSSA_BACKOFF_COUNT_WEIGHT * log2(count)`, in the
-    same units the ternary dot lives in. Weight sweep on the subword
-    held-out split (single acceptance-harness runs): 64 -> 34.5084%, 256 ->
-    35.6478%, **1024 -> 36.5382% (shipped default)**, 4096 -> 35.7252%;
-    E[accepted(1)] 0.3654 at the peak. The shipped decision beats the causal
-    count chain (35.502%) by 1.036 points and the network alone (33.9927%)
-    by 2.546.
-  * **CROSS-VALIDATION of the counts**: the engine's own tables with the
-    weight effectively infinite (4096) score 35.7252% against the
-    independent Python causal chain's 35.502% on the same files -- two
-    independent implementations of one statistical rule agree within 0.22
-    points.
+    score is `ternary_dot + HSSA_BACKOFF_COUNT_WEIGHT * bucket(count)`, where
+    `bucket(count) = floor(log2(count)) + 1` -- the ORDER OF MAGNITUDE of the
+    count, **not** `log2(count)`. One bucket step therefore weighs the whole
+    weight (1024 points at the shipped weight), while the network's dot
+    reaches **7680** in absolute value -- measured, not assumed: 512 dims, the
+    activations clamped to +-15, the weights ternary +-1, and the gate prints
+    the largest |dot| the network actually produced and asserts it stays
+    inside that span. The count term is therefore a strong PREFERENCE, not a
+    lexicographic rule: the network can and does override a bucket step when
+    the dot difference is large, and the sweep proves it (the 1024 and the
+    4096 arms are not the same number). 1024 is the measured BALANCE point
+    between the count statistics and the network's signal, not a threshold.
+    The rule lives in one function (`backoff_score`), used by the training
+    and the inference path alike, and it is gated directly: the gate
+    recomputes the formula from its own copy, pins the bucket semantics (a
+    true `log2` would fail it), checks that the count term is monotone in
+    the count, checks that the weight is consumed at all, and checks the
+    engine's ACTUAL score for the chosen candidate against the rule -- which
+    is what catches a count term that is computed correctly but wired into
+    the decision with the wrong sign.
+    Weight sweep on the subword held-out split: 64 -> 34.5084%, 256 ->
+    35.6478%, **1024 -> 36.5382% (shipped default)**, 4096 -> 35.7252%.
+  * **The coverage ceiling and the SHORTLIST SIZE, measured on the engine's
+    own tables over its 175,876 held-out contexts** (the same corpus, the
+    same seed, the shipped weight; `second_brain/measur/measure_all.py`):
+    the candidate set holds the correct successor for 48.4768% of the
+    contexts at k=4, **58.9347% at k=32 (shipped)**, 60.5006% at k=64,
+    62.0949% at k=256 and 62.4724% at k=1024 -- so truncating to k=32 gives
+    up 3.54 points of the ceiling against k=1024. The ACCURACY, though, is
+    highest exactly at k=32 (36.5382%) and FALLS as k grows (36.5246% at
+    k=64, 36.4097% at k=256 and at k=1024): the extra candidates are wrong
+    more often than right. So k is NOT the lever -- the context's
+    availability is -- and the shipped k=32 is both the accuracy peak and
+    3.54 points below the coverage ceiling. The older F19/F20 curve (58.9%
+    at k=32, 48.2/60.4/62.1/62.5) is confirmed by this measurement to
+    within 0.3 points; the numbers that sat in the engine's comment until
+    this turn were stale and are gone.
+  * **E[accepted(k)] at the shipped weight, measured on the same split**:
+    E[accepted(1)] 0.3654, E[accepted(2)] 0.5919, E[accepted(3)] 0.7591 --
+    the acceptance profile is what a speculative drafter turns into tokens
+    saved.
+  * **The same split, the engine WITHOUT the shortlist** (the plain arm,
+    `-DHSSA_DISABLE_BACKOFF`, the same corpus and the same seed): 28.3876%
+    accuracy and E[accepted(1..3)] 0.2839 / 0.4597 / 0.5896, with no
+    candidate set at all (its coverage is 0 by construction). So the mixture
+    is **+8.15 points** over the network searching the whole vocabulary, and
+    E[accepted(1)] grows from 0.2839 to 0.3654 (+28.6% relative).
+  * **The comparison with the causal chain is now made on the SAME
+    positions.** The causal chain's 35.502% was measured on the trigram
+    positions only (163,876 of them); the engine scores every position from
+    the second token on (175,876). On the engine's own population the causal
+    chain is **34.865%**, so the mixture's advantage is **+1.673 points**, not
+    the +1.036 the mismatched populations suggested. Both numbers come from
+    `second_brain/measur/baselines_bpe_causal.py`, which now prints the
+    population-matched figure next to the trigram-only one.
+  * **CROSS-VALIDATION of the counts, stated exactly**: the engine's own
+    tables at a dominant count weight (4096) score 35.7252% against the
+    independent Python causal chain's 34.865% on the same positions. The two
+    are NOT the same rule -- the engine ranks by the count BUCKET and breaks
+    ties with the network, the Python chain by the exact count -- so the
+    agreement (within 0.86 points) is EMPIRICAL, not structural. The earlier
+    phrasing ("the weight effectively infinite == the count chain") was
+    wrong and is withdrawn.
   * **The fixed reference corpus re-measured at the shipped mixture**: the
     801-line corpus trains to 91.600 / 91.455 / 91.648% (12 epochs seed
     424242, 12 epochs seed 1337, 6 epochs seed 424242) against the
@@ -863,12 +919,48 @@
     seen-data curve within 0.05-0.13 points of F19's backoff row
     (81.02 -> 80.97, 75.86 -> 75.82) and keep the flat-throughput and the
     5.3x-training-time properties.
-  * **Still open, honestly**: the coverage ceiling (58.9% at k=32) and the
-    co-location limit are untouched by this turn; the word-level causal
-    chain (38.462%) remains ABOVE the word-level engine (25.509%) -- the
-    mixture lever is measured on the subword task only; the formal
-    E[accepted(2..3)] re-measure at the shipped weight is the last
-    instrument scheduled in this turn.
+  * **The saved-state format changed, and now says so.**
+    `TRAIN_STATE_VERSION` went 1 -> 2: the skip-gram table is a section of
+    its own, written between the bigram and the unigram sections. A state
+    file written by the older build is INCOMPATIBLE, not missing -- the CLI
+    used to report it as "[ERROR] no trainer state at ..."; it now prints the
+    file's own format version and the one this build expects, and asks for a
+    retrain. The loader was hardened in the same pass: the tables are
+    cleared UP FRONT (a failed load can no longer leave the model counting
+    with the previous tables -- the old comment claimed that and was false),
+    every counted section is bounded by the bytes that are actually left,
+    the expert pages are bounded by their real cost (the 4-byte id PLUS the
+    page payload), an empty unigram next to non-empty higher levels is
+    rejected as a corrupt blob, and the blob must be consumed EXACTLY (a
+    section that overran its own boundary can no longer eat the next
+    section and still "parse").
+  * **The e2e suite was a NO-OP, and the build script looped instead of
+    running it.** Two independent defects, both found by instrumenting
+    `build.bat test` with a timestamp per output line (the step had been
+    running for 47 minutes without finishing):
+    - `build.bat`'s `:build_test` did `call :build_brain_gates`, and
+      `:build_brain_gates` ends by falling through into `:build_test` (the
+      labels are in that order and the no-argument chain relies on it), so
+      the call re-entered the gates: the gates were rebuilt and rerun
+      endlessly (twelve rounds in twelve minutes in the instrumented run)
+      and the e2e suite was NEVER reached;
+    - the e2e runner itself never called `register_tier1..4_tests()`, and the
+      build did not compile the four tier translation units into the runner
+      at all -- so the registry was empty, the runner executed **0 tests**
+      and still reported `[RESULT] PASS (Partial run: 0 tests executed)`
+      with exit code 0. A green light for a suite that never ran.
+    Both are fixed: the gates run once and the e2e follows, the tier units
+    are compiled into the runner, the registrars are called, and a run that
+    executes nothing is now a FAILURE (`[RESULT] FAILED: no test was
+    executed`) instead of a pass. The e2e target is also reachable on its
+    own (`build.bat e2e`) for the lanes that have already run the gates.
+  * **Still open, honestly**: the co-location limit (16 slots per page, the
+    write STE overwrites them) is untouched by this turn; the word-level
+    numbers (the causal chain 38.462% on WORD positions, the same-domain
+    engine 25.509% on ITS tokenizer's positions) are NOT the same
+    population, so they do NOT establish that the engine loses on the word
+    task -- they establish only that the mixture lever was measured on the
+    subword task.
 
 - **Where the non-LLM brain stands after the benchmark**: the reasoning machinery is sound
   (lossless multi-hop at any depth 1..8, physical ablation proof of provenance, zero-shot

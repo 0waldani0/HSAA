@@ -93,6 +93,7 @@ if "%1"=="test_bench" goto :build_test_bench
 if "%1"=="brain_gates" goto :build_brain_gates
 if "%1"=="test_brain_gates" goto :build_brain_gates
 if "%1"=="test" goto :build_test
+if "%1"=="e2e" goto :build_e2e
 
 REM ============================================================================
 REM 4. Target: CUBIN Compilation (CUDA sm_86)
@@ -357,18 +358,26 @@ if %ERRORLEVEL% NEQ 0 (
 echo [+] The second brain's gates passed.
 if "%1"=="brain_gates" exit /b 0
 if "%1"=="test_brain_gates" exit /b 0
+goto :build_e2e
 
 REM 8. Target: Native E2E Test Suite
 REM ============================================================================
 :build_test
 REM The second brain's own gates first: they are the newest surface and the
-REM cheapest to catch a regression in.
-call :build_brain_gates
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+REM cheapest to catch a regression in. A `goto`, not a `call`: :build_brain_gates
+REM ends by falling through into the e2e block below, so a `call` would run
+REM the gates a second time.
+goto :build_brain_gates
+
+:build_e2e
 if exist "%ROOT_DIR%tests\e2e_test_runner.cpp" (
     echo [*] Compiling Native E2E Test Runner...
     cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%tests" /I"%ROOT_DIR%legacy_ptq" ^
         "%ROOT_DIR%tests\e2e_test_runner.cpp" ^
+        "%ROOT_DIR%tests\tier1_feature_tests.cpp" ^
+        "%ROOT_DIR%tests\tier2_boundary_tests.cpp" ^
+        "%ROOT_DIR%tests\tier3_pairwise_tests.cpp" ^
+        "%ROOT_DIR%tests\tier4_workload_tests.cpp" ^
         "%BUILD_DIR%\popcnt_brain.lib" ^
         /Fe:"%BUILD_DIR%\e2e_test_runner.exe" /Fo:"%BUILD_DIR%\\" %LINK_FLAGS%
     if %ERRORLEVEL% NEQ 0 (

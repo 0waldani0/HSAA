@@ -2099,9 +2099,10 @@ struct NativeSublinearLLM {
     // non-causal "skip" level of the earlier 46.899% figure (that one uses
     // the gold FUTURE token as context -- BRIDGE.md F21); ours only looks
     // BACKWARD. On the real split it changed nothing (33.9927% before and
-    // after: the trigram and bigram levels already cover every context it
-    // fires on); on the gate's synthetic corpus it is worth +5.34 points
-    // (41.33% -> 46.67% with the empty weight).
+    // after -- the measurement of that turn, before the mixture was measured
+    // on the engine's own population; the trigram and bigram levels already
+    // cover every context it fires on); on the gate's synthetic corpus it is
+    // worth +5.34 points (41.33% -> 46.67% with the empty weight).
     std::unordered_map<uint64_t, std::vector<std::pair<int, uint32_t>>> backoff_skip;
     std::vector<std::pair<int, uint32_t>> backoff_uni;
     // The A/B switch. The corpus path builds the counts and restricts the
@@ -2113,30 +2114,72 @@ struct NativeSublinearLLM {
 #else
     bool use_backoff_shortlist = false;
 #endif
-    // How many candidates the decision may choose from. This number IS the
-    // accuracy ceiling of the mechanism: measured on the real split (187,876
-    // held-out contexts) the candidate set contains the correct successor for
-    // 46.27% of them at k=4, 57.68% at k=32, 59.79% at k=64, 62.77% at k=256
-    // and 64.79% without a limit -- so truncating costs 7.11 points of the
-    // ceiling at the shipped k=32, and the cost of the search is 0.36 us per
-    // decision.
+    // How many candidates the decision may choose from. This number bounds
+    // the mechanism, and the bound was MEASURED on the engine's own tables
+    // over its 175,876 held-out contexts: the candidate set holds the
+    // correct successor for 48.4768% of them at k=4, 58.9347% at k=32,
+    // 60.5006% at k=64, 62.0949% at k=256 and 62.4724% at k=1024 -- so the
+    // shipped k=32 gives up 3.54 points of the ceiling against k=1024. The
+    // ACCURACY is highest at k=32 (36.5382%) and FALLS as k grows (36.4097%
+    // at k=256 and at k=1024): the extra candidates are wrong more often
+    // than right, so a bigger k buys coverage and loses accuracy. The cost
+    // of the search is 0.36 us per decision.
 #ifndef HSSA_BACKOFF_SHORTLIST_K
 #define HSSA_BACKOFF_SHORTLIST_K 32
 #endif
 // How much the count statistics weigh in the decision, in the same units as
-// the ternary dot (which spans roughly -512..512). Zero is the network alone;
-// past this scale the count level dominates every non-tie. Measured on the
+// the ternary dot. The dot spans about -7680..+7680 (512 dimensions, the
+// activations clamped to +-15, the weights ternary +-1), and the count term
+// is worth HSSA_BACKOFF_COUNT_WEIGHT points per bucket step. At the shipped
+// weight (1024) the count is a STRONG PREFERENCE, not a decision: the dot
+// difference between two candidates reaches ~15360, so the network can and
+// does override a bucket step. Zero is the network alone. Measured on the
 // subword held-out split: 64 -> 34.5084%, 256 -> 35.6478%, 1024 -> 36.5382%
-// (the measured peak), 4096 -> 35.7252%. At the peak the decision already
-// beats the causal count backoff chain fitted on the same files: 35.502%.
+// (the measured peak), 4096 -> 35.7252%. At the peak the decision beats the
+// causal count backoff chain fitted on the same files: 34.865% on the
+// engine's own population of 175,876 positions (the chain's 35.502% was
+// measured on the trigram positions only, 163,876 of them -- a different
+// population, so it must not be compared as if it were the same one).
 #ifndef HSSA_BACKOFF_COUNT_WEIGHT
 #define HSSA_BACKOFF_COUNT_WEIGHT 1024
 #endif
 static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
               "a negative count weight would reject every candidate");
+    // The count term of the decision score is the ORDER OF MAGNITUDE of the
+    // count (floor(log2(count)) + 1), not log2(count): one bucket step weighs
+    // the whole weight. The weight is a MEASURED BALANCE between the count
+    // statistics and the network's signal, NOT a lexicographic rule: the
+    // network can and does override a bucket step when the dot difference is
+    // large (the dot spans about -7680..+7680, so two candidates can differ
+    // by ~15360, more than the shipped weight of 1024). The candidates are
+    // sorted by count descending, so a score tie keeps the candidate with the
+    // higher count.
+    static double backoff_count_bucket(uint32_t count) {
+        double b = 0.0;
+        uint32_t c = count;
+        while (c > 0) { b += 1.0; c >>= 1; }
+        return b;
+    }
+    // The score of one candidate: the ternary dot plus the count term. A
+    // count of zero means "no count known" -> the dot alone.
+    static int64_t backoff_score(int64_t dot, uint32_t count) {
+        if (count == 0) return dot;
+        const double term = static_cast<double>(HSSA_BACKOFF_COUNT_WEIGHT) *
+                            backoff_count_bucket(count);
+        // an absurd weight must not overflow the accumulator (that is UB)
+        if (term >= 9.0e18) return 9223372036854775807LL;
+        return dot + static_cast<int64_t>(term);
+    }
     int backoff_shortlist_k = HSSA_BACKOFF_SHORTLIST_K;
     std::vector<int> backoff_buf;
     std::vector<uint32_t> backoff_counts;
+    // The LAST decision's numbers: the network's dot, the count that came
+    // with the candidate, and the final score. The score is what the
+    // decision actually used, so a gate can check it against the documented
+    // rule instead of trusting the formula.
+    mutable int64_t last_decision_dot = 0;
+    mutable uint32_t last_decision_count = 0;
+    mutable int64_t last_decision_score = 0;
 
     // A context hash over the token identities (not the recurrent state).
     static uint64_t mix_context(uint64_t a, uint64_t b) {
@@ -2194,9 +2237,11 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
     // unigram, the most frequent successors first, with the count of each
     // successor. The count is what lets the decision COMBINE the network's
     // opinion with the statistics -- measured on the same held-out split,
-    // identical data and tokenisation, the causal count rule alone reaches
-    // 35.502%, the network alone 33.9927%, and the mixture 36.5382% -- so
-    // the two have to be mixed rather than chosen between.
+    // identical data and tokenisation, and over the SAME positions (the
+    // engine's 175,876): the causal count rule alone reaches 34.865%, the
+    // engine without the shortlist (the network alone, searching the whole
+    // vocabulary) 28.3876%, and the mixture 36.5382% -- so the two have to
+    // be mixed rather than chosen between.
     void backoff_candidates(int prev2, int prev1, std::vector<int>& out, int k,
                              std::vector<uint32_t>* out_counts = nullptr) const {
         out.clear();
@@ -2336,12 +2381,26 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         }
         blob.u32(static_cast<uint32_t>(backoff_uni.size()));
         for (const auto& pr : backoff_uni) { blob.u32(static_cast<uint32_t>(pr.first)); blob.u32(pr.second); }
-        // the expert pages the training wrote to
-        blob.u32(static_cast<uint32_t>(trained_pages.size()));
-        if (bank && bank->base_ptr) {
+        // the expert pages the training wrote to. The count MUST be the
+        // number of entries that follow it: a page id outside the bank
+        // cannot be written, so it is dropped from the list, and the count
+        // is the size of the list that is actually written.
+        if (!bank || !bank->base_ptr) {
+            // Without a bank there is nowhere to READ the pages from, so the
+            // state cannot be written at all: a count with no entries behind
+            // it would be an unloadable blob.
+            return false;
+        }
+        std::vector<uint32_t> written_pages;
+        written_pages.reserve(trained_pages.size());
+        for (uint32_t pid : trained_pages) {
+            if (pid >= TOTAL_EXPERTS) continue;
+            written_pages.push_back(pid);
+        }
+        blob.u32(static_cast<uint32_t>(written_pages.size()));
+        {
             const auto* page_base = static_cast<const uint8_t*>(bank->base_ptr);
-            for (uint32_t pid : trained_pages) {
-                if (pid >= TOTAL_EXPERTS) continue;
+            for (uint32_t pid : written_pages) {
                 // the id FIRST, then the page: the reader expects the same
                 // order, and a page without its id is unplaceable
                 blob.u32(pid);
@@ -2355,25 +2414,40 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
 
     // Reads the vocabulary out of a saved state, so that a model can be
     // created with the right size before the rest is loaded.
+    //
+    // The reason a header is rejected is RETURNED through `error`, never
+    // printed from here: the caller decides what to say about it (a missing
+    // file, an incompatible format and a corrupt body are three different
+    // failures and must not be reported as one).
     static bool read_state_header(const uint8_t* region, size_t region_bytes,
-                                  std::vector<std::string>& words) {
+                                  std::vector<std::string>& words,
+                                  std::string* error = nullptr) {
+        auto fail = [error](const char* why) {
+            if (error) *error = why;
+            return false;
+        };
+        auto fail_version = [error](uint32_t v) {
+            if (error) *error = "the format version is " + std::to_string(v) +
+                                 ", this build expects " + std::to_string(TRAIN_STATE_VERSION);
+            return false;
+        };
         StateReader r{region, region_bytes, 0};
         uint64_t magic = 0;
         uint32_t version = 0, nwords = 0;
-        if (!r.u64(magic)) return false;
-        if (magic != TRAIN_STATE_MAGIC) return false;
-        if (!r.u32(version)) return false;
-        if (version != TRAIN_STATE_VERSION) return false;
-        if (!r.u32(nwords)) return false;
+        if (!r.u64(magic)) return fail("the state blob is too short to hold the magic");
+        if (magic != TRAIN_STATE_MAGIC) return fail("the magic does not match");
+        if (!r.u32(version)) return fail("the state blob is too short to hold the format version");
+        if (version != TRAIN_STATE_VERSION) return fail_version(version);
+        if (!r.u32(nwords)) return fail("the state blob is too short to hold the vocabulary count");
         // a counted section's count must have enough blob left for its items,
         // so a corrupt count cannot turn into a reserve of many gigabytes
         // (each string costs at least its 4-byte length field)
-        if (static_cast<size_t>(nwords) > (r.n - r.at) / 4) return false;
+        if (static_cast<size_t>(nwords) > (r.n - r.at) / 4) return fail("the vocabulary section is truncated");
         words.clear();
         words.reserve(nwords);
         for (uint32_t i = 0; i < nwords; ++i) {
             std::string w;
-            if (!r.str(w)) return false;
+            if (!r.str(w)) return fail("the vocabulary section is truncated");
             words.push_back(std::move(w));
         }
         return true;
@@ -2381,51 +2455,76 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
 
     // Reads it back. The embeddings and the master weights are re-derived into
     // their ternary masks, exactly as the constructor does.
+    //
+    // The reason a load failed is RETURNED through `error`, never printed
+    // from here: the caller has to tell a missing file, an incompatible
+    // format and a corrupt body apart, and only the loader knows which one
+    // happened.
     bool load_state(const uint8_t* region, size_t region_bytes,
-                    std::vector<std::string>& words) {
+                    std::vector<std::string>& words,
+                    std::string* error = nullptr) {
+        auto fail = [error](const char* why) {
+            if (error) *error = why;
+            return false;
+        };
+        auto fail_version = [error](uint32_t v) {
+            if (error) *error = "the format version is " + std::to_string(v) +
+                                 ", this build expects " + std::to_string(TRAIN_STATE_VERSION);
+            return false;
+        };
         StateReader r{region, region_bytes, 0};
-        uint64_t magic = 0;
-        uint32_t version = 0, nwords = 0, vocab = 0, emb = 0;
-        if (!r.u64(magic)) return false;
-        if (magic != TRAIN_STATE_MAGIC) return false;
-        if (!r.u32(version)) return false;
-        if (version != TRAIN_STATE_VERSION) return false;
-        if (!r.u32(nwords)) return false;
-        // a counted section's count must have enough blob left for its items,
-        // so a corrupt count cannot turn into a reserve of many gigabytes
-        // (each string costs at least its 4-byte length field)
-        if (static_cast<size_t>(nwords) > (r.n - r.at) / 4) return false;
-        words.clear();
-        words.reserve(nwords);
-        for (uint32_t i = 0; i < nwords; ++i) {
-            std::string w;
-            if (!r.str(w)) return false;
-            words.push_back(std::move(w));
-        }
-        if (!r.u32(vocab) || !r.u32(emb)) return false;
-        if (static_cast<int>(vocab) != vocab_size) return false;
-        if (emb != embeddings.size()) return false;
-        if (!r.raw(embeddings.data(), embeddings.size())) return false;
-        if (!r.raw(wc_master, sizeof(wc_master))) return false;
-        if (!r.raw(wf_pos, sizeof(wf_pos))) return false;
-        if (!r.raw(wf_neg, sizeof(wf_neg))) return false;
-        if (!r.raw(tree_nodes.data(), tree_nodes.size() * sizeof(uint64_t))) return false;
-        if (!r.raw(sub1_acc, sizeof(sub1_acc))) return false;
-        if (!r.raw(sub2_acc, sizeof(sub2_acc))) return false;
-        if (!r.raw(keys_sub1, sizeof(keys_sub1))) return false;
-        if (!r.raw(keys_sub2, sizeof(keys_sub2))) return false;
-        sync_vocab_bitmasks();
-        for (size_t i = 0; i < D_MODEL; ++i) {
-            sync_latent_row_to_ternary_masks(wc_master[i], 4, wc_pos[i], wc_neg[i]);
-        }
-        // ALL four tables are cleared up front: a failed load must not
+        // ALL five tables are cleared up front: a failed load must not
         // leave the model counting with half of its previous life
         backoff_tri.clear();
         backoff_bi.clear();
         backoff_skip.clear();
         backoff_uni.clear();
+        trained_pages.clear();
+        uint64_t magic = 0;
+        uint32_t version = 0, nwords = 0, vocab = 0, emb = 0;
+        if (!r.u64(magic)) return fail("the state blob is too short to hold the magic");
+        if (magic != TRAIN_STATE_MAGIC) return fail("the magic does not match");
+        if (!r.u32(version)) return fail("the state blob is too short to hold the format version");
+        if (version != TRAIN_STATE_VERSION) return fail_version(version);
+        if (!r.u32(nwords)) return fail("the state blob is too short to hold the vocabulary count");
+        // a counted section's count must have enough blob left for its items,
+        // so a corrupt count cannot turn into a reserve of many gigabytes
+        // (each string costs at least its 4-byte length field)
+        if (static_cast<size_t>(nwords) > (r.n - r.at) / 4) return fail("the vocabulary section is truncated");
+        words.clear();
+        words.reserve(nwords);
+        for (uint32_t i = 0; i < nwords; ++i) {
+            std::string w;
+            if (!r.str(w)) return fail("the vocabulary section is truncated");
+            words.push_back(std::move(w));
+        }
+        if (!r.u32(vocab) || !r.u32(emb)) return fail("the state blob is too short to hold the vocabulary and embedding sizes");
+        if (static_cast<int>(vocab) != vocab_size) {
+            if (error) *error = "the state holds a vocabulary of " + std::to_string(vocab) +
+                                " tokens, this model has " + std::to_string(vocab_size);
+            return false;
+        }
+        if (emb != embeddings.size()) {
+            if (error) *error = "the state holds " + std::to_string(emb) +
+                                " embedding values, this model has " + std::to_string(embeddings.size());
+            return false;
+        }
+        if (!r.raw(embeddings.data(), embeddings.size())) return fail("the embedding table is truncated");
+        if (!r.raw(wc_master, sizeof(wc_master))) return fail("the master weights are truncated");
+        if (!r.raw(wf_pos, sizeof(wf_pos))) return fail("the positive forward weights are truncated");
+        if (!r.raw(wf_neg, sizeof(wf_neg))) return fail("the negative forward weights are truncated");
+        if (!r.raw(tree_nodes.data(), tree_nodes.size() * sizeof(uint64_t))) return fail("the tree node table is truncated");
+        if (!r.raw(sub1_acc, sizeof(sub1_acc))) return fail("the subkey accumulator 1 is truncated");
+        if (!r.raw(sub2_acc, sizeof(sub2_acc))) return fail("the subkey accumulator 2 is truncated");
+        if (!r.raw(keys_sub1, sizeof(keys_sub1))) return fail("the subkey keys 1 are truncated");
+        if (!r.raw(keys_sub2, sizeof(keys_sub2))) return fail("the subkey keys 2 are truncated");
+        sync_vocab_bitmasks();
+        for (size_t i = 0; i < D_MODEL; ++i) {
+            sync_latent_row_to_ternary_masks(wc_master[i], 4, wc_pos[i], wc_neg[i]);
+        }
         uint32_t n = 0;
-        if (!r.u32(n)) return false;
+        if (!r.u32(n)) return fail("the state blob is too short to hold the trigram count");
+        const uint32_t n_tri = n;
         // every counted section must have enough blob left for its items
         // (8 bytes per entry: a token id and its count; a corrupt count then
         // cannot turn a reserve into a multi-gigabyte allocation), and a
@@ -2438,69 +2537,89 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         };
         for (uint32_t i = 0; i < n; ++i) {
             uint64_t key = 0; uint32_t cnt = 0;
-            if (!r.u64(key) || !r.u32(cnt) || !fits(cnt, 8)) return false;
+            if (!r.u64(key) || !r.u32(cnt) || !fits(cnt, 8)) return fail("the trigram table overruns the blob");
             std::vector<std::pair<int, uint32_t>> v;
             v.reserve(cnt);
             for (uint32_t j = 0; j < cnt; ++j) {
                 uint32_t tok = 0, c = 0;
-                if (!r.u32(tok) || !r.u32(c) || !tok_ok(tok)) return false;
+                if (!r.u32(tok) || !r.u32(c)) return fail("the trigram table is truncated");
+                if (!tok_ok(tok)) return fail("the trigram table is corrupt (a token id outside the vocabulary)");
                 v.emplace_back(static_cast<int>(tok), c);
             }
             backoff_tri.emplace(key, std::move(v));
         }
-        if (!r.u32(n)) return false;
+        if (!r.u32(n)) return fail("the state blob is too short to hold the bigram count");
+        const uint32_t n_bi = n;
         for (uint32_t i = 0; i < n; ++i) {
             uint64_t key = 0; uint32_t cnt = 0;
-            if (!r.u64(key) || !r.u32(cnt) || !fits(cnt, 8)) return false;
+            if (!r.u64(key) || !r.u32(cnt) || !fits(cnt, 8)) return fail("the bigram table overruns the blob");
             std::vector<std::pair<int, uint32_t>> v;
             v.reserve(cnt);
             for (uint32_t j = 0; j < cnt; ++j) {
                 uint32_t tok = 0, c = 0;
-                if (!r.u32(tok) || !r.u32(c) || !tok_ok(tok)) return false;
+                if (!r.u32(tok) || !r.u32(c)) return fail("the bigram table is truncated");
+                if (!tok_ok(tok)) return fail("the bigram table is corrupt (a token id outside the vocabulary)");
                 v.emplace_back(static_cast<int>(tok), c);
             }
             backoff_bi.emplace(key, std::move(v));
         }
-        if (!r.u32(n)) return false;
+        if (!r.u32(n)) return fail("the state blob is too short to hold the skip-gram count");
+        const uint32_t n_skip = n;
         for (uint32_t i = 0; i < n; ++i) {
             uint64_t key = 0; uint32_t cnt = 0;
-            if (!r.u64(key) || !r.u32(cnt) || !fits(cnt, 8)) return false;
+            if (!r.u64(key) || !r.u32(cnt) || !fits(cnt, 8)) return fail("the skip-gram table overruns the blob");
             std::vector<std::pair<int, uint32_t>> v;
             v.reserve(cnt);
             for (uint32_t j = 0; j < cnt; ++j) {
                 uint32_t tok = 0, c = 0;
-                if (!r.u32(tok) || !r.u32(c) || !tok_ok(tok)) return false;
+                if (!r.u32(tok) || !r.u32(c)) return fail("the skip-gram table is truncated");
+                if (!tok_ok(tok)) return fail("the skip-gram table is corrupt (a token id outside the vocabulary)");
                 v.emplace_back(static_cast<int>(tok), c);
             }
             backoff_skip.emplace(key, std::move(v));
         }
-        if (!r.u32(n)) return false;
+        if (!r.u32(n)) return fail("the state blob is too short to hold the unigram count");
+        const uint32_t n_uni = n;
         // the unigram table: 8 bytes per (token, count) entry
-        if (!fits(n, 8)) return false;
+        if (!fits(n, 8)) return fail("the unigram table overruns the blob");
         backoff_uni.reserve(n);
         for (uint32_t i = 0; i < n; ++i) {
             uint32_t tok = 0, c = 0;
-            if (!r.u32(tok) || !r.u32(c) || !tok_ok(tok)) return false;
+            if (!r.u32(tok) || !r.u32(c)) return fail("the unigram table is truncated");
+            if (!tok_ok(tok)) return fail("the unigram table is corrupt (a token id outside the vocabulary)");
             backoff_uni.emplace_back(static_cast<int>(tok), c);
         }
-        // the expert pages: each entry costs at least its 4-byte page id
-        if (!r.u32(n)) return false;
-        if (!fits(n, 4)) return false;
-        trained_pages.clear();
+        // a corrupt count of zero must not silently drop a level: EVERY
+        // transition feeds the unigram, the bigram, the skip-gram and the
+        // trigram in the SAME loop iteration, so those four levels are empty
+        // or non-empty TOGETHER. An empty unigram next to a non-empty higher
+        // level therefore cannot happen for a state this build wrote: this is
+        // a corruption check, not a size rule.
+        if (n_uni == 0 && (n_tri != 0 || n_bi != 0 || n_skip != 0)) {
+            return fail("the unigram table is empty while a higher level is not");
+        }
+        // the expert pages: each entry costs its 4-byte page id PLUS the
+        // PAGE_BYTES of the payload that follows it
+        if (!r.u32(n)) return fail("the state blob is too short to hold the expert page count");
+        if (!fits(n, 4 + PAGE_BYTES)) return fail("the expert pages section overruns the blob");
         trained_pages.reserve(n);
         if (bank && bank->base_ptr) {
             auto* page_base = static_cast<uint8_t*>(bank->base_ptr);
             for (uint32_t i = 0; i < n; ++i) {
                 uint32_t pid = 0;
-                if (!r.u32(pid)) return false;
-                if (pid >= TOTAL_EXPERTS) return false;
-                if (!r.raw(page_base + static_cast<size_t>(pid) * PAGE_BYTES, PAGE_BYTES)) return false;
+                if (!r.u32(pid)) return fail("the expert pages section is truncated");
+                if (pid >= TOTAL_EXPERTS) return fail("the expert pages section names a page id outside the bank");
+                if (!r.raw(page_base + static_cast<size_t>(pid) * PAGE_BYTES, PAGE_BYTES)) return fail("the expert pages section is truncated");
                 trained_pages.push_back(pid);
             }
         } else {
             // No bank to restore the pages into: the state cannot be used.
-            return false;
+            return fail("the model has no weight bank to restore the expert pages into");
         }
+        // the blob must be consumed EXACTLY: a section whose count overruns
+        // its own boundary would otherwise eat the NEXT section's bytes and
+        // still "parse", with a wrong boundary
+        if (r.at != r.n) return fail("the blob has trailing bytes");
         return true;
     }
 
@@ -2509,10 +2628,13 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
     //
     // The count of each candidate is mixed in: the network says which
     // continuation fits the state, the counts say which one actually happens.
-    // Measured on the same held-out split, identical data and tokenisation:
-    // causal counts alone 35.502% (independent Python chain; the engine's own
-    // tables reproduce it at 35.7252% with the weight effectively infinite),
-    // network alone 33.9927%, the mixture at the shipped weight 36.5382%.
+    // Measured on the same held-out split, identical data and tokenisation,
+    // over the engine's own 175,876 positions: the causal count chain alone
+    // 34.865% (the independent Python chain on that same population; the
+    // engine's own tables at the weight 4096, where the count dominates,
+    // reach 35.7252%), the network alone -- the engine without the
+    // shortlist, searching the whole vocabulary -- 28.3876%, and the mixture
+    // at the shipped weight 36.5382%.
     int argmax_over_candidates(const int8_t* __restrict__ ffn_out,
                                const std::vector<int>& cands,
                                const std::vector<uint32_t>* counts = nullptr) const {
@@ -2521,23 +2643,32 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         pack_activation_bitplanes(ffn_out, sb, mp);
         int best = -1;
         int64_t best_score = -1000000000;
+        int64_t best_dot = 0;
+        uint32_t best_count = 0;
         for (size_t i = 0; i < cands.size(); ++i) {
             const int v = cands[i];
             if (v < 0 || v >= vocab_size) continue;
-            int64_t s = ternary_popcnt_dot_512(
+            const int64_t dot = ternary_popcnt_dot_512(
                 &vocab_pos[static_cast<size_t>(v) * WORDS_PER_VEC],
                 &vocab_neg[static_cast<size_t>(v) * WORDS_PER_VEC], sb, mp);
-            if (counts && i < counts->size() && (*counts)[i] > 0) {
-                // the counts are a log scale: the difference between one and
-                // two occurrences matters more than between a hundred and a
-                // hundred and one
-                double logc = 0.0;
-                uint32_t c = (*counts)[i];
-                while (c > 0) { logc += 1.0; c >>= 1; }
-                s += static_cast<int64_t>((HSSA_BACKOFF_COUNT_WEIGHT) * logc);
+            // the count that came WITH this candidate: no count means the
+            // dot alone (backoff_score(dot, 0) == dot)
+            const uint32_t cnt = (counts && i < counts->size()) ? (*counts)[i] : 0u;
+            const int64_t scored = (counts && i < counts->size())
+                ? backoff_score(dot, cnt)
+                : dot;
+            // a STRICT comparison: the first candidate wins a tie, and the
+            // candidates are sorted by count descending, so a tie keeps the
+            // candidate with the higher count
+            if (scored > best_score) {
+                best_score = scored; best = v; best_dot = dot; best_count = cnt;
             }
-            if (s > best_score) { best_score = s; best = v; }
         }
+        // the LAST decision's numbers, never stale: a decision that had no
+        // candidate at all reports zeros
+        last_decision_dot = best_dot;
+        last_decision_count = best_count;
+        last_decision_score = (best >= 0) ? best_score : 0;
         return best;
     }
 
@@ -6181,6 +6312,17 @@ static bool read_state_file(const std::string& path, std::vector<uint8_t>& blob)
     return ifs.gcount() == n;
 }
 
+// Is this a state file of a FORMAT this build cannot read? A state saved by
+// an older build is incompatible, not missing: the file exists and its magic
+// is right, only its version differs.
+static bool state_version_mismatch(const std::vector<uint8_t>& blob, uint32_t& version) {
+    if (blob.size() < 12) return false;
+    uint64_t magic = 0;
+    std::memcpy(&magic, blob.data(), 8);
+    std::memcpy(&version, blob.data() + 8, 4);
+    return magic == TRAIN_STATE_MAGIC && version != TRAIN_STATE_VERSION;
+}
+
 // -----------------------------------------------------------------------------
 // 13a. CLI Corpus Training: teach the engine from a user-supplied raw text file.
 //
@@ -6322,17 +6464,46 @@ static int train_corpus_cli(int argc, char** argv) {
         // one the embeddings were trained with.
         std::vector<std::string> words;
         std::vector<uint8_t> blob;
-        if (!read_state_file(state_path, blob) ||
-            !NativeSublinearLLM::read_state_header(blob.data(), blob.size(), words)) {
+        // Three DIFFERENT failures, and the loader is the only one that
+        // knows which happened:
+        //   (a) there is no state file at all;
+        //   (b) the file exists but its FORMAT is not this build's (the
+        //       magic or the version differs) -- INCOMPATIBLE, not missing;
+        //   (c) the file exists, the magic and the version are right, but
+        //       the body is corrupt.
+        if (!read_state_file(state_path, blob)) {
             std::printf("  },\n  \"error\": \"no trainer state next to the bank\"\n}\n");
             std::cerr << "[ERROR] no trainer state at " << state_path << "\n";
             return 3;
         }
+        std::string header_error;
+        if (!NativeSublinearLLM::read_state_header(blob.data(), blob.size(), words, &header_error)) {
+            uint32_t file_version = 0;
+            uint64_t file_magic = 0;
+            if (blob.size() >= 8) std::memcpy(&file_magic, blob.data(), 8);
+            if (state_version_mismatch(blob, file_version) ||
+                (blob.size() >= 8 && file_magic != TRAIN_STATE_MAGIC)) {
+                // (b) a state saved by an older build carries a different
+                // format version: it is INCOMPATIBLE, not missing.
+                std::printf("  },\n  \"error\": \"incompatible trainer state format\"\n}\n");
+                std::cerr << "[ERROR] trainer state at " << state_path << ": " << header_error
+                          << ": the saved state is not compatible, retrain (delete the file or run --train)\n";
+                return 3;
+            }
+            // (c) the file is there and its format is this build's, but the
+            // body does not parse: the loader's reason says what is wrong.
+            std::printf("  },\n  \"error\": \"the trainer state could not be read\"\n}\n");
+            std::cerr << "[ERROR] the trainer state at " << state_path
+                      << " could not be read: " << header_error << "\n";
+            return 3;
+        }
         tok.reset_vocabulary();
         for (const auto& w : words) tok.add_word(w);
-        if (!model->load_state(blob.data(), blob.size(), words)) {
+        std::string load_error;
+        if (!model->load_state(blob.data(), blob.size(), words, &load_error)) {
             std::printf("  },\n  \"error\": \"the trainer state could not be read\"\n}\n");
-            std::cerr << "[ERROR] the trainer state could not be read\n";
+            std::cerr << "[ERROR] the trainer state at " << state_path
+                      << " could not be read: " << load_error << "\n";
             return 3;
         }
         std::printf("    \"restored_from_state\": true,\n");

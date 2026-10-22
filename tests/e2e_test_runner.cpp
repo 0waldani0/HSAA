@@ -31,6 +31,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // The suites register themselves. Without these calls the registry stays
+    // EMPTY and the runner reports a green "0 tests executed" -- a silent
+    // no-op, which is exactly what this runner did for a long time.
+    register_tier1_tests();
+    register_tier2_tests();
+    register_tier3_tests();
+    register_tier4_tests();
+
     auto& all_tests = TestRegistry::instance().get_tests();
 
     std::cout << "===============================================================================\n";
@@ -125,9 +133,16 @@ int main(int argc, char* argv[]) {
     if (failed == 0 && ran >= 184) {
         std::cout << "[RESULT] ALL TESTS PASSED! E2E Suite satisfies 100% of TEST_INFRA.md.\n";
         return 0;
-    } else if (failed == 0) {
+    } else if (failed == 0 && ran > 0) {
         std::cout << "[RESULT] PASS (Partial run: " << ran << " tests executed)\n";
         return 0;
+    } else if (ran == 0) {
+        // A run that executed NOTHING is not a pass: it means the suites
+        // registered nothing (or the filter matched nothing). Reporting it
+        // as green is how a broken suite hides.
+        std::cout << "[RESULT] FAILED: no test was executed -- the suites registered "
+                     "nothing (or the filter matched nothing).\n";
+        return 2;
     } else {
         std::cout << "[RESULT] FAILED: " << failed << " test(s) failed!\n";
         return 1;
