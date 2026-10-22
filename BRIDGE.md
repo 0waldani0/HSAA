@@ -83,7 +83,10 @@
   the one that makes the drafter genuinely useful.** A BPE with 4,000 merges was trained on
   the TRAINING split only and applied to both splits, so the held-out never influences
   the vocabulary. Same-domain split, epochs 6, seed 424242:
-  * word level: vocab 67,890, accuracy **25.509%**, E[accepted(5)] 0.6489, E[accepted(12)]
+  * word level: vocab 67,890, accuracy **25.509%** (this is the PLAIN engine, i.e. BEFORE F21's
+    count mixture; on the same corpus and the same 63,432 held-out positions the shipped
+    count-mixed engine reaches **36.3365%**, +10.83 points),
+    E[accepted(5)] 0.6489, E[accepted(12)]
     0.8701, draft **188,601 ns**
   * subword  : vocab **4,166**, accuracy **28.388%**, E[accepted(5)] **0.7764**,
     E[accepted(8)] 0.9618, E[accepted(12)] **1.1085**, draft **34,492 ns** (-82%)
@@ -126,6 +129,28 @@
   shortfall is in RETRIEVAL, not in the model class -- the engine's learned key is
   a lossy encoding of the context where a backoff n-gram looks the context up
   exactly.
+  * **The word-level comparison was RE-MEASURED IN ONE POPULATION, and the conclusion
+    reversed.** The paragraph above compares two different things: 30.022% (and the
+    causal 38.462%) were measured on the TRIGRAM positions -- the contexts (t[i-1], t[i])
+    a trigram chain can see -- while the engine scores the positions from the second
+    token on, with the WHOLE prefix as its context. Measured on the engine's own
+    positions (63,432 of them, epochs 6, seed 424242, `measur/sweep_slots.py --word`):
+
+    | what | accuracy |
+    |---|---|
+    | the plain engine (no count backoff) | 25.5092% |
+    | the count-mixed engine, K=256 | 36.3350% |
+    | **the count-mixed engine, K=32 (shipped)** | **36.3365%** |
+    | the causal chain, trigram window, same positions | 34.432% |
+    | the causal chain, FULL PREFIX (the engine's context), same positions | 32.211% |
+
+    So the count mixture is worth **+10.83 points** on the word corpus, and the engine
+    ends up **above** the count chain it was supposed to beat: +1.90 points over the
+    trigram-window chain and +4.13 over the chain that gets the engine's own full-prefix
+    context (`measur/baselines_word_causal.py`). The earlier "the engine sits below the
+    chain on words" was an artefact of the population mismatch, and the earlier
+    "25.509%" was the engine WITHOUT F21. The mixture lever is therefore measured on
+    BOTH tasks, not only on the subword one.
 - **FIX C, implemented and REJECTED: split-subspace expert key.** Following the
   architecture the file header already describes (sub-space 1 = context state,
   sub-space 2 = trajectory), the second half of the expert key was replaced by the
@@ -820,7 +845,10 @@
     6.449%, unigram fallback 1.335%, NON-CAUSAL skip level **12.733%**. The
     CAUSAL chain top-1 is **35.502%**. The word-level 30.022% is the same
     construction (skip level +6.185, no unigram fallback); the causal
-    word-level chain is 38.462%. The engine-hosted comments and this log now
+    word-level chain is 38.462% **on the trigram positions** -- on the
+    positions the engine itself scores (63,432) the same chain gives 34.432%,
+    and the full-prefix chain (the engine's context) 32.211%, against the
+    engine's 36.3365%. The engine-hosted comments and this log now
     quote the causal figure everywhere.
   * **A legitimate BACKWARD-LOOKING skip-gram level was added to the chain**
     (context = the token TWO positions back), clearly distinct from the
@@ -954,13 +982,25 @@
     executes nothing is now a FAILURE (`[RESULT] FAILED: no test was
     executed`) instead of a pass. The e2e target is also reachable on its
     own (`build.bat e2e`) for the lanes that have already run the gates.
-  * **Still open, honestly**: the co-location limit (16 slots per page, the
-    write STE overwrites them) is untouched by this turn; the word-level
-    numbers (the causal chain 38.462% on WORD positions, the same-domain
-    engine 25.509% on ITS tokenizer's positions) are NOT the same
-    population, so they do NOT establish that the engine loses on the word
-    task -- they establish only that the mixture lever was measured on the
-    subword task.
+  * **The two open items above are now CLOSED by measurement** (this turn, both
+    quoted from `measur/`): (a) the word-level comparison was invalid -- see the
+    one-population re-measurement above: the count-mixed engine is 36.3365% on
+    the word corpus, above the trigram-window chain (34.432%) and the
+    full-prefix chain (32.211%) on the SAME positions, and the old 25.509%
+    was the plain engine before F21; (b) the co-location limit is a
+    second-order lever: widening the page from 16 to 32/64/128 slots buys
+    +0.18/+0.29/+0.54 points for 2/4/8x the bank map and 2/4/8x the master
+    accumulators (4.1 -> 32.6 GB, past this host's RAM) with a ~10.6% draft
+    cost rise already at 32 slots, so 16 slots stay shipped and the sweep is
+    documented (`measur/sweep_slots.py`, `measur/README.md`, third section).
+  * **Still open, honestly**: `brain_query_relation` in the C-ABI reads ONLY
+    the exact-string `direct_facts` dictionary; the VSA bank's associative
+    read (`bank_query_rule`, Hamming over every page the owner owns) is
+    wired on the WRITE path only (the fact is embedded into the bank, but
+    never read back through the ABI). The token-decision path (F21) is not
+    affected -- it never touches this dictionary -- but an external LLM
+    integrating through the fact API gets no semantic generalization until
+    the query miss is routed through the associative read.
 
 - **Where the non-LLM brain stands after the benchmark**: the reasoning machinery is sound
   (lossless multi-hop at any depth 1..8, physical ablation proof of provenance, zero-shot

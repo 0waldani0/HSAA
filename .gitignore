@@ -15,6 +15,7 @@ obj/
 # Temporary and test artifacts
 *.tmp
 *.log
+__pycache__/
 _unpacked/
 stdout.txt
 stderr.txt
