@@ -1,0 +1,30 @@
+# Build directories
+build/
+build_cmake/
+bin/
+obj/
+
+# Binaries and outputs
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.cubin
+*.bin
+
+# Temporary and test artifacts
+*.tmp
+*.log
+_unpacked/
+stdout.txt
+stderr.txt
+
+# Visual Studio / IDE
+.vs/
+*.sln
+*.vcxproj*
+CMakeSettings.json
+
+# Local agent work products (backups, saved training states)
+*.bak
+*.state
