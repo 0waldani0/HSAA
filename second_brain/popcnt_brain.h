@@ -7,6 +7,18 @@
 extern "C" {
 #endif
 
+#if defined(_WIN32)
+  #if defined(BUILDING_POPCNT_BRAIN_DLL)
+    #define POPCNT_BRAIN_API __declspec(dllexport)
+  #elif defined(USING_POPCNT_BRAIN_DLL)
+    #define POPCNT_BRAIN_API __declspec(dllimport)
+  #else
+    #define POPCNT_BRAIN_API
+  #endif
+#else
+  #define POPCNT_BRAIN_API
+#endif
+
 // =============================================================================
 // Bank file layout
 //
@@ -100,27 +112,27 @@ typedef struct PopCountBrain PopCountBrain;
 // max_pages: a capacity hint only. The current implementation maps a single
 // shared weight bank for the process, so this value does not partition or bound
 // anything and is otherwise unused; it is NOT reported by brain_get_stats.
-PopCountBrain* brain_create(size_t max_pages, const char* filepath);
+POPCNT_BRAIN_API PopCountBrain* brain_create(size_t max_pages, const char* filepath);
 
 // Destroy the brain instance, releasing mapped memory and file locks.
-void brain_destroy(PopCountBrain* brain);
+POPCNT_BRAIN_API void brain_destroy(PopCountBrain* brain);
 
 // Store an episodic relation / fact triple (Subject - Relation - Object).
 // Writes the triple into the in-RAM exact index, into the associative fallback
 // index, and feeds it to the neural engine. Returns 1 on success, 0 on failure.
-int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
+POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
 
 // Query an object given a subject and relation. Exact raw-string lookup first;
 // on a miss the lexical associative fallback documented above may resolve a
 // near-miss (case/whitespace variants, single-character typos within the
 // measured threshold). The neural/VSA engine is never consulted.
 // Returns 1 if found and fills out_object (null-terminated), 0 if not found.
-int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len);
+POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len);
 
 // Verify consistency: returns 1 if proposed statement contradicts stored knowledge, 0 otherwise.
 // Resolves through the same exact-then-associative path; a near-miss that
 // resolves to a stored fact with a different object counts as a conflict.
-int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
+POPCNT_BRAIN_API int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
 
 // Stats.
 //   out_active_pages: 4 KB expert pages that hold trained weights, as a count of
@@ -134,7 +146,77 @@ int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* 
 //   out_active_rules: number of brain_store_fact calls, NOT the number of distinct
 //                     stored rules (probed: 250 after 200 distinct + 50 duplicate
 //                     stores).
-void brain_get_stats(PopCountBrain* brain, size_t* out_active_pages, size_t* out_active_rules);
+POPCNT_BRAIN_API void brain_get_stats(PopCountBrain* brain, size_t* out_active_pages, size_t* out_active_rules);
+
+// State persistence
+POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath);
+POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath);
+
+// =============================================================================
+// PopCount Generative LLM (Coherent Text & Code Training and Generation)
+//
+// Hybrid neuro-symbolic language and code engine combining:
+//   1. CodeProseTokenizer: structure-preserving tokenization for UTF-8 prose
+//      and multi-line source code (<nl>, <ind_1>..<ind_8>, multi-char operators).
+//   2. Multi-Horizon Suffix Cascade (L = 1..8 + skip-gram): resolves the
+//      single-level shortlist truncation ceiling by cascading across 8 context
+//      orders with lower-order reinforcement.
+//   3. Symbolic Scope-Register Induction (<reg_0>..<reg_7>): binds function
+//      parameters in scope to positional registers, enabling zero-shot variable
+//      renaming in generated source code.
+//   4. 512-Bit Bitwise MLGRU + 4 KB Ternary STE Micro-Experts + 512-Bit VSA
+//      Discourse Topic Memory: scores candidates via hardware POPCNT dot
+//      products against both local recurrent state and global segment topic
+//      hypervectors, plus live episodic facts stored via brain_store_fact.
+//   5. Structural Syntax Stack Automaton & Anti-Loop Controller: enforces
+//      balanced (), {}, [], indentation alignment, and cycle-free generation.
+// =============================================================================
+typedef struct BrainTrainStats {
+    size_t vocab_size;
+    size_t num_sequences;
+    size_t total_tokens;
+    size_t total_transitions;
+    int epochs;
+    int initial_errors;
+    int final_errors;
+    double replay_accuracy_percent;
+    double shortlist_coverage_percent;
+    double train_time_ms;
+    double tokens_per_sec;
+} BrainTrainStats;
+
+// Train the PopCount Generative LLM on an in-memory UTF-8 text/code corpus.
+// If epochs <= 0, defaults to 6 STE epochs. out_stats may be NULL.
+// Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_train_corpus(
+    PopCountBrain* brain,
+    const char* corpus_text,
+    int epochs,
+    BrainTrainStats* out_stats
+);
+
+// Train the PopCount Generative LLM from a UTF-8 corpus file on disk.
+// Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_train_file(
+    PopCountBrain* brain,
+    const char* filepath,
+    int epochs,
+    BrainTrainStats* out_stats
+);
+
+// Autoregressively generate coherent text or source code from a prompt.
+// Writes null-terminated UTF-8 output to out_text (up to max_len bytes).
+// temperature <= 0.0f selects deterministic greedy decoding; temperature > 0.0f
+// enables softmax-free Gumbel/Boltzmann top-k sampling over the POPCNT logits.
+// Returns the number of generated tokens (> 0) on success, or 0 on failure.
+POPCNT_BRAIN_API int brain_generate(
+    PopCountBrain* brain,
+    const char* prompt,
+    char* out_text,
+    size_t max_len,
+    int max_tokens,
+    float temperature
+);
 
 #ifdef __cplusplus
 }

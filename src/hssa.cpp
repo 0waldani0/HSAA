@@ -77,7 +77,7 @@ HssaContext* hssa_create(uint32_t num_layers) {
     HssaContext* ctx = (HssaContext*)std::calloc(1, sizeof(HssaContext));
     if (!ctx) return nullptr;
 
-    ctx->state_lock = new (std::nothrow) std::mutex();
+    ctx->state_lock = new (std::nothrow) std::recursive_mutex();
     if (!ctx->state_lock) {
         std::free(ctx);
         return nullptr;
@@ -92,7 +92,7 @@ HssaContext* hssa_create(uint32_t num_layers) {
 
     ctx->layers = (HssaLayer*)std::calloc(num_layers, sizeof(HssaLayer));
     if (!ctx->layers) {
-        delete static_cast<std::mutex*>(ctx->state_lock);
+        delete static_cast<std::recursive_mutex*>(ctx->state_lock);
         ctx->state_lock = nullptr;
         std::free(ctx);
         return nullptr;
@@ -117,6 +117,7 @@ HssaContext* hssa_create(uint32_t num_layers) {
         std::memset(lyr->tt_v, 0, HSSA_TT16_CORE_SIZE * sizeof(float));
 
         lyr->vsa_handle = nullptr;
+        lyr->reserved[0] = nullptr;
     }
 
     // Preallocate 64-byte aligned hot-path scratchpads to guarantee zero heap allocations
@@ -260,7 +261,7 @@ void hssa_destroy(HssaContext* ctx) {
         ctx->global_vsa_db = nullptr;
     }
 
-    delete static_cast<std::mutex*>(ctx->state_lock);
+    delete static_cast<std::recursive_mutex*>(ctx->state_lock);
     ctx->state_lock = nullptr;
 
     std::free(ctx);
@@ -268,10 +269,20 @@ void hssa_destroy(HssaContext* ctx) {
 
 int hssa_reset_state(HssaContext* ctx) {
     if (!ctx || !ctx->layers) return -1;
-    for (uint32_t l = 0; l < ctx->config.num_layers; ++l) {
-        HssaLayer* lyr = &ctx->layers[l];
-        if (lyr->deltanet_state) {
-            std::memset(lyr->deltanet_state, 0, HSSA_DELTANET_STATE_SIZE * sizeof(float));
+    if (ctx->state_lock) {
+        std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+        for (uint32_t l = 0; l < ctx->config.num_layers; ++l) {
+            HssaLayer* lyr = &ctx->layers[l];
+            if (lyr->deltanet_state) {
+                std::memset(lyr->deltanet_state, 0, HSSA_DELTANET_STATE_SIZE * sizeof(float));
+            }
+        }
+    } else {
+        for (uint32_t l = 0; l < ctx->config.num_layers; ++l) {
+            HssaLayer* lyr = &ctx->layers[l];
+            if (lyr->deltanet_state) {
+                std::memset(lyr->deltanet_state, 0, HSSA_DELTANET_STATE_SIZE * sizeof(float));
+            }
         }
     }
     return 0;
@@ -282,6 +293,55 @@ int hssa_reset_state(HssaContext* ctx) {
  * Tier 1: Gated DeltaNet State-Space Recurrence Kernel
  * =============================================================================
  */
+
+/* Full AVX-512 non-zero check for TT16 core presence via _mm512_or_si512.
+ * Unrolls across 64 floats (4 x 512-bit vectors) per iteration to eliminate
+ * per-vector branching and bitwise ORs all lanes into a single accumulator. */
+static inline bool hssa_is_tt16_active(const float* u_ptr, const float* v_ptr, size_t count) {
+    if (!u_ptr && !v_ptr) return false;
+    __m512i acc = _mm512_setzero_si512();
+
+    if (u_ptr) {
+        size_t i = 0;
+        for (; i + 64 <= count; i += 64) {
+            __m512i u0 = _mm512_loadu_si512((const __m512i*)(u_ptr + i));
+            __m512i u1 = _mm512_loadu_si512((const __m512i*)(u_ptr + i + 16));
+            __m512i u2 = _mm512_loadu_si512((const __m512i*)(u_ptr + i + 32));
+            __m512i u3 = _mm512_loadu_si512((const __m512i*)(u_ptr + i + 48));
+            acc = _mm512_or_si512(acc, _mm512_or_si512(_mm512_or_si512(u0, u1), _mm512_or_si512(u2, u3)));
+        }
+        for (; i + 16 <= count; i += 16) {
+            acc = _mm512_or_si512(acc, _mm512_loadu_si512((const __m512i*)(u_ptr + i)));
+        }
+        for (; i < count; ++i) {
+            if (u_ptr[i] != 0.0f) return true;
+        }
+    }
+
+    if (v_ptr) {
+        size_t i = 0;
+        for (; i + 64 <= count; i += 64) {
+            __m512i v0 = _mm512_loadu_si512((const __m512i*)(v_ptr + i));
+            __m512i v1 = _mm512_loadu_si512((const __m512i*)(v_ptr + i + 16));
+            __m512i v2 = _mm512_loadu_si512((const __m512i*)(v_ptr + i + 32));
+            __m512i v3 = _mm512_loadu_si512((const __m512i*)(v_ptr + i + 48));
+            acc = _mm512_or_si512(acc, _mm512_or_si512(_mm512_or_si512(v0, v1), _mm512_or_si512(v2, v3)));
+        }
+        for (; i + 16 <= count; i += 16) {
+            acc = _mm512_or_si512(acc, _mm512_loadu_si512((const __m512i*)(v_ptr + i)));
+        }
+        for (; i < count; ++i) {
+            if (v_ptr[i] != 0.0f) return true;
+        }
+    }
+
+    return _mm512_test_epi64_mask(acc, acc) != 0;
+}
+
+static inline bool hssa_is_layer_tt16_active(HssaLayer* layer) {
+    if (!layer) return false;
+    return layer->reserved[0] != nullptr;
+}
 
 static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float* out_vec) {
     const size_t H = HSSA_HEADS;       // 8 heads
@@ -385,7 +445,7 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
     // Apply TT16 low-rank continuous core residual if active/adapted
     const float* v_ptr = layer->tt_v;
     const float* u_ptr = layer->tt_u;
-    if (v_ptr && u_ptr && (v_ptr[0] != 0.0f || u_ptr[0] != 0.0f)) {
+    if (v_ptr && u_ptr && hssa_is_layer_tt16_active(layer)) {
         const uint32_t R = HSSA_RANK;
         const uint32_t D = HSSA_HIDDEN_DIM;
 
@@ -620,7 +680,7 @@ int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, Hs
     // The scratchpads, Hopfield patterns and tt_u/tt_v cores are single-instance
     // mutable state. hssa_update_tt16() mutates the cores from another thread, so
     // every pass through this function holds the context lock.
-    std::lock_guard<std::mutex> state_guard(*static_cast<std::mutex*>(ctx->state_lock));
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
     double t_start = get_qpc_time_us();
 
@@ -807,6 +867,7 @@ int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, Hs
 
 int hssa_project_simplex(HssaContext* ctx, float* logits, size_t vocab_size) {
     if (!ctx || !logits || vocab_size == 0) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
     // 1. Collect contradicted candidates into a local veto list. A list (rather than a
     //    sentinel value written into logits) keeps the veto exact: a caller's legitimate
@@ -1046,6 +1107,7 @@ int hssa_mutate_knowledge(HssaContext* ctx, const char* subj, const char* rel, c
  * public entry points funnel through this implementation. */
 static int hssa_register_assertion_impl(HssaContext* ctx, uint32_t token_id, const char* subj, const char* rel, const char* obj) {
     if (!ctx || !subj || !rel || !obj) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
     // Grow the registry on demand so an idle context carries no assertion footprint.
     if (ctx->assertion_count >= ctx->assertion_capacity) {
@@ -1085,6 +1147,7 @@ int hssa_register_assertion(HssaContext* ctx, uint32_t token_id, const char* sub
 int hssa_set_unembedding_matrix(HssaContext* ctx, const float* unembed_weights, size_t vocab_size) {
     if (!ctx) return -1;
     if (vocab_size == 0 || vocab_size > HSSA_MAX_VOCAB) return -2;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
     const size_t total_floats = vocab_size * HSSA_HIDDEN_DIM;
 
@@ -1194,6 +1257,8 @@ int hssa_generate(
     if (!ctx->unembed_weights || !ctx->logits_buf || ctx->vocab_size == 0) return -6;
     if (prompt_len > 0 && !prompt_tokens) return -7;
 
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
     const size_t vocab = ctx->vocab_size;
     const double t_start_ms = get_qpc_time_us() / 1000.0;
 
@@ -1217,6 +1282,12 @@ int hssa_generate(
     // 2. Decode: zero-heap loop over preallocated buffers only.
     for (size_t t = 0; t < max_gen_len; ++t) {
         hssa_compute_logits(ctx, cur_vec);
+        if (temperature > 1e-4f) {
+            const float inv_temp = 1.0f / temperature;
+            for (size_t v = 0; v < vocab; ++v) {
+                ctx->logits_buf[v] *= inv_temp;
+            }
+        }
         const int rejected = hssa_project_simplex(ctx, ctx->logits_buf, vocab);
         if (rejected < 0) return -10;
         if (rejected > 0) contradictions_blocked += (uint32_t)rejected;
@@ -1242,6 +1313,7 @@ int hssa_generate(
 
 int hssa_clear_assertions(HssaContext* ctx) {
     if (!ctx) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
     ctx->assertion_count = 0;
     return 0;
 }
@@ -1266,9 +1338,10 @@ int hssa_update_tt16(HssaContext* ctx, uint32_t layer_idx, const float* u_delta,
     if (!ctx || !u_delta || !v_delta || layer_idx >= ctx->config.num_layers) return -1;
 
     // Serialize against hssa_forward_token(), which reads these same cores.
-    std::lock_guard<std::mutex> state_guard(*static_cast<std::mutex*>(ctx->state_lock));
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
     HssaLayer* lyr = &ctx->layers[layer_idx];
+    lyr->reserved[0] = (void*)(uintptr_t)1;
     size_t sz = HSSA_TT16_CORE_SIZE;
 
     // 4-way AVX-512 unrolled vector addition

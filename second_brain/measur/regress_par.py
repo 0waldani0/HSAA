@@ -96,7 +96,10 @@ def self_test_group():
 
 def capi_group():
     bat(os.path.join(MEAS, "build_capi_probe.bat"), 1800)
-    run("capi_probe", [os.path.join(MEAS, "capi_probe.exe")], 1800)
+    exe = os.path.join(ROOT, "build", "capi_probe.exe")
+    if not os.path.isfile(exe):
+        exe = os.path.join(MEAS, "capi_probe.exe")
+    run("capi_probe", [exe], 1800)
 
 
 def e2e_group():
@@ -124,7 +127,8 @@ for script in ("build_stress.bat", "build_stress_bench.bat",
                "build_stress_tier5.bat", "build_stress_tier5_adversarial.bat",
                "build_challenger2.bat", "build_hssa_m1_tests.bat",
                "build_hssa_m3_tests.bat", "build_bench_model_mod.bat",
-               "build_bench_hot_swap.bat", "build_ptq_validation.bat"):
+               "build_bench_hot_swap.bat", "build_ptq_validation.bat",
+               "build_llm_text_code_tests.bat"):
     bat_run(os.path.join(ROOT, "tests", script), 1800)
 print("phase C: %.0fs" % (time.time() - t0), flush=True)
 

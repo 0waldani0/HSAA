@@ -1,13 +1,12 @@
-# [Gemini 3.8 Flash] Start: Python ctypes wrapper for PopCount Second Brain (AVX-512 VPOPCNTDQ)
 import ctypes
 import os
 import time
 
 DLL_DIR = os.path.dirname(os.path.abspath(__file__))
 candidate_paths = [
+    os.path.join(os.path.dirname(DLL_DIR), "build", "popcnt_brain.dll"),
     os.path.join(DLL_DIR, "popcnt_brain.dll"),
     os.path.join(DLL_DIR, "build", "popcnt_brain.dll"),
-    r"C:\Users\Администратор\Documents\project upgrade\second_brain\build\popcnt_brain.dll"
 ]
 
 DLL_PATH = None
@@ -18,6 +17,21 @@ for p in candidate_paths:
 
 class PopCountBrainStruct(ctypes.Structure):
     pass
+
+class BrainTrainStatsStruct(ctypes.Structure):
+    _fields_ = [
+        ("vocab_size", ctypes.c_size_t),
+        ("num_sequences", ctypes.c_size_t),
+        ("total_tokens", ctypes.c_size_t),
+        ("total_transitions", ctypes.c_size_t),
+        ("epochs", ctypes.c_int),
+        ("initial_errors", ctypes.c_int),
+        ("final_errors", ctypes.c_int),
+        ("replay_accuracy_percent", ctypes.c_double),
+        ("shortlist_coverage_percent", ctypes.c_double),
+        ("train_time_ms", ctypes.c_double),
+        ("tokens_per_sec", ctypes.c_double),
+    ]
 
 class SecondBrain:
     def __init__(self, max_pages=4096, state_file="C:/models/second_brain_state.bin"):
@@ -44,11 +58,43 @@ class SecondBrain:
         
         self.lib.brain_get_stats.argtypes = [ctypes.POINTER(PopCountBrainStruct), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
         self.lib.brain_get_stats.restype = None
+
+        self.lib.brain_save_state.argtypes = [ctypes.POINTER(PopCountBrainStruct), ctypes.c_char_p]
+        self.lib.brain_save_state.restype = ctypes.c_int
+
+        self.lib.brain_load_state.argtypes = [ctypes.POINTER(PopCountBrainStruct), ctypes.c_char_p]
+        self.lib.brain_load_state.restype = ctypes.c_int
+
+        self.lib.brain_train_corpus.argtypes = [
+            ctypes.POINTER(PopCountBrainStruct),
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(BrainTrainStatsStruct),
+        ]
+        self.lib.brain_train_corpus.restype = ctypes.c_int
+
+        self.lib.brain_train_file.argtypes = [
+            ctypes.POINTER(PopCountBrainStruct),
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(BrainTrainStatsStruct),
+        ]
+        self.lib.brain_train_file.restype = ctypes.c_int
+
+        self.lib.brain_generate.argtypes = [
+            ctypes.POINTER(PopCountBrainStruct),
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_float,
+        ]
+        self.lib.brain_generate.restype = ctypes.c_int
         
         # Ensure directory exists for state_file if provided
         if state_file:
             os.makedirs(os.path.dirname(os.path.abspath(state_file)), exist_ok=True)
-            path_bytes = state_file.encode("ascii", errors="ignore")
+            path_bytes = state_file.encode("utf-8")
         else:
             path_bytes = b"C:/models/second_brain_state.bin"
             
@@ -75,6 +121,75 @@ class SecondBrain:
         self.lib.brain_get_stats(self.handle, ctypes.byref(pages), ctypes.byref(rules))
         return {"pages": pages.value, "rules": rules.value}
 
+    def save_state(self, filepath: str) -> bool:
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        return bool(self.lib.brain_save_state(self.handle, filepath.encode("utf-8")))
+
+    def load_state(self, filepath: str) -> bool:
+        return bool(self.lib.brain_load_state(self.handle, filepath.encode("utf-8")))
+
+    def train_corpus(self, corpus_text: str, epochs: int = 6) -> dict:
+        st = BrainTrainStatsStruct()
+        ok = self.lib.brain_train_corpus(
+            self.handle,
+            corpus_text.encode("utf-8"),
+            int(epochs),
+            ctypes.byref(st),
+        )
+        if not ok:
+            raise RuntimeError("brain_train_corpus failed")
+        return {
+            "vocab_size": st.vocab_size,
+            "num_sequences": st.num_sequences,
+            "total_tokens": st.total_tokens,
+            "total_transitions": st.total_transitions,
+            "epochs": st.epochs,
+            "initial_errors": st.initial_errors,
+            "final_errors": st.final_errors,
+            "replay_accuracy_percent": st.replay_accuracy_percent,
+            "shortlist_coverage_percent": st.shortlist_coverage_percent,
+            "train_time_ms": st.train_time_ms,
+            "tokens_per_sec": st.tokens_per_sec,
+        }
+
+    def train_file(self, filepath: str, epochs: int = 6) -> dict:
+        st = BrainTrainStatsStruct()
+        ok = self.lib.brain_train_file(
+            self.handle,
+            filepath.encode("utf-8"),
+            int(epochs),
+            ctypes.byref(st),
+        )
+        if not ok:
+            raise RuntimeError(f"brain_train_file failed on {filepath}")
+        return {
+            "vocab_size": st.vocab_size,
+            "num_sequences": st.num_sequences,
+            "total_tokens": st.total_tokens,
+            "total_transitions": st.total_transitions,
+            "epochs": st.epochs,
+            "initial_errors": st.initial_errors,
+            "final_errors": st.final_errors,
+            "replay_accuracy_percent": st.replay_accuracy_percent,
+            "shortlist_coverage_percent": st.shortlist_coverage_percent,
+            "train_time_ms": st.train_time_ms,
+            "tokens_per_sec": st.tokens_per_sec,
+        }
+
+    def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.0, buffer_size: int = 8192) -> str:
+        buf = ctypes.create_string_buffer(buffer_size)
+        n_tok = self.lib.brain_generate(
+            self.handle,
+            prompt.encode("utf-8"),
+            buf,
+            buffer_size,
+            int(max_tokens),
+            float(temperature),
+        )
+        if n_tok <= 0:
+            return ""
+        return buf.value.decode("utf-8")
+
     def close(self):
         if hasattr(self, "handle") and self.handle:
             self.lib.brain_destroy(self.handle)
@@ -84,6 +199,9 @@ class SecondBrain:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def __del__(self):
         self.close()
 
 if __name__ == "__main__":
@@ -107,4 +225,3 @@ if __name__ == "__main__":
         stats = brain.get_stats()
         print(f"[+] Brain stats: {stats}")
     print("[SUCCESS] SecondBrain Python test completed flawlessly!")
-# [Gemini 3.8 Flash] End

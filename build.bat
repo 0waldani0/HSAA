@@ -80,6 +80,8 @@ REM Route directly if specific target requested
 if "%1"=="cubin" goto :build_cubin
 if "%1"=="ptq" goto :build_ptq
 if "%1"=="brain" goto :build_second_brain
+if "%1"=="dll" goto :build_dll
+if "%1"=="brain_dll" goto :build_dll
 if "%1"=="bridge" goto :build_bridge
 if "%1"=="test_bridge" goto :build_bridge
 if "%1"=="vsa_db" goto :build_vsa_db
@@ -151,6 +153,16 @@ cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_LIB /I"%ROOT_DIR%second_brain" /
 if errorlevel 1 exit /b 1
 lib.exe /nologo /OUT:"%BUILD_DIR%\popcnt_brain.lib" "%BUILD_DIR%\popcnt_brain_lib.obj"
 if errorlevel 1 exit /b 1
+
+:build_dll
+echo [*] Compiling popcnt_brain.dll shared library...
+cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_DLL /LD /I"%ROOT_DIR%second_brain" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.dll" /Fo:"%BUILD_DIR%\popcnt_brain_dll.obj" %LINK_FLAGS%
+if errorlevel 1 exit /b 1
+if not exist "%ROOT_DIR%second_brain\build" mkdir "%ROOT_DIR%second_brain\build"
+copy /y "%BUILD_DIR%\popcnt_brain.dll" "%ROOT_DIR%second_brain\build\popcnt_brain.dll" >nul
+echo [+] PopCount Second Brain DLL built: "%BUILD_DIR%\popcnt_brain.dll"
+if "%1"=="dll" exit /b 0
+if "%1"=="brain_dll" exit /b 0
 if "%1"=="brain" exit /b 0
 
 REM ============================================================================

@@ -15,10 +15,13 @@
 # facts need.
 import os, re, shutil, struct, subprocess, sys, time
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-TMP = os.path.join(os.environ["TEMP"], "opencode")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+TMP = os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), "opencode")
 EXE = os.path.join(ROOT, "build", "popcnt_brain.exe")
-CORPUS = os.path.join(TMP, "real_corpus.txt")
+REPO_CORPUS = os.path.join(HERE, "data", "real_corpus.txt")
+TMP_CORPUS = os.path.join(TMP, "real_corpus.txt")
+CORPUS = REPO_CORPUS if os.path.isfile(REPO_CORPUS) else TMP_CORPUS
 STATE = os.path.join(ROOT, "build", "weight_bank_corpus_train.state")
 
 REF_ACC = 91.455

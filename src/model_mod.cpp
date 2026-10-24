@@ -490,6 +490,8 @@ int model_forward_layer(void* ctx, uint32_t layer_idx, const float* in_vec, floa
     LayerType current_type =
         std::atomic_ref<LayerType>(lyr->layer_type).load(std::memory_order_acquire);
 
+    // Note: CPU layer operators execute FP32 reference pathways; lyr->precision
+    // is preserved atomically across runtime modulation for hardware GPU dispatch.
     // 1. Dispatch base layer operator
     switch (current_type) {
         case LAYER_GQA_ATTENTION:

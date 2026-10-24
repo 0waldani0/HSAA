@@ -30,7 +30,7 @@ if not exist "%ROOT%\build\popcnt_brain.lib" (
     exit /b 92
 )
 
-set "OUTDIR=%HERE%"
+set "OUTDIR=%ROOT%\build"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
 echo [*] building capi_probe.exe ...

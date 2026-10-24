@@ -25,15 +25,18 @@ if not defined VCVARS64 (
 )
 call "%VCVARS64%" >nul
 
+set "BUILD_DIR=%ROOT%\build"
+if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
+
 echo [*] building assoc_calib.exe ...
 cl.exe /nologo /std:c++20 /O2 /EHsc /utf-8 /arch:AVX2 /I"%ROOT%\second_brain" ^
     "%HERE%assoc_calib.cpp" ^
-    /Fe:"%HERE%assoc_calib.exe" /Fo:"%HERE%assoc_calib.obj" 2>&1
+    /Fe:"%BUILD_DIR%\assoc_calib.exe" /Fo:"%BUILD_DIR%\assoc_calib.obj" 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [FATAL] assoc_calib build FAILED
     exit /b 91
 )
 
-"%HERE%assoc_calib.exe"
+"%BUILD_DIR%\assoc_calib.exe"
 set "RC=%ERRORLEVEL%"
 exit /b %RC%

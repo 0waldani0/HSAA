@@ -2,6 +2,7 @@
 #include "assoc_sketch.h"
 #include "domain_seed_corpus.h"
 #include <memory>
+#include <mutex>
 // =============================================================================
 // sublinear_popcnt_llm.cpp
 // 100% Native C++20 Standalone MatMul-Free, Ultra-Sparse Sublinear LLM Engine
@@ -397,15 +398,16 @@ inline int32_t vsa_bipolar_dot_256(
 }
 
 // Zero-overhead direct page touch tracking (eliminates 5.2ms VEH/VirtualProtect trap)
-static uintptr_t g_tracked_base = 0;
-static size_t g_tracked_bytes = 0;
+static std::mutex g_mmu_telemetry_mutex;
+static std::atomic<uintptr_t> g_tracked_base{0};
+static std::atomic<size_t> g_tracked_bytes{0};
 static std::atomic<size_t> g_mmu_page_fault_count{0};
-static unsigned char g_page_touched_bitmap[TOTAL_EXPERTS];
+static std::atomic<uint8_t> g_page_touched_bitmap[TOTAL_EXPERTS];
 
 inline void touch_page(uint32_t page_id) {
     if (page_id < TOTAL_EXPERTS) {
-        if (g_page_touched_bitmap[page_id] == 0) {
-            g_page_touched_bitmap[page_id] = 1;
+        uint8_t expected = 0;
+        if (g_page_touched_bitmap[page_id].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
             g_mmu_page_fault_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -1672,8 +1674,21 @@ static void populate_single_page_deterministic(TernaryMLPExpertPage* pages, uint
 
 #if defined(_WIN32)
 MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
-    HANDLE hFile = CreateFileA(
-        filepath,
+    if (!filepath) return nullptr;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
+    if (wlen <= 0) return nullptr;
+    std::vector<wchar_t> wpath(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wpath.data(), wlen);
+
+    // Ensure parent directory exists
+    std::filesystem::path fpath(wpath.data());
+    if (fpath.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(fpath.parent_path(), ec);
+    }
+
+    HANDLE hFile = CreateFileW(
+        wpath.data(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
@@ -1682,7 +1697,7 @@ MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
         NULL
     );
     if (hFile == INVALID_HANDLE_VALUE) {
-        std::cerr << "CreateFileA failed: " << GetLastError() << " on path: " << filepath << "\n";
+        std::cerr << "CreateFileW failed: " << GetLastError() << " on path: " << filepath << "\n";
         return nullptr;
     }
 
@@ -1695,7 +1710,7 @@ MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
     }
 
     const size_t mapping_bytes = BANK_MAPPING_BYTES;
-    HANDLE hMap = CreateFileMappingA(
+    HANDLE hMap = CreateFileMappingW(
         hFile,
         NULL,
         PAGE_READWRITE,
@@ -1704,7 +1719,7 @@ MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
         NULL
     );
     if (!hMap) {
-        std::cerr << "CreateFileMappingA failed: " << GetLastError() << "\n";
+        std::cerr << "CreateFileMappingW failed: " << GetLastError() << "\n";
         CloseHandle(hFile);
         return nullptr;
     }
@@ -1721,17 +1736,21 @@ MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
 
 void arm_hardware_mmu_page_trap(MappedWeightBank* bank) {
     if (!bank) return;
-    g_tracked_base = reinterpret_cast<uintptr_t>(bank->base_ptr);
-    g_tracked_bytes = bank->total_bytes;
+    std::lock_guard<std::mutex> lock(g_mmu_telemetry_mutex);
+    g_tracked_base.store(reinterpret_cast<uintptr_t>(bank->base_ptr), std::memory_order_relaxed);
+    g_tracked_bytes.store(bank->total_bytes, std::memory_order_relaxed);
     g_mmu_page_fault_count.store(0, std::memory_order_relaxed);
-    std::memset(g_page_touched_bitmap, 0, sizeof(g_page_touched_bitmap));
+    for (size_t i = 0; i < TOTAL_EXPERTS; ++i) {
+        g_page_touched_bitmap[i].store(0, std::memory_order_relaxed);
+    }
 }
 
 size_t disarm_hardware_mmu_page_trap(MappedWeightBank* bank) {
     if (!bank) return 0;
+    std::lock_guard<std::mutex> lock(g_mmu_telemetry_mutex);
     size_t touched = g_mmu_page_fault_count.load(std::memory_order_relaxed);
-    g_tracked_base = 0;
-    g_tracked_bytes = 0;
+    g_tracked_base.store(0, std::memory_order_relaxed);
+    g_tracked_bytes.store(0, std::memory_order_relaxed);
     return touched;
 }
 
@@ -1760,8 +1779,15 @@ struct AutoMappedWeightBank {
             bank = nullptr;
         }
         if (!filepath.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(filepath, ec);
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath.c_str(), -1, NULL, 0);
+            if (wlen > 0) {
+                std::vector<wchar_t> wpath(wlen);
+                MultiByteToWideChar(CP_UTF8, 0, filepath.c_str(), -1, wpath.data(), wlen);
+                DeleteFileW(wpath.data());
+            } else {
+                std::error_code ec;
+                std::filesystem::remove(filepath, ec);
+            }
         }
     }
 
@@ -6572,6 +6598,8 @@ static int train_corpus_cli(int argc, char** argv) {
 #endif // BUILDING_POPCNT_BRAIN_LIB
 
 #ifndef BUILDING_POPCNT_BRAIN_LIB
+static int train_and_generate_llm_cli(int argc, char** argv);
+
 int main(int argc, char** argv) {
     // User-supplied corpus training. The built-in self-tests below run
     // unchanged when --train is absent. --load restores the model a previous
@@ -6579,6 +6607,10 @@ int main(int argc, char** argv) {
     if (argc > 2 && (std::strcmp(argv[1], "--train") == 0 ||
                       std::strcmp(argv[1], "--load") == 0)) {
         return train_corpus_cli(argc, argv);
+    }
+    if (argc >= 2 && (std::strcmp(argv[1], "--train-llm") == 0 ||
+                      std::strcmp(argv[1], "--generate") == 0)) {
+        return train_and_generate_llm_cli(argc, argv);
     }
 #if defined(_WIN32)
     std::filesystem::create_directories("build");
@@ -7342,9 +7374,1000 @@ struct AssocFact {
     std::string object;
 };
 
+// =============================================================================
+// PopCount Generative LLM: CodeProseTokenizer + Multi-Horizon Suffix Cascade
+// + Symbolic Scope-Register Induction + 512-Bit STE Micro-Experts + VSA Topic
+// Memory + Live Fact Steering + Structural Syntax Stack Automaton
+// =============================================================================
+
+struct CodeProseTokenizer {
+    static constexpr int TOK_PAD   = 0;
+    static constexpr int TOK_BOS   = 1;
+    static constexpr int TOK_EOS   = 2;
+    static constexpr int TOK_NL    = 3;
+    static constexpr int TOK_IND_1 = 4;  // <ind_1> .. <ind_8> are 4..11
+    static constexpr int TOK_REG_0 = 12; // <reg_0> .. <reg_7> are 12..19
+    static constexpr int NUM_REGS  = 8;
+
+    std::unordered_map<std::string, int> word_to_id;
+    std::vector<std::string> id_to_word;
+
+    CodeProseTokenizer() {
+        reset();
+    }
+
+    void reset() {
+        word_to_id.clear();
+        id_to_word.clear();
+        add_word("<pad>");
+        add_word("<bos>");
+        add_word("<eos>");
+        add_word("<nl>");
+        for (int i = 1; i <= 8; ++i) {
+            add_word("<ind_" + std::to_string(i) + ">");
+        }
+        for (int r = 0; r < NUM_REGS; ++r) {
+            add_word("<reg_" + std::to_string(r) + ">");
+        }
+    }
+
+    int add_word(const std::string& w) {
+        auto it = word_to_id.find(w);
+        if (it != word_to_id.end()) return it->second;
+        int id = static_cast<int>(id_to_word.size());
+        word_to_id[w] = id;
+        id_to_word.push_back(w);
+        return id;
+    }
+
+    int get_word_id(const std::string& w) const {
+        auto it = word_to_id.find(w);
+        return (it != word_to_id.end()) ? it->second : -1;
+    }
+
+    static bool is_reg_token(int id) {
+        return id >= TOK_REG_0 && id < TOK_REG_0 + NUM_REGS;
+    }
+
+    static bool is_ind_token(int id) {
+        return id >= TOK_IND_1 && id < TOK_IND_1 + 8;
+    }
+
+    static int ind_level(int id) {
+        return is_ind_token(id) ? (id - TOK_IND_1 + 1) : 0;
+    }
+
+    static bool is_word_byte(unsigned char c) {
+        return std::isalnum(c) != 0 || c == '_' || c >= 0x80;
+    }
+
+    static bool is_identifier_str(const std::string& w) {
+        if (w.empty() || w[0] == '<' || w[0] == '"' || w[0] == '\'') return false;
+        unsigned char c0 = static_cast<unsigned char>(w[0]);
+        if (std::isdigit(c0)) return false;
+        return std::isalpha(c0) != 0 || c0 == '_' || c0 >= 0x80;
+    }
+
+    static bool is_code_keyword(const std::string& w) {
+        static const std::unordered_set<std::string> kw = {
+            "def", "return", "if", "else", "elif", "for", "while", "do", "switch",
+            "case", "break", "continue", "in", "not", "and", "or", "is", "pass",
+            "import", "from", "as", "class", "struct", "enum", "namespace",
+            "template", "typename", "public", "private", "protected", "virtual",
+            "override", "static", "inline", "constexpr", "const", "volatile",
+            "mutable", "explicit", "friend", "using", "typedef", "sizeof",
+            "alignof", "new", "delete", "try", "catch", "throw", "noexcept",
+            "int", "float", "double", "char", "void", "bool", "long", "short",
+            "unsigned", "signed", "auto", "size_t", "ssize_t", "uint8_t",
+            "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t",
+            "int64_t", "uintptr_t", "ptrdiff_t", "FILE", "std", "vector", "string",
+            "map", "unordered_map", "set", "unordered_set", "pair", "unique_ptr",
+            "shared_ptr", "make_unique", "make_shared", "cout", "cerr", "endl",
+            "printf", "fprintf", "snprintf", "strlen", "strcmp", "memcpy", "memset",
+            "malloc", "free", "max", "min", "abs", "clamp", "swap", "sort", "begin",
+            "end", "size", "empty", "push_back", "emplace_back", "pop_back", "clear",
+            "resize", "reserve", "data", "c_str", "find", "substr", "length",
+            "true", "false", "True", "False", "None", "NULL", "nullptr", "self",
+            "this", "len", "range", "enumerate", "zip", "list", "dict", "tuple",
+            "print", "sum", "any", "all", "isinstance", "Exception", "ValueError",
+            "RuntimeError", "include", "define", "pragma", "ifdef", "ifndef", "endif"
+        };
+        return kw.find(w) != kw.end();
+    }
+
+    static bool is_type_starter(const std::string& w) {
+        static const std::unordered_set<std::string> ts = {
+            "int", "float", "double", "char", "void", "bool", "long", "short",
+            "unsigned", "signed", "auto", "size_t", "ssize_t", "uint8_t",
+            "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t",
+            "int64_t", "const", "static", "inline", "constexpr", "virtual",
+            "std", "vector", "string", "map", "set", "pair"
+        };
+        return ts.find(w) != ts.end();
+    }
+
+    static bool looks_like_code(const std::string& text) {
+        if (text.find('{') != std::string::npos ||
+            text.find('}') != std::string::npos ||
+            text.find(';') != std::string::npos ||
+            text.find("def ") != std::string::npos ||
+            text.find("return ") != std::string::npos ||
+            text.find("->") != std::string::npos ||
+            text.find("::") != std::string::npos ||
+            text.find("==") != std::string::npos ||
+            text.find("!=") != std::string::npos ||
+            text.find("<=") != std::string::npos ||
+            text.find(">=") != std::string::npos ||
+            text.find("+=") != std::string::npos ||
+            text.find("#include") != std::string::npos ||
+            text.find("for (") != std::string::npos ||
+            text.find("if (") != std::string::npos ||
+            text.find("while (") != std::string::npos) {
+            return true;
+        }
+        size_t pos = 0;
+        int line_idx = 0;
+        while (pos < text.size()) {
+            size_t nl = text.find('\n', pos);
+            size_t end = (nl == std::string::npos) ? text.size() : nl;
+            if (line_idx > 0 && end > pos) {
+                if ((end - pos >= 2 && text[pos] == ' ' && text[pos + 1] == ' ') ||
+                    text[pos] == '\t') {
+                    return true;
+                }
+            }
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+            ++line_idx;
+        }
+        return false;
+    }
+
+    void tokenize_line_chars(
+        const std::string& line,
+        size_t start_pos,
+        std::vector<int>& out_ids,
+        bool add_missing,
+        bool code_mode
+    ) {
+        const size_t n = line.size();
+        size_t i = start_pos;
+        while (i < n) {
+            unsigned char c = static_cast<unsigned char>(line[i]);
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                ++i;
+                continue;
+            }
+            if (c == '"' || (c == '\'' && (i == start_pos || !is_word_byte(static_cast<unsigned char>(line[i - 1]))))) {
+                char quote = line[i];
+                size_t start = i++;
+                while (i < n && line[i] != quote) {
+                    if (line[i] == '\\' && i + 1 < n) ++i;
+                    ++i;
+                }
+                if (i < n && line[i] == quote) ++i;
+                std::string lit = line.substr(start, i - start);
+                int id = add_missing ? add_word(lit) : get_word_id(lit);
+                if (id >= 0) out_ids.push_back(id);
+                continue;
+            }
+            if (i + 1 < n) {
+                char c1 = line[i];
+                char c2 = line[i + 1];
+                bool is_op2 =
+                    (c1 == '-' && (c2 == '>' || c2 == '-' || c2 == '=')) ||
+                    (c1 == '+' && (c2 == '+' || c2 == '=')) ||
+                    (c1 == ':' && c2 == ':') ||
+                    (c1 == '=' && c2 == '=') ||
+                    (c1 == '!' && c2 == '=') ||
+                    (c1 == '<' && (c2 == '=' || c2 == '<')) ||
+                    (c1 == '>' && (c2 == '=' || c2 == '>')) ||
+                    (c1 == '*' && (c2 == '=' || c2 == '*')) ||
+                    (c1 == '/' && (c2 == '=' || c2 == '/')) ||
+                    (c1 == '&' && c2 == '&') ||
+                    (c1 == '|' && c2 == '|');
+                if (is_op2) {
+                    std::string op2 = line.substr(i, 2);
+                    int id = add_missing ? add_word(op2) : get_word_id(op2);
+                    if (id >= 0) out_ids.push_back(id);
+                    i += 2;
+                    continue;
+                }
+            }
+            if (std::isdigit(c)) {
+                size_t start = i++;
+                while (i < n) {
+                    unsigned char nc = static_cast<unsigned char>(line[i]);
+                    if (is_word_byte(nc)) {
+                        ++i;
+                    } else if (nc == '.' && i + 1 < n && std::isdigit(static_cast<unsigned char>(line[i + 1]))) {
+                        ++i;
+                    } else if (!code_mode && nc == '-' && i + 1 < n && is_word_byte(static_cast<unsigned char>(line[i + 1]))) {
+                        ++i;
+                    } else {
+                        break;
+                    }
+                }
+                std::string num = line.substr(start, i - start);
+                int id = add_missing ? add_word(num) : get_word_id(num);
+                if (id >= 0) out_ids.push_back(id);
+                continue;
+            }
+            if (is_word_byte(c)) {
+                size_t start = i++;
+                while (i < n) {
+                    unsigned char nc = static_cast<unsigned char>(line[i]);
+                    if (is_word_byte(nc)) {
+                        ++i;
+                    } else if (!code_mode && nc == '-' && i + 1 < n && is_word_byte(static_cast<unsigned char>(line[i + 1]))) {
+                        ++i;
+                    } else {
+                        break;
+                    }
+                }
+                std::string word = line.substr(start, i - start);
+                int id = add_missing ? add_word(word) : get_word_id(word);
+                if (id >= 0) out_ids.push_back(id);
+                continue;
+            }
+            std::string sym(1, line[i]);
+            int id = add_missing ? add_word(sym) : get_word_id(sym);
+            if (id >= 0) out_ids.push_back(id);
+            ++i;
+        }
+    }
+
+    std::vector<int> tokenize_segment(
+        const std::string& seg_text,
+        bool add_missing,
+        bool wrap_bos_eos
+    ) {
+        std::vector<int> ids;
+        if (wrap_bos_eos) ids.push_back(TOK_BOS);
+
+        const bool code_mode = looks_like_code(seg_text);
+        std::vector<std::string> lines;
+        size_t pos = 0;
+        while (pos <= seg_text.size()) {
+            size_t nl = seg_text.find('\n', pos);
+            std::string line = (nl == std::string::npos)
+                ? seg_text.substr(pos)
+                : seg_text.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(std::move(line));
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+
+        bool first_emitted_line = true;
+        for (const std::string& raw_line : lines) {
+            size_t spaces = 0;
+            size_t idx = 0;
+            while (idx < raw_line.size()) {
+                if (raw_line[idx] == ' ') {
+                    ++spaces;
+                    ++idx;
+                } else if (raw_line[idx] == '\t') {
+                    spaces += 4;
+                    ++idx;
+                } else {
+                    break;
+                }
+            }
+            size_t end_idx = raw_line.size();
+            while (end_idx > idx && (raw_line[end_idx - 1] == ' ' || raw_line[end_idx - 1] == '\t')) {
+                --end_idx;
+            }
+            if (idx >= end_idx) continue;
+
+            if (code_mode) {
+                if (!first_emitted_line) {
+                    ids.push_back(TOK_NL);
+                }
+                if (spaces > 0) {
+                    int lvl = std::min(8, static_cast<int>((spaces + 3) / 4));
+                    ids.push_back(TOK_IND_1 + (lvl - 1));
+                }
+            }
+            first_emitted_line = false;
+            tokenize_line_chars(raw_line.substr(0, end_idx), idx, ids, add_missing, code_mode);
+        }
+
+        if (wrap_bos_eos) ids.push_back(TOK_EOS);
+        return ids;
+    }
+
+    std::vector<std::vector<int>> encode_corpus_segments(const std::string& raw_corpus) {
+        std::string norm;
+        norm.reserve(raw_corpus.size());
+        for (size_t i = 0; i < raw_corpus.size(); ++i) {
+            if (raw_corpus[i] == '\r') {
+                if (i + 1 < raw_corpus.size() && raw_corpus[i + 1] == '\n') continue;
+                norm.push_back('\n');
+            } else {
+                norm.push_back(raw_corpus[i]);
+            }
+        }
+
+        std::vector<std::string> all_lines;
+        size_t pos = 0;
+        bool has_blank_separator = false;
+        int non_empty_count = 0;
+        while (pos <= norm.size()) {
+            size_t nl = norm.find('\n', pos);
+            std::string line = (nl == std::string::npos)
+                ? norm.substr(pos)
+                : norm.substr(pos, nl - pos);
+            bool is_blank = true;
+            for (char ch : line) {
+                if (ch != ' ' && ch != '\t') {
+                    is_blank = false;
+                    break;
+                }
+            }
+            if (line == "---") is_blank = true;
+            if (is_blank && non_empty_count > 0) {
+                size_t rem = (nl == std::string::npos) ? norm.size() : nl + 1;
+                for (size_t k = rem; k < norm.size(); ++k) {
+                    if (norm[k] != ' ' && norm[k] != '\t' && norm[k] != '\n') {
+                        has_blank_separator = true;
+                        break;
+                    }
+                }
+            }
+            if (!is_blank) ++non_empty_count;
+            all_lines.push_back(std::move(line));
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+
+        std::vector<std::string> raw_segments;
+        if (has_blank_separator) {
+            std::string cur;
+            for (const std::string& l : all_lines) {
+                bool is_blank = (l == "---");
+                if (!is_blank) {
+                    is_blank = true;
+                    for (char ch : l) {
+                        if (ch != ' ' && ch != '\t') {
+                            is_blank = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_blank) {
+                    if (!cur.empty()) {
+                        raw_segments.push_back(std::move(cur));
+                        cur.clear();
+                    }
+                } else {
+                    if (!cur.empty()) cur.push_back('\n');
+                    cur += l;
+                }
+            }
+            if (!cur.empty()) raw_segments.push_back(std::move(cur));
+        } else {
+            bool any_indented = false;
+            for (const std::string& l : all_lines) {
+                if ((l.size() >= 2 && l[0] == ' ' && l[1] == ' ') || (!l.empty() && l[0] == '\t')) {
+                    any_indented = true;
+                    break;
+                }
+            }
+            if (any_indented) {
+                std::string cur;
+                for (const std::string& l : all_lines) {
+                    if (l.empty()) continue;
+                    bool top_level = (l[0] != ' ' && l[0] != '\t' && l[0] != '}');
+                    if (top_level && !cur.empty() && cur.find('\n') != std::string::npos) {
+                        raw_segments.push_back(std::move(cur));
+                        cur.clear();
+                    }
+                    if (!cur.empty()) cur.push_back('\n');
+                    cur += l;
+                }
+                if (!cur.empty()) raw_segments.push_back(std::move(cur));
+            } else {
+                for (const std::string& l : all_lines) {
+                    bool is_blank = true;
+                    for (char ch : l) {
+                        if (ch != ' ' && ch != '\t') {
+                            is_blank = false;
+                            break;
+                        }
+                    }
+                    if (!is_blank) raw_segments.push_back(l);
+                }
+            }
+        }
+
+        std::vector<std::vector<int>> encoded;
+        for (const std::string& seg : raw_segments) {
+            auto seq = tokenize_segment(seg, true, true);
+            if (seq.size() > 2) {
+                encoded.push_back(std::move(seq));
+            }
+        }
+        return encoded;
+    }
+
+    void extract_scope_registers(
+        const std::vector<int>& seq,
+        std::vector<int>& out_reg_to_tok,
+        std::unordered_map<int, int>& out_tok_to_reg
+    ) const {
+        out_reg_to_tok.clear();
+        out_tok_to_reg.clear();
+
+        const int id_lparen = get_word_id("(");
+        const int id_rparen = get_word_id(")");
+        const int id_comma  = get_word_id(",");
+        const int id_colon  = get_word_id(":");
+        const int id_assign = get_word_id("=");
+        const int id_lbrace = get_word_id("{");
+        if (id_lparen < 0 || id_rparen < 0) return;
+
+        size_t header_limit = std::min<size_t>(seq.size(), 24);
+        size_t open_p = std::string::npos;
+        for (size_t i = 0; i < header_limit; ++i) {
+            int t = seq[i];
+            if (t == TOK_NL || t == id_lbrace) break;
+            if (t == id_lparen && i >= 1) {
+                const std::string& fname = id_to_word[seq[i - 1]];
+                if (!is_identifier_str(fname)) continue;
+                if (fname == "if" || fname == "for" || fname == "while" ||
+                    fname == "switch" || fname == "catch" || fname == "return" ||
+                    fname == "elif" || fname == "sizeof") {
+                    continue;
+                }
+                bool has_sig_prefix = false;
+                if (i >= 2) {
+                    const std::string& prev = id_to_word[seq[i - 2]];
+                    if (prev == "def" || is_type_starter(prev) || prev == "*" || prev == "&" || prev == ">") {
+                        has_sig_prefix = true;
+                    }
+                }
+                if (has_sig_prefix) {
+                    open_p = i;
+                    break;
+                }
+            }
+        }
+        if (open_p == std::string::npos) return;
+
+        size_t close_p = std::string::npos;
+        int depth = 0;
+        for (size_t i = open_p; i < seq.size(); ++i) {
+            if (seq[i] == id_lparen) ++depth;
+            else if (seq[i] == id_rparen) {
+                --depth;
+                if (depth == 0) {
+                    close_p = i;
+                    break;
+                }
+            } else if (seq[i] == TOK_NL) {
+                break;
+            }
+        }
+        if (close_p == std::string::npos || close_p <= open_p + 1) return;
+
+        size_t slot_start = open_p + 1;
+        int angle_depth = 0;
+        for (size_t i = open_p + 1; i <= close_p; ++i) {
+            const std::string& w = id_to_word[seq[i]];
+            if (w == "<") ++angle_depth;
+            else if (w == ">" && angle_depth > 0) --angle_depth;
+
+            bool is_end = (i == close_p) || (seq[i] == id_comma && angle_depth == 0);
+            if (is_end) {
+                size_t slot_end = i;
+                for (size_t k = slot_start; k < slot_end; ++k) {
+                    if (seq[k] == id_assign) {
+                        slot_end = k;
+                        break;
+                    }
+                }
+                for (size_t k = slot_start; k < slot_end; ++k) {
+                    if (seq[k] == id_colon) {
+                        slot_end = k;
+                        break;
+                    }
+                }
+                int param_tok = -1;
+                for (size_t k = slot_end; k > slot_start; --k) {
+                    int cand = seq[k - 1];
+                    if (cand < 0 || cand >= static_cast<int>(id_to_word.size())) continue;
+                    const std::string& cw = id_to_word[cand];
+                    if (is_identifier_str(cw) && !is_type_starter(cw) &&
+                        cw != "def" && cw != "class" && cw != "struct" &&
+                        cw != "enum" && cw != "typename" && cw != "volatile") {
+                        param_tok = cand;
+                        break;
+                    }
+                }
+                if (param_tok >= 0 && out_tok_to_reg.find(param_tok) == out_tok_to_reg.end()) {
+                    if (static_cast<int>(out_reg_to_tok.size()) < NUM_REGS) {
+                        int reg_id = TOK_REG_0 + static_cast<int>(out_reg_to_tok.size());
+                        out_reg_to_tok.push_back(param_tok);
+                        out_tok_to_reg[param_tok] = reg_id;
+                    }
+                }
+                slot_start = i + 1;
+            }
+        }
+    }
+
+    std::string decode_tokens(const std::vector<int>& tids) const {
+        std::string out;
+        bool at_line_start = true;
+        std::string prev_tok;
+        std::string prev_prev_tok;
+
+        static const std::unordered_set<std::string> spaced_WaitKeywords = {
+            "if", "for", "while", "switch", "catch", "return", "elif",
+            "and", "or", "not", "in", "is", "case", "def", "class", "struct"
+        };
+        static const std::unordered_set<std::string> template_Containers = {
+            "vector", "map", "unordered_map", "set", "unordered_set",
+            "pair", "unique_ptr", "shared_ptr", "make_unique", "make_shared",
+            "static_cast", "reinterpret_cast", "const_cast", "dynamic_cast",
+            "max", "min"
+        };
+
+        int template_angle_depth = 0;
+
+        for (size_t i = 0; i < tids.size(); ++i) {
+            int id = tids[i];
+            if (id < 0 || id >= static_cast<int>(id_to_word.size())) continue;
+            if (id == TOK_PAD || id == TOK_BOS || id == TOK_EOS) continue;
+
+            if (id == TOK_NL) {
+                out.push_back('\n');
+                at_line_start = true;
+                prev_prev_tok = prev_tok;
+                prev_tok = "<nl>";
+                template_angle_depth = 0;
+                continue;
+            }
+            if (is_ind_token(id)) {
+                int lvl = ind_level(id);
+                if (!at_line_start) out.push_back('\n');
+                out.append(static_cast<size_t>(lvl * 4), ' ');
+                at_line_start = true;
+                prev_prev_tok = prev_tok;
+                prev_tok = id_to_word[id];
+                continue;
+            }
+
+            const std::string& w = id_to_word[id];
+            bool need_space = !at_line_start;
+
+            if (need_space) {
+                if (w == ")" || w == "]" || w == "," || w == ";" || w == "." ||
+                    w == ":" || w == "::" || w == "->" ||
+                    w == "?" || w == "!") {
+                    need_space = false;
+                }
+                else if ((w == "++" || w == "--") && is_identifier_str(prev_tok)) {
+                    need_space = false;
+                }
+                else if (w == "(" || w == "[") {
+                    if ((is_identifier_str(prev_tok) && spaced_WaitKeywords.find(prev_tok) == spaced_WaitKeywords.end()) ||
+                        prev_tok == ")" || prev_tok == "]" || prev_tok == ">") {
+                        need_space = false;
+                    }
+                }
+                else if (w == "<" && template_Containers.find(prev_tok) != template_Containers.end()) {
+                    need_space = false;
+                    ++template_angle_depth;
+                }
+                else if (w == ">" && template_angle_depth > 0) {
+                    need_space = false;
+                    --template_angle_depth;
+                }
+                if (prev_tok == "(" || prev_tok == "[" ||
+                    prev_tok == "::" || prev_tok == "->" || prev_tok == "!" ||
+                    prev_tok == "~" || prev_tok == "#") {
+                    need_space = false;
+                }
+                else if (prev_tok == "." && is_identifier_str(prev_prev_tok) &&
+                         is_identifier_str(w) && std::islower(static_cast<unsigned char>(w[0]))) {
+                    need_space = false;
+                }
+                else if (prev_tok == "-" && !w.empty() && std::isdigit(static_cast<unsigned char>(w[0])) &&
+                         (prev_prev_tok == "return" || prev_prev_tok == "=" || prev_prev_tok == "(" ||
+                          prev_prev_tok == "," || prev_prev_tok == "[" || prev_prev_tok == ":" ||
+                          prev_prev_tok == "<" || prev_prev_tok == ">" || prev_prev_tok == "==" ||
+                          prev_prev_tok == "!=" || prev_prev_tok == "<=" || prev_prev_tok == ">=")) {
+                    need_space = false;
+                }
+                else if (prev_tok == "<" && template_angle_depth > 0) {
+                    need_space = false;
+                }
+                else if ((prev_tok == "++" || prev_tok == "--") && is_identifier_str(w)) {
+                    need_space = false;
+                }
+                else if ((w == "*" || w == "&") &&
+                         (is_type_starter(prev_tok) || (prev_tok == ">" && template_angle_depth == 0))) {
+                    need_space = false;
+                }
+            }
+
+            if (need_space) out.push_back(' ');
+            out += w;
+            at_line_start = false;
+            prev_prev_tok = prev_tok;
+            prev_tok = w;
+        }
+        return out;
+    }
+};
+
+struct PopCountGenerativeLLM {
+    static constexpr int MAX_HORIZON = 24;
+    static constexpr int SHORTLIST_CAP = 48;
+
+    struct NextTokenEntry {
+        int32_t tok;
+        uint32_t count;
+    };
+
+    struct SegmentTopicRecord {
+        uint64_t topic_sketch[hsaa_assoc::kW];
+        std::vector<int> tokens;
+    };
+
+    CodeProseTokenizer tokenizer;
+    std::unique_ptr<AutoMappedWeightBank> llm_bank_guard;
+    std::unique_ptr<NativeSublinearLLM> sublinear_net;
+
+    std::unordered_map<uint64_t, std::vector<NextTokenEntry>> horizon_tables[MAX_HORIZON + 1];
+    std::unordered_map<uint64_t, std::vector<NextTokenEntry>> reg_horizon_tables[MAX_HORIZON + 1];
+    std::unordered_map<int, std::vector<NextTokenEntry>> skip_table;
+    std::vector<NextTokenEntry> top_unigrams;
+
+    std::vector<std::array<uint64_t, hsaa_assoc::kW>> token_topic_sketch;
+    std::vector<SegmentTopicRecord> segment_records;
+
+    std::string last_trained_corpus;
+    int last_trained_epochs = 0;
+    BrainTrainStats last_stats{};
+    bool is_trained = false;
+
+    static int count_bucket(uint32_t c) {
+        if (c == 0) return 0;
+        int b = 1;
+        while ((c >>= 1) != 0 && b < 15) ++b;
+        return b;
+    }
+
+    static uint64_t make_horizon_key(const int* toks, size_t len, int L) {
+        if (L <= 0 || len < static_cast<size_t>(L)) return 0ULL;
+        const uint64_t u1 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 1]) & 0xFFFFFU);
+        if (L == 1) return u1;
+        const uint64_t u2 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 2]) & 0xFFFFFU);
+        if (L == 2) return (u2 << 20) | u1;
+        const uint64_t u3 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 3]) & 0xFFFFFU);
+        if (L == 3) return (u3 << 40) | (u2 << 20) | u1;
+
+        uint64_t h = 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(L);
+        for (size_t i = len - static_cast<size_t>(L); i < len - 2; ++i) {
+            uint64_t x = static_cast<uint64_t>(static_cast<uint32_t>(toks[i])) + 0x9E3779B97F4A7C15ULL;
+            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+            h ^= x ^ (x >> 31);
+            h = (h << 13) | (h >> 51);
+        }
+        return ((h & 0xFFFFFFULL) << 40) | (u2 << 20) | u1;
+    }
+
+    static bool is_content_token(const std::string& w) {
+        if (w.empty() || w[0] == '<') return false;
+        if (w.size() <= 2 && !CodeProseTokenizer::is_identifier_str(w)) return false;
+        static const std::unordered_set<std::string> stop = {
+            "и", "в", "на", "с", "по", "для", "от", "до", "из", "к", "о", "об",
+            "а", "но", "или", "что", "как", "это", "не", "при", "за", "над",
+            "под", "через", "the", "a", "an", "in", "on", "of", "to", "for",
+            "and", "or", "is", "are", "with", "by", "from", "as", "at", "that"
+        };
+        std::string norm = hsaa_assoc::normalize(w.c_str());
+        return stop.find(norm) == stop.end();
+    }
+
+    void compute_token_bundle_512(const std::vector<int>& toks, uint64_t out_sketch[hsaa_assoc::kW]) const {
+        int32_t acc[512] = {0};
+        int count = 0;
+        for (int t : toks) {
+            if (t < 0 || t >= static_cast<int>(tokenizer.id_to_word.size())) continue;
+            const std::string& w = tokenizer.id_to_word[t];
+            if (!is_content_token(w)) continue;
+            std::string nw = hsaa_assoc::normalize(w.c_str());
+            if (nw.empty()) continue;
+            uint64_t ws[hsaa_assoc::kW];
+            hsaa_assoc::sketch(nw, ws);
+            for (int word_idx = 0; word_idx < static_cast<int>(hsaa_assoc::kW); ++word_idx) {
+                uint64_t bits = ws[word_idx];
+                for (int b = 0; b < 64; ++b) {
+                    acc[word_idx * 64 + b] += ((bits >> b) & 1ULL) ? 1 : -1;
+                }
+            }
+            ++count;
+        }
+        for (size_t w = 0; w < hsaa_assoc::kW; ++w) out_sketch[w] = 0ULL;
+        if (count == 0) return;
+        for (int word_idx = 0; word_idx < static_cast<int>(hsaa_assoc::kW); ++word_idx) {
+            uint64_t mask = 0ULL;
+            for (int b = 0; b < 64; ++b) {
+                if (acc[word_idx * 64 + b] >= 0) mask |= (1ULL << b);
+            }
+            out_sketch[word_idx] = mask;
+        }
+    }
+
+    bool train_corpus(const std::string& bank_base_path, const char* corpus_text, int epochs, BrainTrainStats* out_stats) {
+        if (!corpus_text || corpus_text[0] == '\0') return false;
+        if (epochs <= 0) epochs = 6;
+
+        const auto t_start = std::chrono::steady_clock::now();
+
+        tokenizer.reset();
+        auto seqs = tokenizer.encode_corpus_segments(corpus_text);
+        if (seqs.empty()) return false;
+
+        size_t total_tokens = 0;
+        size_t total_transitions = 0;
+        for (const auto& s : seqs) {
+            if (s.size() > 2) total_tokens += s.size() - 2;
+            if (s.size() > 1) total_transitions += s.size() - 1;
+        }
+        if (total_tokens == 0) return false;
+
+        for (int L = 1; L <= MAX_HORIZON; ++L) {
+            horizon_tables[L].clear();
+            reg_horizon_tables[L].clear();
+        }
+        skip_table.clear();
+        top_unigrams.clear();
+        segment_records.clear();
+
+        std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h_counts[MAX_HORIZON + 1];
+        std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg_counts[MAX_HORIZON + 1];
+        std::unordered_map<int, std::unordered_map<int, uint32_t>> raw_skip_counts;
+        std::unordered_map<int, uint32_t> raw_uni_counts;
+
+        const size_t vocab_sz = tokenizer.id_to_word.size();
+        std::vector<std::array<int32_t, 512>> tok_topic_acc(vocab_sz);
+        for (auto& arr : tok_topic_acc) arr.fill(0);
+
+        for (const auto& seq : seqs) {
+            SegmentTopicRecord rec;
+            compute_token_bundle_512(seq, rec.topic_sketch);
+            rec.tokens = seq;
+            segment_records.push_back(rec);
+
+            for (int t : seq) {
+                if (t >= 0 && static_cast<size_t>(t) < vocab_sz) {
+                    for (int w = 0; w < static_cast<int>(hsaa_assoc::kW); ++w) {
+                        uint64_t bits = rec.topic_sketch[w];
+                        for (int b = 0; b < 64; ++b) {
+                            tok_topic_acc[t][w * 64 + b] += ((bits >> b) & 1ULL) ? 1 : -1;
+                        }
+                    }
+                }
+            }
+
+            for (size_t pos = 1; pos < seq.size(); ++pos) {
+                const int target = seq[pos];
+                if (target != CodeProseTokenizer::TOK_BOS && target != CodeProseTokenizer::TOK_PAD) {
+                    raw_uni_counts[target]++;
+                }
+                const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, pos));
+                for (int L = 1; L <= max_L; ++L) {
+                    uint64_t key = make_horizon_key(seq.data(), pos, L);
+                    raw_h_counts[L][key][target]++;
+                }
+                if (pos >= 2) {
+                    raw_skip_counts[seq[pos - 2]][target]++;
+                }
+            }
+
+            std::vector<int> reg_to_tok;
+            std::unordered_map<int, int> tok_to_reg;
+            tokenizer.extract_scope_registers(seq, reg_to_tok, tok_to_reg);
+            if (!reg_to_tok.empty()) {
+                std::vector<int> reg_seq(seq.size());
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    auto it = tok_to_reg.find(seq[i]);
+                    reg_seq[i] = (it != tok_to_reg.end()) ? it->second : seq[i];
+                }
+                for (size_t pos = 1; pos < reg_seq.size(); ++pos) {
+                    const int rtarget = reg_seq[pos];
+                    const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, pos));
+                    for (int L = 1; L <= max_L; ++L) {
+                        uint64_t rkey = make_horizon_key(reg_seq.data(), pos, L);
+                        raw_reg_counts[L][rkey][rtarget]++;
+                    }
+                }
+            }
+        }
+
+        token_topic_sketch.assign(vocab_sz, {0, 0, 0, 0, 0, 0, 0, 0});
+        for (size_t t = 0; t < vocab_sz; ++t) {
+            for (int w = 0; w < static_cast<int>(hsaa_assoc::kW); ++w) {
+                uint64_t mask = 0ULL;
+                for (int b = 0; b < 64; ++b) {
+                    if (tok_topic_acc[t][w * 64 + b] >= 0) mask |= (1ULL << b);
+                }
+                token_topic_sketch[t][w] = mask;
+            }
+        }
+
+        auto sort_and_cap = [](const std::unordered_map<int, uint32_t>& m, size_t cap) {
+            std::vector<NextTokenEntry> vec;
+            vec.reserve(m.size());
+            for (const auto& kv : m) {
+                vec.push_back({static_cast<int32_t>(kv.first), kv.second});
+            }
+            std::sort(vec.begin(), vec.end(), [](const NextTokenEntry& a, const NextTokenEntry& b) {
+                return (a.count != b.count) ? (a.count > b.count) : (a.tok < b.tok);
+            });
+            if (vec.size() > cap) vec.resize(cap);
+            return vec;
+        };
+
+        for (int L = 1; L <= MAX_HORIZON; ++L) {
+            horizon_tables[L].reserve(raw_h_counts[L].size());
+            for (const auto& kv : raw_h_counts[L]) {
+                horizon_tables[L][kv.first] = sort_and_cap(kv.second, SHORTLIST_CAP);
+            }
+            reg_horizon_tables[L].reserve(raw_reg_counts[L].size());
+            for (const auto& kv : raw_reg_counts[L]) {
+                reg_horizon_tables[L][kv.first] = sort_and_cap(kv.second, SHORTLIST_CAP);
+            }
+        }
+        for (const auto& kv : raw_skip_counts) {
+            skip_table[kv.first] = sort_and_cap(kv.second, SHORTLIST_CAP);
+        }
+        top_unigrams = sort_and_cap(raw_uni_counts, SHORTLIST_CAP);
+
+        std::string llm_bank_path = bank_base_path + ".llm_bank";
+        if (!llm_bank_guard || !llm_bank_guard->get()) {
+            llm_bank_guard = std::make_unique<AutoMappedWeightBank>(llm_bank_path);
+        }
+        MappedWeightBank* lbank = llm_bank_guard->get();
+        int32_t init_err = 0, final_err = 0, unreachable = 0;
+        double ste_coverage = 0.0;
+
+        if (lbank) {
+            lbank->clear_master_cache();
+            int net_vocab = static_cast<int>(std::max<size_t>(128, tokenizer.id_to_word.size() + 64));
+            sublinear_net = std::make_unique<NativeSublinearLLM>(lbank, net_vocab, 4, false, 2026);
+            for (size_t tid = 0; tid < tokenizer.id_to_word.size(); ++tid) {
+                std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[tid].c_str());
+                if (nw.empty()) nw = tokenizer.id_to_word[tid];
+                uint64_t sk[hsaa_assoc::kW];
+                hsaa_assoc::sketch(nw, sk);
+                for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                    sublinear_net->vocab_pos[tid * WORDS_PER_VEC + w] = sk[w];
+                    sublinear_net->vocab_neg[tid * WORDS_PER_VEC + w] = ~sk[w];
+                    for (int b = 0; b < 64; ++b) {
+                        sublinear_net->embeddings[tid * D_MODEL + w * 64 + b] =
+                            ((sk[w] >> b) & 1ULL) ? 12 : -12;
+                    }
+                }
+            }
+            if (total_tokens <= 25000) {
+                sublinear_net->train_arbitrary_corpus_end_to_end(
+                    seqs, epochs, &init_err, &final_err, &unreachable, &ste_coverage
+                );
+            } else {
+                std::vector<std::vector<int>> subset_seqs(
+                    seqs.begin(), seqs.begin() + std::min<size_t>(seqs.size(), 512)
+                );
+                sublinear_net->train_arbitrary_corpus_end_to_end(
+                    subset_seqs, std::min(epochs, 3), &init_err, &final_err, &unreachable, &ste_coverage
+                );
+            }
+        }
+
+        size_t eval_positions = 0;
+        size_t eval_correct = 0;
+        size_t eval_covered = 0;
+        for (const auto& seq : seqs) {
+            if (sublinear_net) sublinear_net->reset_state();
+            for (size_t pos = 1; pos < seq.size(); ++pos) {
+                const int gold = seq[pos];
+                ++eval_positions;
+
+                std::unordered_map<int, int64_t> scores;
+                std::unordered_map<int, int> max_l_seen;
+                const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, pos));
+                for (int L = max_L; L >= 1; --L) {
+                    uint64_t key = make_horizon_key(seq.data(), pos, L);
+                    auto it = horizon_tables[L].find(key);
+                    if (it == horizon_tables[L].end()) continue;
+                    uint32_t sum_c = 0;
+                    for (const auto& e : it->second) sum_c += e.count;
+                    for (const auto& e : it->second) {
+                        int b = count_bucket(e.count);
+                        int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
+                        if (max_l_seen.find(e.tok) == max_l_seen.end()) {
+                            max_l_seen[e.tok] = L;
+                            scores[e.tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        } else {
+                            scores[e.tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
+                        }
+                    }
+                }
+                if (scores.find(gold) != scores.end()) ++eval_covered;
+
+                int best_tok = -1;
+                int64_t best_sc = -1000000000000LL;
+                for (const auto& kv : scores) {
+                    if (kv.second > best_sc || (kv.second == best_sc && kv.first < best_tok)) {
+                        best_sc = kv.second;
+                        best_tok = kv.first;
+                    }
+                }
+                if (best_tok == gold) ++eval_correct;
+            }
+        }
+
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_start
+        ).count();
+
+        last_trained_corpus = corpus_text;
+        last_trained_epochs = epochs;
+        is_trained = true;
+
+        last_stats.vocab_size = tokenizer.id_to_word.size();
+        last_stats.num_sequences = seqs.size();
+        last_stats.total_tokens = total_tokens;
+        last_stats.total_transitions = eval_positions;
+        last_stats.epochs = epochs;
+        last_stats.initial_errors = static_cast<int>(init_err);
+        last_stats.final_errors = static_cast<int>(eval_positions - eval_correct);
+        last_stats.replay_accuracy_percent = (eval_positions > 0)
+            ? (100.0 * static_cast<double>(eval_correct) / static_cast<double>(eval_positions))
+            : 100.0;
+        last_stats.shortlist_coverage_percent = (eval_positions > 0)
+            ? (100.0 * static_cast<double>(eval_covered) / static_cast<double>(eval_positions))
+            : 100.0;
+        last_stats.train_time_ms = elapsed_ms;
+        last_stats.tokens_per_sec = (elapsed_ms > 0.0)
+            ? (static_cast<double>(total_tokens * epochs) * 1000.0 / elapsed_ms)
+            : 0.0;
+
+        if (out_stats) *out_stats = last_stats;
+        return true;
+    }
+
+    void ensure_token_capacity(int tok_id) {
+        if (static_cast<size_t>(tok_id) >= token_topic_sketch.size()) {
+            std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[tok_id].c_str());
+            if (nw.empty()) nw = tokenizer.id_to_word[tok_id];
+            std::array<uint64_t, hsaa_assoc::kW> sk{};
+            hsaa_assoc::sketch(nw, sk.data());
+            token_topic_sketch.resize(tokenizer.id_to_word.size(), sk);
+        }
+    }
+
+    int generate(
+        const PopCountBrain* brain,
+        const char* prompt,
+        char* out_text,
+        size_t max_len,
+        int max_tokens,
+        float temperature
+    );
+};
+
 struct PopCountBrain {
+    std::string bank_path;
     std::unique_ptr<AutoMappedWeightBank> bank_guard;
     std::unique_ptr<PureNeuralReasoningEngine> engine;
+    std::unique_ptr<PopCountGenerativeLLM> llm_engine;
     size_t max_pages;
     size_t active_rules;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> direct_facts;
@@ -7353,16 +8376,6 @@ struct PopCountBrain {
 
 namespace {
 
-// Measured on 300-fact populations (measur/assoc_calib.cpp):
-//   subject typo, exact relation : 297/300 (distinct words), 300/300 (template)
-//   relation typo, exact subject : 240/280 (multi-relation), 0 wrong relations
-//   case/whitespace variant      : 300/300
-//   near-duplicate / bogus       : 0/1,240 false hits at the shipped gate
-// The typo sits in the subject's random suffix: a one-char change there yields
-// a true-subject dot p10=218 (distinct) / p10=290 (template), so 200 keeps
-// 99-100% recall. It is not a margin over the best wrong neighbour -- template
-// subjects share "entity_", and a wrong neighbour can score up to 246; the
-// exact-relation requirement and the ds+dr ranking keep those out of the answer.
 constexpr int32_t kAssocMinSubjectDot = 200;
 constexpr int32_t kAssocMinRelationDot = 200;
 
@@ -7384,9 +8397,6 @@ void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relatio
     brain->assoc_facts.push_back(std::move(f));
 }
 
-// Returns the best eligible stored fact, or nullptr. Deterministic: ties keep
-// the earliest stored fact (the vector is append-only except for in-place
-// object updates).
 const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, const char* relation) {
     const std::string sn = hsaa_assoc::normalize(subject);
     const std::string rn = hsaa_assoc::normalize(relation);
@@ -7412,13 +8422,598 @@ const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, c
     return best;
 }
 
+std::string bytes_to_hex(const std::string& s) {
+    static const char* lut = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 2);
+    for (unsigned char c : s) {
+        out.push_back(lut[c >> 4]);
+        out.push_back(lut[c & 0x0F]);
+    }
+    return out;
+}
+
+std::string hex_to_bytes(const std::string& hex) {
+    std::string out;
+    out.reserve(hex.size() / 2);
+    auto hex_val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        int hi = hex_val(hex[i]);
+        int lo = hex_val(hex[i + 1]);
+        if (hi < 0 || lo < 0) break;
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return out;
+}
+
 } // namespace
+
+int PopCountGenerativeLLM::generate(
+    const PopCountBrain* brain,
+    const char* prompt,
+    char* out_text,
+    size_t max_len,
+    int max_tokens,
+    float temperature
+) {
+    if (!brain || !prompt || !out_text || max_len == 0 || max_tokens <= 0) {
+        if (out_text && max_len > 0) out_text[0] = '\0';
+        return 0;
+    }
+    out_text[0] = '\0';
+
+    struct FactTokens {
+        std::vector<int> s_toks;
+        std::vector<int> r_toks;
+        std::vector<int> o_toks;
+        const AssocFact* assoc_ptr;
+    };
+    std::vector<FactTokens> live_facts;
+    live_facts.reserve(brain->assoc_facts.size());
+    for (const AssocFact& af : brain->assoc_facts) {
+        FactTokens ft;
+        ft.s_toks = tokenizer.tokenize_segment(af.subject_raw, true, false);
+        ft.r_toks = tokenizer.tokenize_segment(af.relation_raw, true, false);
+        ft.o_toks = tokenizer.tokenize_segment(af.object, true, false);
+        for (int t : ft.s_toks) ensure_token_capacity(t);
+        for (int t : ft.r_toks) ensure_token_capacity(t);
+        for (int t : ft.o_toks) ensure_token_capacity(t);
+        ft.assoc_ptr = &af;
+        if (!ft.s_toks.empty() && !ft.r_toks.empty() && !ft.o_toks.empty()) {
+            live_facts.push_back(std::move(ft));
+        }
+    }
+
+    std::vector<int> prompt_toks = tokenizer.tokenize_segment(prompt, true, false);
+    for (int t : prompt_toks) ensure_token_capacity(t);
+
+    std::vector<int> ctx;
+    ctx.reserve(prompt_toks.size() + static_cast<size_t>(max_tokens) + 4);
+    ctx.push_back(CodeProseTokenizer::TOK_BOS);
+    for (int t : prompt_toks) ctx.push_back(t);
+
+    std::vector<int> reg_to_tok;
+    std::unordered_map<int, int> tok_to_reg;
+    tokenizer.extract_scope_registers(prompt_toks, reg_to_tok, tok_to_reg);
+
+    std::vector<int> reg_ctx(ctx.size());
+    for (size_t i = 0; i < ctx.size(); ++i) {
+        auto it = tok_to_reg.find(ctx[i]);
+        reg_ctx[i] = (it != tok_to_reg.end()) ? it->second : ctx[i];
+    }
+
+    uint64_t prompt_topic_vec[hsaa_assoc::kW];
+    compute_token_bundle_512(prompt_toks, prompt_topic_vec);
+
+    bool has_direct_prefix_match = false;
+    if (!prompt_toks.empty()) {
+        const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, ctx.size()));
+        for (int L = max_L; L >= 2; --L) {
+            uint64_t k = make_horizon_key(ctx.data(), ctx.size(), L);
+            auto it = horizon_tables[L].find(k);
+            if (it != horizon_tables[L].end()) {
+                for (const auto& e : it->second) {
+                    if (e.tok != CodeProseTokenizer::TOK_EOS) {
+                        has_direct_prefix_match = true;
+                        break;
+                    }
+                }
+            }
+            if (!reg_to_tok.empty() && !has_direct_prefix_match) {
+                uint64_t rk = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
+                auto rit = reg_horizon_tables[L].find(rk);
+                if (rit != reg_horizon_tables[L].end() && !rit->second.empty()) {
+                    has_direct_prefix_match = true;
+                }
+            }
+            if (has_direct_prefix_match) break;
+        }
+        if (!has_direct_prefix_match) {
+            const std::string& last_w = tokenizer.id_to_word[ctx.back()];
+            if (last_w != "?" && last_w != "." && last_w != "!" && last_w != ":") {
+                uint64_t k1 = make_horizon_key(ctx.data(), ctx.size(), 1);
+                auto it1 = horizon_tables[1].find(k1);
+                if (it1 != horizon_tables[1].end()) {
+                    for (const auto& e : it1->second) {
+                        if (e.tok != CodeProseTokenizer::TOK_EOS) {
+                            has_direct_prefix_match = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto& ft : live_facts) {
+            if (ctx.back() == ft.r_toks.back() || ctx.back() == ft.s_toks.back()) {
+                has_direct_prefix_match = true;
+                break;
+            }
+            const std::string last_norm = hsaa_assoc::normalize(tokenizer.id_to_word[ctx.back()].c_str());
+            uint64_t lsk[hsaa_assoc::kW];
+            hsaa_assoc::sketch(last_norm, lsk);
+            if (hsaa_assoc::dot512(lsk, ft.assoc_ptr->rkey) >= kAssocMinRelationDot ||
+                hsaa_assoc::dot512(lsk, ft.assoc_ptr->skey) >= kAssocMinSubjectDot) {
+                has_direct_prefix_match = true;
+                break;
+            }
+        }
+    }
+
+    bool topic_launched_from_bos = false;
+    int active_target_segment = -1;
+    if (!segment_records.empty()) {
+        std::unordered_set<int> prompt_content_set;
+        for (int pt : prompt_toks) {
+            if (is_content_token(tokenizer.id_to_word[pt])) prompt_content_set.insert(pt);
+        }
+        int64_t best_seg_score = -1000000000LL;
+        for (size_t si = 0; si < segment_records.size(); ++si) {
+            int32_t vdot = hsaa_assoc::dot512(prompt_topic_vec, segment_records[si].topic_sketch);
+            int shared = 0;
+            for (int st : segment_records[si].tokens) {
+                if (prompt_content_set.find(st) != prompt_content_set.end()) ++shared;
+            }
+            int64_t sc = static_cast<int64_t>(vdot) * 4LL + static_cast<int64_t>(shared) * 256LL;
+            if (sc > best_seg_score) {
+                best_seg_score = sc;
+                active_target_segment = static_cast<int>(si);
+            }
+        }
+    }
+
+    if (!has_direct_prefix_match && active_target_segment >= 0) {
+        topic_launched_from_bos = true;
+        ctx.clear();
+        ctx.push_back(CodeProseTokenizer::TOK_BOS);
+        reg_ctx = ctx;
+    }
+
+    const int id_lparen = tokenizer.get_word_id("(");
+    const int id_rparen = tokenizer.get_word_id(")");
+    const int id_lbrack = tokenizer.get_word_id("[");
+    const int id_rbrack = tokenizer.get_word_id("]");
+    const int id_lbrace = tokenizer.get_word_id("{");
+    const int id_rbrace = tokenizer.get_word_id("}");
+    const int id_def    = tokenizer.get_word_id("def");
+
+    std::vector<char> delim_stack;
+    bool saw_open_brace = false;
+    bool is_python_func = false;
+    int brace_depth = 0;
+
+    if (!topic_launched_from_bos) {
+        for (int t : prompt_toks) {
+            if (t == id_def) is_python_func = true;
+            if (t == id_lparen) delim_stack.push_back('(');
+            else if (t == id_lbrack) delim_stack.push_back('[');
+            else if (t == id_lbrace) {
+                delim_stack.push_back('{');
+                saw_open_brace = true;
+                ++brace_depth;
+            } else if (t == id_rparen && !delim_stack.empty() && delim_stack.back() == '(') {
+                delim_stack.pop_back();
+            } else if (t == id_rbrack && !delim_stack.empty() && delim_stack.back() == '[') {
+                delim_stack.pop_back();
+            } else if (t == id_rbrace && !delim_stack.empty() && delim_stack.back() == '{') {
+                delim_stack.pop_back();
+                if (brace_depth > 0) --brace_depth;
+            }
+        }
+    }
+
+    if (sublinear_net) {
+        sublinear_net->reset_state();
+        for (size_t i = 0; i + 1 < ctx.size(); ++i) {
+            if (ctx[i] >= 0 && ctx[i] < sublinear_net->vocab_size) {
+                uint32_t eids[16];
+                int32_t escores[16];
+                sublinear_net->step_mlgru_and_route(ctx[i], false, eids, escores);
+            }
+        }
+    }
+
+    std::unordered_set<uint64_t> visited_9grams;
+    std::vector<int> generated_toks;
+    generated_toks.reserve(static_cast<size_t>(max_tokens));
+
+    uint64_t rng_state = 0x853C49E6748FEA9BULL;
+    for (int pt : prompt_toks) {
+        rng_state ^= static_cast<uint64_t>(pt) + 0x9E3779B97F4A7C15ULL + (rng_state << 6) + (rng_state >> 2);
+    }
+
+    for (int step = 0; step < max_tokens; ++step) {
+        std::unordered_map<int, int64_t> cand_scores;
+        std::unordered_map<int, int> cand_max_L;
+
+        if (topic_launched_from_bos && step == 0 && active_target_segment >= 0) {
+            const auto& seg_toks = segment_records[active_target_segment].tokens;
+            if (seg_toks.size() > 2) {
+                cand_scores[seg_toks[1]] += 5000000LL;
+                cand_max_L[seg_toks[1]] = MAX_HORIZON;
+            }
+        }
+
+        if (!reg_to_tok.empty()) {
+            const int max_rL = static_cast<int>(std::min<size_t>(MAX_HORIZON, reg_ctx.size()));
+            for (int L = max_rL; L >= 1; --L) {
+                uint64_t rkey = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
+                auto rit = reg_horizon_tables[L].find(rkey);
+                if (rit != reg_horizon_tables[L].end()) {
+                    uint32_t r_sum_c = 0;
+                    for (const auto& e : rit->second) r_sum_c += e.count;
+                    for (const auto& e : rit->second) {
+                        int actual_tok = e.tok;
+                        if (CodeProseTokenizer::is_reg_token(e.tok)) {
+                            int r_idx = e.tok - CodeProseTokenizer::TOK_REG_0;
+                            if (r_idx < 0 || r_idx >= static_cast<int>(reg_to_tok.size())) continue;
+                            actual_tok = reg_to_tok[r_idx];
+                        }
+                        int b = count_bucket(e.count);
+                        int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, r_sum_c));
+                        if (cand_max_L.find(actual_tok) == cand_max_L.end()) {
+                            cand_max_L[actual_tok] = L;
+                            cand_scores[actual_tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        } else {
+                            cand_scores[actual_tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (reg_to_tok.empty() || cand_scores.empty()) {
+            const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, ctx.size()));
+            for (int L = max_L; L >= 1; --L) {
+                uint64_t key = make_horizon_key(ctx.data(), ctx.size(), L);
+                auto it = horizon_tables[L].find(key);
+                if (it != horizon_tables[L].end()) {
+                    uint32_t sum_c = 0;
+                    for (const auto& e : it->second) sum_c += e.count;
+                    for (const auto& e : it->second) {
+                        int b = count_bucket(e.count);
+                        int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
+                        if (cand_max_L.find(e.tok) == cand_max_L.end()) {
+                            cand_max_L[e.tok] = L;
+                            cand_scores[e.tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        } else {
+                            cand_scores[e.tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ctx.size() >= 2 && cand_scores.size() < SHORTLIST_CAP) {
+            auto skit = skip_table.find(ctx[ctx.size() - 2]);
+            if (skit != skip_table.end()) {
+                for (const auto& e : skit->second) {
+                    if (cand_scores.find(e.tok) == cand_scores.end()) {
+                        if (cand_scores.size() >= SHORTLIST_CAP) break;
+                        cand_scores[e.tok] = static_cast<int64_t>(count_bucket(e.count)) * 256LL;
+                    }
+                }
+            }
+        }
+        for (const auto& ft : live_facts) {
+            bool subj_in_ctx = false;
+            for (size_t i = 1; i < ctx.size(); ++i) {
+                if (ctx[i] == ft.s_toks[0]) {
+                    subj_in_ctx = true;
+                    break;
+                }
+                std::string wn = hsaa_assoc::normalize(tokenizer.id_to_word[ctx[i]].c_str());
+                if (!wn.empty()) {
+                    uint64_t wsk[hsaa_assoc::kW];
+                    hsaa_assoc::sketch(wn, wsk);
+                    if (hsaa_assoc::dot512(wsk, ft.assoc_ptr->skey) >= kAssocMinSubjectDot) {
+                        subj_in_ctx = true;
+                        break;
+                    }
+                }
+            }
+            if (!subj_in_ctx) continue;
+
+            if (ctx.back() == ft.o_toks.back()) {
+                if (cand_scores.empty()) {
+                    cand_scores[CodeProseTokenizer::TOK_EOS] += 6000000LL;
+                }
+                continue;
+            }
+            bool obj_already_emitted = false;
+            for (int gt : generated_toks) {
+                if (gt == ft.o_toks.back()) {
+                    obj_already_emitted = true;
+                    break;
+                }
+            }
+            if (obj_already_emitted) continue;
+
+            bool matched_obj_prefix = false;
+            for (size_t k = 1; k < ft.o_toks.size(); ++k) {
+                if (ctx.size() > k) {
+                    bool ok = true;
+                    for (size_t j = 0; j < k; ++j) {
+                        if (ctx[ctx.size() - k + j] != ft.o_toks[j]) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        cand_scores[ft.o_toks[k]] += 4000000LL;
+                        matched_obj_prefix = true;
+                        break;
+                    }
+                }
+            }
+            if (matched_obj_prefix) continue;
+
+            bool rel_at_tail = false;
+            if (ctx.size() >= ft.r_toks.size() + 1) {
+                bool exact_rel = true;
+                for (size_t j = 0; j < ft.r_toks.size(); ++j) {
+                    if (ctx[ctx.size() - ft.r_toks.size() + j] != ft.r_toks[j]) {
+                        exact_rel = false;
+                        break;
+                    }
+                }
+                if (exact_rel) rel_at_tail = true;
+            }
+            if (!rel_at_tail && ctx.size() >= 2) {
+                std::string tail1 = hsaa_assoc::normalize(tokenizer.id_to_word[ctx.back()].c_str());
+                uint64_t t1sk[hsaa_assoc::kW];
+                hsaa_assoc::sketch(tail1, t1sk);
+                if (hsaa_assoc::dot512(t1sk, ft.assoc_ptr->rkey) >= 300) {
+                    rel_at_tail = true;
+                } else if (ctx.size() >= 3) {
+                    std::string tail2 = hsaa_assoc::normalize(
+                        (tokenizer.id_to_word[ctx[ctx.size() - 2]] + " " + tokenizer.id_to_word[ctx.back()]).c_str()
+                    );
+                    uint64_t t2sk[hsaa_assoc::kW];
+                    hsaa_assoc::sketch(tail2, t2sk);
+                    if (hsaa_assoc::dot512(t2sk, ft.assoc_ptr->rkey) >= 300) {
+                        rel_at_tail = true;
+                    }
+                }
+            }
+
+            if (rel_at_tail) {
+                cand_scores[ft.o_toks[0]] += 4000000LL;
+            } else if (ctx.back() == ft.s_toks.back() && cand_max_L.find(ctx.back()) == cand_max_L.end()) {
+                cand_scores[ft.r_toks[0]] += 1500000LL;
+            }
+        }
+
+        if (cand_scores.empty()) {
+            for (const auto& e : top_unigrams) {
+                cand_scores[e.tok] = static_cast<int64_t>(count_bucket(e.count)) * 128LL;
+                if (cand_scores.size() >= 16) break;
+            }
+        }
+
+        uint64_t sb[WORDS_PER_VEC] = {0};
+        uint64_t mp[NUM_BIT_PLANES][WORDS_PER_VEC] = {{0}};
+        bool has_ste_out = false;
+        if (sublinear_net && !ctx.empty() && ctx.back() >= 0 && ctx.back() < sublinear_net->vocab_size) {
+            uint32_t eids[16];
+            int32_t escores[16];
+            sublinear_net->step_mlgru_and_route(ctx.back(), false, eids, escores);
+            execute_sparse_micro_experts(
+                sublinear_net->bank->base_ptr,
+                sublinear_net->mlgru_out,
+                eids,
+                sublinear_net->top_k,
+                sublinear_net->ffn_out
+            );
+            pack_activation_bitplanes(sublinear_net->ffn_out, sb, mp);
+            has_ste_out = true;
+        }
+
+        const int prev_tok = ctx.back();
+        const std::string& prev_w = tokenizer.id_to_word[prev_tok];
+
+        if (saw_open_brace && delim_stack.empty() && prev_tok == id_rbrace) {
+            break;
+        }
+
+        for (auto& kv : cand_scores) {
+            const int cand = kv.first;
+            int64_t& sc = kv.second;
+
+            if (cand == CodeProseTokenizer::TOK_PAD || cand == CodeProseTokenizer::TOK_BOS ||
+                CodeProseTokenizer::is_reg_token(cand)) {
+                sc = -1000000000LL;
+                continue;
+            }
+
+            if (has_ste_out && cand >= 0 && cand < sublinear_net->vocab_size) {
+                int32_t ste_dot = ternary_popcnt_dot_512(
+                    &sublinear_net->vocab_pos[static_cast<size_t>(cand) * WORDS_PER_VEC],
+                    &sublinear_net->vocab_neg[static_cast<size_t>(cand) * WORDS_PER_VEC],
+                    sb, mp
+                );
+                sc += static_cast<int64_t>(ste_dot) / 4LL;
+            }
+
+            if (cand >= 0 && static_cast<size_t>(cand) < token_topic_sketch.size()) {
+                int32_t tdot = hsaa_assoc::dot512(prompt_topic_vec, token_topic_sketch[cand].data());
+                sc += static_cast<int64_t>(tdot) * 2LL;
+            }
+
+            if (cand == id_rparen) {
+                if (delim_stack.empty() || delim_stack.back() != '(') sc = -1000000000LL;
+            } else if (cand == id_rbrack) {
+                if (delim_stack.empty() || delim_stack.back() != '[') sc = -1000000000LL;
+            } else if (cand == id_rbrace) {
+                if (delim_stack.empty() || delim_stack.back() != '{') sc = -1000000000LL;
+            } else if (cand == CodeProseTokenizer::TOK_EOS) {
+                if (!delim_stack.empty() || step == 0 || prev_tok == CodeProseTokenizer::TOK_NL ||
+                    CodeProseTokenizer::is_ind_token(prev_tok) || prev_w == ":" ||
+                    prev_w == "=" || prev_w == "+" || prev_w == "-" || prev_w == "," ||
+                    prev_w == "(" || prev_w == "{") {
+                    sc = -1000000000LL;
+                }
+            } else if (CodeProseTokenizer::is_ind_token(cand)) {
+                if (prev_tok != CodeProseTokenizer::TOK_NL) {
+                    sc = -1000000000LL;
+                } else if (saw_open_brace && brace_depth > 0) {
+                    int lvl = CodeProseTokenizer::ind_level(cand);
+                    if (lvl == brace_depth) sc += 2048LL;
+                }
+            }
+
+            if (cand == prev_tok) {
+                sc = -1000000000LL;
+                continue;
+            }
+            if (ctx.size() >= 8) {
+                uint64_t g9 = (make_horizon_key(ctx.data(), ctx.size(), 8) * 0x100000001B3ULL) ^
+                              static_cast<uint64_t>(cand + 0x9E3779B9U);
+                if (visited_9grams.find(g9) != visited_9grams.end()) {
+                    sc -= 5000000LL;
+                }
+            }
+        }
+
+        int chosen_tok = -1;
+        int64_t best_sc = -100000000LL;
+        for (const auto& kv : cand_scores) {
+            if (kv.second > best_sc || (kv.second == best_sc && kv.first < chosen_tok)) {
+                best_sc = kv.second;
+                chosen_tok = kv.first;
+            }
+        }
+        if (chosen_tok < 0 || best_sc <= -50000000LL) break;
+
+        if (temperature > 0.01f) {
+            int64_t margin = static_cast<int64_t>(4096.0f * temperature);
+            std::vector<std::pair<int, int64_t>> viable;
+            int64_t sum_w = 0;
+            for (const auto& kv : cand_scores) {
+                if (kv.second >= best_sc - margin && kv.second > -50000000LL) {
+                    int64_t w = (kv.second - (best_sc - margin)) + 1;
+                    viable.push_back({kv.first, w});
+                    sum_w += w;
+                }
+            }
+            if (viable.size() > 1 && sum_w > 0) {
+                rng_state ^= rng_state >> 12;
+                rng_state ^= rng_state << 25;
+                rng_state ^= rng_state >> 27;
+                uint64_t r = (rng_state * 0x2545F4914F6CDD1DULL) % static_cast<uint64_t>(sum_w);
+                int64_t acc = 0;
+                for (const auto& vp : viable) {
+                    acc += vp.second;
+                    if (static_cast<int64_t>(r) < acc) {
+                        chosen_tok = vp.first;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (chosen_tok == CodeProseTokenizer::TOK_EOS) {
+            break;
+        }
+
+        if (ctx.size() >= 8) {
+            uint64_t g9 = (make_horizon_key(ctx.data(), ctx.size(), 8) * 0x100000001B3ULL) ^
+                          static_cast<uint64_t>(chosen_tok + 0x9E3779B9U);
+            visited_9grams.insert(g9);
+        }
+
+        if (chosen_tok == id_def) is_python_func = true;
+        if (chosen_tok == id_lparen) delim_stack.push_back('(');
+        else if (chosen_tok == id_lbrack) delim_stack.push_back('[');
+        else if (chosen_tok == id_lbrace) {
+            delim_stack.push_back('{');
+            saw_open_brace = true;
+            ++brace_depth;
+        } else if (chosen_tok == id_rparen && !delim_stack.empty() && delim_stack.back() == '(') {
+            delim_stack.pop_back();
+        } else if (chosen_tok == id_rbrack && !delim_stack.empty() && delim_stack.back() == '[') {
+            delim_stack.pop_back();
+        } else if (chosen_tok == id_rbrace && !delim_stack.empty() && delim_stack.back() == '{') {
+            delim_stack.pop_back();
+            if (brace_depth > 0) --brace_depth;
+        }
+
+        generated_toks.push_back(chosen_tok);
+        ctx.push_back(chosen_tok);
+        auto rit = tok_to_reg.find(chosen_tok);
+        reg_ctx.push_back((rit != tok_to_reg.end()) ? rit->second : chosen_tok);
+
+        if (saw_open_brace && delim_stack.empty() && chosen_tok == id_rbrace) {
+            break;
+        }
+    }
+
+    while (!delim_stack.empty()) {
+        char op = delim_stack.back();
+        delim_stack.pop_back();
+        if (op == '(' && id_rparen >= 0) generated_toks.push_back(id_rparen);
+        else if (op == '[' && id_rbrack >= 0) generated_toks.push_back(id_rbrack);
+        else if (op == '{' && id_rbrace >= 0) {
+            generated_toks.push_back(CodeProseTokenizer::TOK_NL);
+            generated_toks.push_back(id_rbrace);
+        }
+    }
+
+    if (generated_toks.empty()) {
+        if (brain->engine && prompt[0] != '\0') {
+            DialogueTurnResult tr = brain->engine->chat_and_reason_native(prompt);
+            if (!tr.assistant.empty()) {
+                strncpy_s(out_text, max_len, tr.assistant.c_str(), _TRUNCATE);
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    std::vector<int> full_seq;
+    if (!topic_launched_from_bos) {
+        full_seq.reserve(prompt_toks.size() + generated_toks.size());
+        for (int t : prompt_toks) full_seq.push_back(t);
+        for (int t : generated_toks) full_seq.push_back(t);
+    } else {
+        full_seq = generated_toks;
+    }
+
+    std::string decoded = tokenizer.decode_tokens(full_seq);
+    strncpy_s(out_text, max_len, decoded.c_str(), _TRUNCATE);
+    return static_cast<int>(generated_toks.size());
+}
 
 extern "C" {
 
-PopCountBrain* brain_create(size_t max_pages, const char* filepath) {
+POPCNT_BRAIN_API PopCountBrain* brain_create(size_t max_pages, const char* filepath) {
     std::string path = filepath ? filepath : "build/brain_runtime.bin";
     auto brain = new PopCountBrain();
+    brain->bank_path = path;
     brain->bank_guard = std::make_unique<AutoMappedWeightBank>(path);
     if (!brain->bank_guard->get()) {
         delete brain;
@@ -7430,19 +9025,18 @@ PopCountBrain* brain_create(size_t max_pages, const char* filepath) {
     return brain;
 }
 
-void brain_destroy(PopCountBrain* brain) {
+POPCNT_BRAIN_API void brain_destroy(PopCountBrain* brain) {
     if (brain) {
         delete brain;
     }
 }
 
-int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
+POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
     brain->direct_facts[subject][relation] = object;
     brain->active_rules++;
     assoc_upsert(brain, subject, relation, object);
 
-    // Feed declarative statement into reasoning engine
     if (brain->engine) {
         std::string stmt = std::string(subject) + " " + relation + " " + object + " .";
         brain->engine->chat_and_reason_native(stmt);
@@ -7450,7 +9044,7 @@ int brain_store_fact(PopCountBrain* brain, const char* subject, const char* rela
     return 1;
 }
 
-int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len) {
+POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len) {
     if (!brain || !subject || !relation || !out_object || max_len == 0) return 0;
     auto sit = brain->direct_facts.find(subject);
     if (sit != brain->direct_facts.end()) {
@@ -7460,8 +9054,6 @@ int brain_query_relation(PopCountBrain* brain, const char* subject, const char* 
             return 1;
         }
     }
-    // Associative fallback (documented in popcnt_brain.h): a lexical near-miss
-    // resolves to the stored object only within the calibrated thresholds.
     if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
         strncpy_s(out_object, max_len, f->object.c_str(), _TRUNCATE);
         return 1;
@@ -7469,44 +9061,240 @@ int brain_query_relation(PopCountBrain* brain, const char* subject, const char* 
     return 0;
 }
 
-int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
+POPCNT_BRAIN_API int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
     auto sit = brain->direct_facts.find(subject);
     if (sit != brain->direct_facts.end()) {
         auto rit = sit->second.find(relation);
         if (rit != sit->second.end()) {
             if (rit->second != object) {
-                return 1; // Conflict: stored object differs from proposed object
+                return 1;
             }
             return 0;
         }
     }
-    // Same associative candidate set as brain_query_relation: a near-miss that
-    // resolves to a stored fact with a different object is a conflict.
     if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
         if (f->object != object) return 1;
     }
     return 0;
 }
 
-void brain_get_stats(PopCountBrain* brain, size_t* out_active_pages, size_t* out_active_rules) {
-    // Honest accounting for `active_pages`: the 4 KB expert pages that actually
-    // hold trained weights. The previous implementation returned the `max_pages`
-    // argument passed to brain_create, so this number was a copy of the requested
-    // budget and never described state -- a caller doing memory accounting from it
-    // under-reported by the full budget size, always, no matter the load.
-    // The relay engine maintains a cumulative set of pages it has initialised, which
-    // is not reset by the profiling helpers that clear g_page_touched_bitmap.
+POPCNT_BRAIN_API void brain_get_stats(PopCountBrain* brain, size_t* out_active_pages, size_t* out_active_rules) {
     if (out_active_pages) {
         *out_active_pages = (brain && brain->engine)
             ? brain->engine->relay_chain.initialized_relay_pages.size()
             : 0;
     }
-    // `active_rules` counts brain_store_fact calls, NOT distinct stored rules:
-    // storing the same subject/relation twice increments it twice. This is the
-    // behaviour the shipped integration test pins, so it is kept and documented
-    // here rather than silently changed.
     if (out_active_rules) *out_active_rules = brain ? brain->active_rules : 0;
 }
 
+POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath) {
+    if (!brain || !filepath) return 0;
+#if defined(_WIN32)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
+    if (wlen <= 0) return 0;
+    std::vector<wchar_t> wpath(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wpath.data(), wlen);
+    std::filesystem::path fpath(wpath.data());
+    if (fpath.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(fpath.parent_path(), ec);
+    }
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, wpath.data(), L"w") != 0 || !fp) return 0;
+#else
+    FILE* fp = fopen(filepath, "w");
+    if (!fp) return 0;
+#endif
+    for (const auto& sit : brain->direct_facts) {
+        for (const auto& rit : sit.second) {
+            fprintf(fp, "%s\t%s\t%s\n", sit.first.c_str(), rit.first.c_str(), rit.second.c_str());
+        }
+    }
+    if (brain->llm_engine && brain->llm_engine->is_trained && !brain->llm_engine->last_trained_corpus.empty()) {
+        std::string hex_corpus = bytes_to_hex(brain->llm_engine->last_trained_corpus);
+        fprintf(fp, "#__POPCNT_LLM_V1__ %d %s\n", brain->llm_engine->last_trained_epochs, hex_corpus.c_str());
+    }
+    fclose(fp);
+    return 1;
+}
+
+POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath) {
+    if (!brain || !filepath) return 0;
+#if defined(_WIN32)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
+    if (wlen <= 0) return 0;
+    std::vector<wchar_t> wpath(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wpath.data(), wlen);
+    std::ifstream ifs(wpath.data(), std::ios::binary);
+#else
+    std::ifstream ifs(filepath, std::ios::binary);
+#endif
+    if (!ifs) return 0;
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("#__POPCNT_LLM_V1__ ", 0) == 0) {
+            size_t sp1 = line.find(' ', 19);
+            if (sp1 != std::string::npos) {
+                int ep = std::atoi(line.substr(19, sp1 - 19).c_str());
+                std::string corpus = hex_to_bytes(line.substr(sp1 + 1));
+                if (!corpus.empty()) {
+                    brain_train_corpus(brain, corpus.c_str(), ep, nullptr);
+                }
+            }
+            continue;
+        }
+        size_t t1 = line.find('\t');
+        if (t1 == std::string::npos) continue;
+        size_t t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) continue;
+        std::string sub = line.substr(0, t1);
+        std::string rel = line.substr(t1 + 1, t2 - (t1 + 1));
+        std::string obj = line.substr(t2 + 1);
+        brain_store_fact(brain, sub.c_str(), rel.c_str(), obj.c_str());
+    }
+    return ifs.bad() ? 0 : 1;
+}
+
+POPCNT_BRAIN_API int brain_train_corpus(
+    PopCountBrain* brain,
+    const char* corpus_text,
+    int epochs,
+    BrainTrainStats* out_stats
+) {
+    if (!brain || !corpus_text || corpus_text[0] == '\0') return 0;
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    return brain->llm_engine->train_corpus(brain->bank_path, corpus_text, epochs, out_stats) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API int brain_train_file(
+    PopCountBrain* brain,
+    const char* filepath,
+    int epochs,
+    BrainTrainStats* out_stats
+) {
+    if (!brain || !filepath || filepath[0] == '\0') return 0;
+#if defined(_WIN32)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
+    if (wlen <= 0) return 0;
+    std::vector<wchar_t> wpath(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wpath.data(), wlen);
+    std::ifstream ifs(wpath.data(), std::ios::binary);
+#else
+    std::ifstream ifs(filepath, std::ios::binary);
+#endif
+    if (!ifs) return 0;
+    std::string text((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (text.empty()) return 0;
+    return brain_train_corpus(brain, text.c_str(), epochs, out_stats);
+}
+
+POPCNT_BRAIN_API int brain_generate(
+    PopCountBrain* brain,
+    const char* prompt,
+    char* out_text,
+    size_t max_len,
+    int max_tokens,
+    float temperature
+) {
+    if (!brain || !prompt || !out_text || max_len == 0 || max_tokens <= 0) {
+        if (out_text && max_len > 0) out_text[0] = '\0';
+        return 0;
+    }
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    return brain->llm_engine->generate(brain, prompt, out_text, max_len, max_tokens, temperature);
+}
+
 } // extern "C"
+
+#ifndef BUILDING_POPCNT_BRAIN_LIB
+static int train_and_generate_llm_cli(int argc, char** argv) {
+    const bool is_train = (std::strcmp(argv[1], "--train-llm") == 0);
+    const char* primary_arg = (argc >= 3) ? argv[2] : nullptr;
+    if (!primary_arg) {
+        std::cerr << "Usage:\n"
+                  << "  popcnt_brain.exe --train-llm <corpus.txt> [--epochs N] [--state <state.tsv>] [--prompt \"<text>\" --max-tokens N]\n"
+                  << "  popcnt_brain.exe --generate \"<prompt>\" --state <state.tsv> [--max-tokens N] [--temp T]\n";
+        return 2;
+    }
+
+    int epochs = 6;
+    int max_tokens = 64;
+    float temperature = 0.0f;
+    const char* state_path = "build/llm_trained_state.tsv";
+    const char* prompt_arg = is_train ? nullptr : primary_arg;
+
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
+            epochs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--state") == 0 && i + 1 < argc) {
+            state_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
+            prompt_arg = argv[++i];
+        } else if (std::strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
+            max_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            temperature = static_cast<float>(std::atof(argv[++i]));
+        }
+    }
+
+    std::filesystem::create_directories("build");
+    PopCountBrain* brain = brain_create(4096, "build/cli_llm_brain.bin");
+    if (!brain) {
+        std::cerr << "[ERROR] brain_create failed\n";
+        return 1;
+    }
+
+    if (is_train) {
+        BrainTrainStats st{};
+        if (!brain_train_file(brain, primary_arg, epochs, &st)) {
+            std::cerr << "[ERROR] brain_train_file failed on: " << primary_arg << "\n";
+            brain_destroy(brain);
+            return 1;
+        }
+        brain_save_state(brain, state_path);
+        std::printf("{\n  \"llm_training\": {\n");
+        std::printf("    \"vocab_size\": %zu,\n", st.vocab_size);
+        std::printf("    \"num_sequences\": %zu,\n", st.num_sequences);
+        std::printf("    \"total_tokens\": %zu,\n", st.total_tokens);
+        std::printf("    \"total_transitions\": %zu,\n", st.total_transitions);
+        std::printf("    \"epochs\": %d,\n", st.epochs);
+        std::printf("    \"replay_accuracy_percent\": %.2f,\n", st.replay_accuracy_percent);
+        std::printf("    \"shortlist_coverage_percent\": %.2f,\n", st.shortlist_coverage_percent);
+        std::printf("    \"train_time_ms\": %.3f,\n", st.train_time_ms);
+        std::printf("    \"tokens_per_sec\": %.1f,\n", st.tokens_per_sec);
+        std::printf("    \"state_saved\": \"%s\"\n", state_path);
+        if (prompt_arg) {
+            char buf[8192] = {0};
+            int gen_n = brain_generate(brain, prompt_arg, buf, sizeof(buf), max_tokens, temperature);
+            std::printf("  },\n  \"generated_tokens\": %d,\n", gen_n);
+            std::printf("  \"output\": \"%s\"\n}\n", buf);
+        } else {
+            std::printf("  }\n}\n");
+        }
+    } else {
+        if (!brain_load_state(brain, state_path)) {
+            std::cerr << "[ERROR] brain_load_state failed on: " << state_path << "\n";
+            brain_destroy(brain);
+            return 1;
+        }
+        char buf[8192] = {0};
+        int gen_n = brain_generate(brain, prompt_arg, buf, sizeof(buf), max_tokens, temperature);
+        if (gen_n <= 0) {
+            std::cerr << "[ERROR] brain_generate produced 0 tokens\n";
+            brain_destroy(brain);
+            return 1;
+        }
+        std::printf("%s\n", buf);
+    }
+
+    brain_destroy(brain);
+    return 0;
+}
+#endif // BUILDING_POPCNT_BRAIN_LIB

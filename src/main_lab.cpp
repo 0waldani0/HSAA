@@ -383,7 +383,7 @@ static int cmd_lab(int argc, char** argv) {
 
         std::string lat_str = std::to_string(t1 - t0).substr(0, 6) + " us";
         std::string cos_str = std::to_string(cos_sim).substr(0, 7);
-        std::string sqnr_str = (sqnr >= 120.0f) ? "Infinity (Exact)" : (std::to_string(sqnr).substr(0, 6) + " dB");
+        std::string sqnr_str = (sqnr >= 120.0f) ? "N/A (FP32 path)" : (std::to_string(sqnr).substr(0, 6) + " dB");
 
         std::cout << std::left << std::setw(46) << m.name
                   << std::setw(16) << lat_str

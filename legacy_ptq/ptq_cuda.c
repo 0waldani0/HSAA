@@ -265,12 +265,12 @@ int ptq_gemv_sm86(
 
     uint32_t rows_arg = M, cols_arg = N, rank_arg = R, planes_arg = active_planes;
     CUdeviceptr d_tt_v = mat->d_tt_v;
-    CUdeviceptr d_z_tt = mat->d_z_tt;
+    CUdeviceptr d_z_or_u = (mat->R & 0x80u) ? mat->d_tt_u : mat->d_z_tt;
 
     void *args[] = {
         (void*)&mat->d_p[0], (void*)&mat->d_p[1], (void*)&mat->d_p[2], (void*)&mat->d_p[3],
         (void*)&mat->d_sc, (void*)&mat->d_zr, (void*)&d_x,
-        (void*)&d_tt_v, (void*)&d_z_tt, (void*)&d_partials, (void*)&d_tile_cnt, (void*)&d_y,
+        (void*)&d_tt_v, (void*)&d_z_or_u, (void*)&d_partials, (void*)&d_tile_cnt, (void*)&d_y,
         (void*)&rows_arg, (void*)&cols_arg, (void*)&rank_arg, (void*)&planes_arg
     };
 

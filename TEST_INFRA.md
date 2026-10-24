@@ -15,10 +15,11 @@ and the current readiness statement are in `TEST_READY.md`.
   model_mod, bench_runner). 43 checks; exit code 0 only if all pass.
   Built and run by `tests\build_tests.bat run`; `build.bat test` delegates to it.
 - **Adversarial / stress suites** (`tests\build_stress*.bat`,
-  `build_hssa_m1..m3_tests.bat`, `build_challenger2.bat`): boundary matrices,
+  `tests\build_hssa_m1_tests.bat`, `tests\build_hssa_m2_tests.bat`, `tests\build_hssa_m3_tests.bat`,
+  `build_adversarial_stress.bat`, `tests\build_challenger2.bat`): boundary matrices,
   concurrency, lifecycle and leak checks, CUDA M2, mutation-flip sensitivity.
 - **Benchmarks** (`tests\build_bench_model_mod.bat`,
-  `build_bench_hot_swap.bat`, `build_stress_bench.bat`): numerical fidelity
+  `tests\build_bench_hot_swap.bat`, `tests\build_stress_bench.bat`, `build_micro_bench.bat`): numerical fidelity
   against independent software references plus latency/throughput.
 - **Regression driver** (`second_brain\measur\regress_par.py`): serial phase
   (gates, engine library, associative calibration, CUDA M2 on an idle host),

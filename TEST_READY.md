@@ -52,7 +52,10 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 | model_mod benchmark | `tests\build_bench_model_mod.bat run` | 5 / 5 |
 | VSA hot-swap benchmark | `tests\build_bench_hot_swap.bat run` | 3 / 3 |
 | Challenger 2 | `tests\build_challenger2.bat` | 4 / 4 |
+| Adversarial stress | `build_adversarial_stress.bat` | pass |
+| Micro-benchmark | `build_micro_bench.bat` | pass |
 | PTQ host validation | `tests\build_ptq_validation.bat run` | 5 / 5 (N/M tiling and fused rank rejections) |
+| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 28 / 28 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override) |
 | C-ABI probe (F22) | `second_brain\measur\build_capi_probe.bat` | exit 0 |
 | Assoc calibration | `second_brain\measur\build_assoc_calib.bat` | recall/FP table at the shipped gate |
 

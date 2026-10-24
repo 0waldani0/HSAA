@@ -39,9 +39,9 @@ REM 2. Ensure popcnt_brain.lib exists
 REM ============================================================================
 if not exist "%BUILD_DIR%\popcnt_brain.lib" (
     echo [*] Building prerequisite popcnt_brain.lib...
-    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /EHsc /utf-8 /wd4068 /c ^
-        "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain.obj"
-    lib.exe /nologo "%BUILD_DIR%\popcnt_brain.obj" /OUT:"%BUILD_DIR%\popcnt_brain.lib"
+    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /EHsc /utf-8 /wd4068 /DBUILDING_POPCNT_BRAIN_LIB /c ^
+        "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
+    lib.exe /nologo "%BUILD_DIR%\popcnt_brain_lib.obj" /OUT:"%BUILD_DIR%\popcnt_brain.lib"
 )
 
 echo [*] Compiling Adversarial Stress Harness (adversarial_stress_hssa.cpp)...
