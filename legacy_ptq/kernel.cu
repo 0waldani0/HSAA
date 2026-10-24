@@ -38,12 +38,22 @@ extern "C" __global__ void bsl_lut_gemv_sm86(
     const uint32_t row        = rt * 32 + lane;
     const uint32_t col_blocks = cols >> 7;           /* cols / 128 */
     const uint32_t row_tiles  = rows >> 5;           /* rows / 32 */
-    const uint32_t real_rank  = tt_rank & 0x7Fu;
+    const uint32_t req_rank   = tt_rank & 0x7Fu;
     const uint32_t fused_u    = (tt_rank >> 7) & 1u;
+    /* The fused epilogue stages z in s_z_tt[16]. The host wrapper rejects a fused
+     * request above 16 ranks; a direct launch that gets here is a caller bug, so
+     * trap instead of clamping and silently returning a truncated projection. */
+    if (fused_u && req_rank > 16u) __trap();
+    const uint32_t real_rank  = req_rank;
 
-    const uint32_t cb_per_split = col_blocks / gridDim.y;
-    const uint32_t cb_start     = blockIdx.y * cb_per_split;
-    const uint32_t cb_end       = cb_start + cb_per_split;
+    /* Ceil-division, not truncation: col_blocks / gridDim.y dropped the remainder,
+     * so e.g. 7 column blocks over 2 splits silently skipped one block of every
+     * row. Empty trailing splits still run and contribute a zero partial. */
+    const uint32_t cb_per_split = (col_blocks + gridDim.y - 1u) / gridDim.y;
+    const uint32_t cb_start     = (blockIdx.y * cb_per_split < col_blocks)
+                                    ? blockIdx.y * cb_per_split : col_blocks;
+    const uint32_t cb_end       = (cb_start + cb_per_split < col_blocks)
+                                    ? cb_start + cb_per_split : col_blocks;
 
     /* Hybrid Split-Local float4 Fused TT-U Projection (only 8 float4 loads/thread, 0 extra kernel launch!) */
     if (fused_u && active_planes != 24 && active_planes != 34 && real_rank > 0 && d_z_tt != NULL) {
@@ -469,6 +479,13 @@ extern "C" __global__ void gqa_attn_sm86(
     __shared__ float s_red[4];
     __shared__ float s_max;
     __shared__ float s_inv_sum;
+
+    /* s_scores is fixed at 2048 floats of shared memory; qwen3_gqa_attn() on the
+     * host already rejects seq_len > 2048. Trap rather than write out of bounds
+     * if this kernel is ever launched directly. */
+    if (seq_len > 2048u) {
+        __trap();
+    }
 
     const uint32_t h        = blockIdx.x;
     const uint32_t tid      = threadIdx.x;

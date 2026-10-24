@@ -134,6 +134,12 @@ typedef struct HssaContext {
     float*              logits_buf;         /* [vocab_size] 64-byte aligned */
     size_t              vocab_size;
 
+    /* Serializes forward passes against TT16 core updates. The scratchpads and
+     * tt_u/tt_v are single-instance mutable state; concurrent forward/backward
+     * calls on one context raced before this lock existed. C-ABI safe: points
+     * at a C++ std::mutex owned by hssa_create. */
+    void*               state_lock;
+
     void*               reserved[8];
 } HssaContext;
 

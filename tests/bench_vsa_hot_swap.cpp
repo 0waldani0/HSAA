@@ -622,8 +622,8 @@ static bool bench_raw_vector_cosine_argmax_scan() {
         BENCH_ASSERT(correct_argmax_count == NUM_TRIALS, "Argmax failed to retrieve the correct target under noise!");
     }
 
-    // 3. Bitwise Inverse Query Test (Negative Cosine Similarity: -1.0)
-    std::printf("\n[*] Testing Bitwise Opposite Vector (Expected Sim: -1.0)...\n");
+    // 3. Bitwise Inverse Query Test (resonance gate)
+    std::printf("\n[*] Testing Bitwise Opposite Vector (Expected Sim: -1.0, rejected by the gate)...\n");
     VsaDbHandle* db_single = vsa_db_create(VSA_CAP_MICRO, nullptr);
     BENCH_ASSERT(db_single != nullptr, "Create DB failed");
 
@@ -634,11 +634,14 @@ static bool bench_raw_vector_cosine_argmax_scan() {
     vsa_db_insert_vector(db_single, 1, v_norm);
 
     uint64_t ret_inv[VSA_WORDS];
-    float sim_inv = 0.0f;
+    float sim_inv = -1.0f;
     int res_inv = vsa_db_query_vector(db_single, v_inv, ret_inv, &sim_inv);
-    BENCH_ASSERT(res_inv == 1, "Inverse vector query failed");
-    std::printf("  Sim for exact bitwise NOT: %.6f (Expected: -1.000000)\n", sim_inv);
-    BENCH_ASSERT(std::abs(sim_inv - (-1.0f)) < 1e-5f, "Inverse vector similarity must be exactly -1.0f");
+    // -1.0 is far below the 0.40 resonance gate: the API reports a miss and
+    // resets the similarity, it does not return an antipode as a "match". The
+    // cosine math itself is covered by the bit-flip sweep above.
+    BENCH_ASSERT(res_inv == 0, "Inverse vector must be rejected by the resonance gate");
+    BENCH_ASSERT(sim_inv == 0.0f, "Rejected inverse probe leaves similarity at 0.0");
+    std::printf("  Inverse query correctly rejected (sim reset to %.6f)\n", sim_inv);
     vsa_db_destroy(db_single);
 
     // 4. Large-Scale Argmax Throughput & Latency Profiling

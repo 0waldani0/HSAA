@@ -61,25 +61,37 @@ extern "C" {
 // What this ABI actually is (verified against the implementation, not the
 // marketing copy -- read this before integrating):
 //
-//   * Knowledge lives in two places, and they do NOT share a query path.
+//   * Knowledge lives in two places:
 //       1. `direct_facts`: an in-RAM std::unordered_map nested
-//          (subject -> relation -> object) keyed by STRING. Every read and
-//          every conflict check below resolves ONLY against this map.
+//          (subject -> relation -> object) keyed by the RAW string. Every
+//          exact read and conflict check resolves here first.
 //       2. The neural/VSA engine (`chat_and_reason_native`), which holds the
 //          4 KB ternary expert pages and the 512-bit vectors. It is written on
-//          every brain_store_fact call but is NEVER consulted by
-//          brain_query_relation, so its fuzzy retrieval is unreachable
-//          through this ABI.
-//   * Consequently: query returns exact-string matches only. No bitwise
-//     similarity, no fuzzy match, no 512-bit vector ever reaches a caller
-//     through brain_query_relation / brain_check_conflict.
+//          every brain_store_fact call but is NEVER consulted by the query
+//          path, so its fuzzy retrieval is unreachable through this ABI.
+//   * Query semantics: exact raw-string match first. On a miss, a LEXICAL
+//     associative fallback (512-bit SimHash over character trigrams, see
+//     assoc_sketch.h) resolves a near-miss when one field matches exactly
+//     after ASCII lowercase + whitespace normalization and the other field
+//     clears the measured threshold (dot >= 200 of 512 on both gates).
+//     MEASURED (measur/assoc_calib.cpp, 300-fact populations):
+//       - 1-char typo in the subject, exact relation: 99.0% (distinct words),
+//         100% (shared-prefix template);
+//       - 1-char typo in the relation, exact subject: 85.7% (280 queries over
+//         40 subjects x 7 relations), 0 wrong-relation outcomes;
+//       - case/whitespace variants: 100%;
+//       - unrelated queries and exact-subject+bogus-relation: 0 false hits in
+//         640 probes.
+//     It is lexical only: "car" and "automobile" are not related here, and
+//     stored identifiers that differ by one character are inherently ambiguous
+//     (exact lookups are unaffected).
+//   * The 512-bit VSA machinery claims (AVX-512 VPOPCNTDQ etc.) describe that
+//     internal engine, NOT this fallback. The bank is still never read by a
+//     query; the fallback is a separate in-RAM index over stored facts.
 //   * The engine does run, and its cost is real: measured on this host,
 //     expert-relay retrieval is 1.5-2.1 us/step (681k-473k steps/s) and the
 //     PKM top-4 probe is 21.6 us/step. See run_massive_multidomain_pretraining
 //     inside popcnt_brain.cpp for the full telemetry block.
-//   * The 512-bit VSA machinery claims (AVX-512 VPOPCNTDQ etc.) describe that
-//     internal engine, NOT this query path. Do not attribute dictionary
-//     lookup behaviour to the hyperdimensional layer.
 // =============================================================================
 
 typedef struct PopCountBrain PopCountBrain;
@@ -94,18 +106,20 @@ PopCountBrain* brain_create(size_t max_pages, const char* filepath);
 void brain_destroy(PopCountBrain* brain);
 
 // Store an episodic relation / fact triple (Subject - Relation - Object).
-// Writes the triple into an in-RAM string index AND feeds it to the neural
-// engine. Returns 1 on success, 0 on failure.
+// Writes the triple into the in-RAM exact index, into the associative fallback
+// index, and feeds it to the neural engine. Returns 1 on success, 0 on failure.
 int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
 
-// Query an object given a subject and relation.
-// EXACT STRING LOOKUP against the in-RAM index only -- the neural/VSA engine is
-// not consulted, so this is a dictionary lookup and never a fuzzy match.
+// Query an object given a subject and relation. Exact raw-string lookup first;
+// on a miss the lexical associative fallback documented above may resolve a
+// near-miss (case/whitespace variants, single-character typos within the
+// measured threshold). The neural/VSA engine is never consulted.
 // Returns 1 if found and fills out_object (null-terminated), 0 if not found.
 int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len);
 
 // Verify consistency: returns 1 if proposed statement contradicts stored knowledge, 0 otherwise.
-// Also an exact-string check against the in-RAM index; the engine is not consulted.
+// Resolves through the same exact-then-associative path; a near-miss that
+// resolves to a stored fact with a different object counts as a conflict.
 int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
 
 // Stats.

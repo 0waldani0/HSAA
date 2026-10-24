@@ -1,4 +1,5 @@
 #include "popcnt_brain.h"
+#include "assoc_sketch.h"
 #include "domain_seed_corpus.h"
 #include <memory>
 // =============================================================================
@@ -358,7 +359,7 @@ inline int32_t ternary_popcnt_dot_512(
 #endif
 }
 
-inline int32_t binary_xnor_popcnt_512(
+inline int32_t vsa_bipolar_dot_512(
     const uint64_t* __restrict__ a_bits,
     const uint64_t* __restrict__ b_bits
 ) {
@@ -383,7 +384,7 @@ inline int32_t binary_xnor_popcnt_512(
 #endif
 }
 
-inline int32_t binary_xnor_popcnt_256(
+inline int32_t vsa_bipolar_dot_256(
     const uint64_t* __restrict__ a_bits,
     const uint64_t* __restrict__ b_bits
 ) {
@@ -458,7 +459,7 @@ inline int32_t vsa_resolve_token_popcnt(
     int32_t best_sim = -1024;
     for (int v = 0; v < vocab_size; ++v) {
         const uint64_t* vp = vocab_pos + static_cast<size_t>(v) * WORDS_PER_VEC;
-        int32_t sim = binary_xnor_popcnt_512(query_bits, vp);
+        int32_t sim = vsa_bipolar_dot_512(query_bits, vp);
         if (sim > best_sim) {
             best_sim = sim;
             best_id = v;
@@ -655,7 +656,7 @@ inline bool bank_store_rule(
         auto& page = bank_pages[pages[p]];
         for (size_t r = 0; r < D_BOTTLENECK; ++r) {
             if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
-            if (binary_xnor_popcnt_512(rule_key_bits, page.w_down_pos[r]) > ALLOC_SAME_RULE_THRESHOLD) {
+            if (vsa_bipolar_dot_512(rule_key_bits, page.w_down_pos[r]) > ALLOC_SAME_RULE_THRESHOLD) {
                 bank_write_rule_slot(page, r, rule_key_bits, rule_val_bits);
                 return true;
             }
@@ -721,7 +722,7 @@ inline int bank_query_rule(
         const auto& page = bank_pages[pages[p]];
         for (size_t r = 0; r < D_BOTTLENECK; ++r) {
             if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
-            const int32_t sim = binary_xnor_popcnt_512(query_key_bits, page.w_down_pos[r]);
+            const int32_t sim = vsa_bipolar_dot_512(query_key_bits, page.w_down_pos[r]);
             if (sim > best_sim) {
                 best_sim = sim;
                 best_r = static_cast<int>(r);
@@ -757,7 +758,7 @@ inline bool write_persistent_fact_page_4kb(
             if (slot < 0) slot = static_cast<int>(r);
             continue;
         }
-        if (binary_xnor_popcnt_512(fact_key_bits, page.w_down_pos[r]) > 460) {
+        if (vsa_bipolar_dot_512(fact_key_bits, page.w_down_pos[r]) > 460) {
             slot = static_cast<int>(r);
             break;
         }
@@ -794,7 +795,7 @@ inline int query_persistent_fact_page_4kb(
     int32_t best_sim = -1024;
     for (size_t r = 0; r < D_BOTTLENECK; ++r) {
         if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
-        int32_t sim = binary_xnor_popcnt_512(query_key_bits, page.w_down_pos[r]);
+        int32_t sim = vsa_bipolar_dot_512(query_key_bits, page.w_down_pos[r]);
         if (sim > best_sim) {
             best_sim = sim;
             best_r = static_cast<int>(r);
@@ -999,7 +1000,7 @@ void popcnt_sliding_window_attention(
 
     for (int pos = 0; pos < window_len; ++pos) {
         const uint64_t* k_ptr = window_key_bits + static_cast<size_t>(pos) * WORDS_PER_VEC;
-        int32_t sim = binary_xnor_popcnt_512(query_sign_bits, k_ptr);
+        int32_t sim = vsa_bipolar_dot_512(query_sign_bits, k_ptr);
         if (sim > best_sim) {
             best_sim = sim;
             best_pos = pos;
@@ -1041,12 +1042,12 @@ void update_router_centroids_simhash(
 
     for (size_t probe = 0; probe < SUBKEY_COUNT; ++probe) {
         bool empty_u = (sub1_acc[u][0] == 0 && sub1_acc[u][1] == 0 && sub1_acc[u][2] == 0);
-        if (empty_u || binary_xnor_popcnt_256(q1, keys_sub1[u]) >= 220) break;
+        if (empty_u || vsa_bipolar_dot_256(q1, keys_sub1[u]) >= 220) break;
         u = static_cast<uint16_t>((u + 1) & (SUBKEY_COUNT - 1));
     }
     for (size_t probe = 0; probe < SUBKEY_COUNT; ++probe) {
         bool empty_v = (sub2_acc[v][0] == 0 && sub2_acc[v][1] == 0 && sub2_acc[v][2] == 0);
-        if (empty_v || binary_xnor_popcnt_256(q2, keys_sub2[v]) >= 220) break;
+        if (empty_v || vsa_bipolar_dot_256(q2, keys_sub2[v]) >= 220) break;
         v = static_cast<uint16_t>((v + 1) & (SUBKEY_COUNT - 1));
     }
 
@@ -1086,8 +1087,8 @@ void route_product_key_popcnt(
     uint16_t idx2[SUBKEY_COUNT];
 
     for (size_t i = 0; i < SUBKEY_COUNT; ++i) {
-        scores1[i] = binary_xnor_popcnt_256(q1, keys_sub1[i]);
-        scores2[i] = binary_xnor_popcnt_256(q2, keys_sub2[i]);
+        scores1[i] = vsa_bipolar_dot_256(q1, keys_sub1[i]);
+        scores2[i] = vsa_bipolar_dot_256(q2, keys_sub2[i]);
         idx1[i] = static_cast<uint16_t>(i);
         idx2[i] = static_cast<uint16_t>(i);
     }
@@ -1140,7 +1141,7 @@ uint32_t route_fff_tree_popcnt(
     int32_t accum_score = 0;
     for (size_t d = 0; d < TREE_DEPTH; ++d) {
         const uint64_t* node_plane = tree_nodes + static_cast<size_t>(node_idx) * WORDS_PER_VEC;
-        int32_t dot = binary_xnor_popcnt_512(sign_bits, node_plane);
+        int32_t dot = vsa_bipolar_dot_512(sign_bits, node_plane);
         accum_score += (dot >= 0) ? dot : -dot;
         uint32_t go_right = (dot >= 0) ? 1U : 0U;
         node_idx = (node_idx << 1) + 1U + go_right;
@@ -3575,8 +3576,8 @@ struct MultiLayerExpertRelayEngine {
         uint32_t best_u = 0, best_v = 0;
 
         for (size_t i = 0; i < LAYER_SUBKEYS; ++i) {
-            int32_t s1 = binary_xnor_popcnt_256(q1, layer_keys_sub1[l][i]);
-            int32_t s2 = binary_xnor_popcnt_256(q2, layer_keys_sub2[l][i]);
+            int32_t s1 = vsa_bipolar_dot_256(q1, layer_keys_sub1[l][i]);
+            int32_t s2 = vsa_bipolar_dot_256(q2, layer_keys_sub2[l][i]);
             if (s1 > best_s1) { best_s1 = s1; best_u = static_cast<uint32_t>(i); }
             if (s2 > best_s2) { best_s2 = s2; best_v = static_cast<uint32_t>(i); }
         }
@@ -3591,12 +3592,12 @@ struct MultiLayerExpertRelayEngine {
 
         for (size_t probe = 0; probe < LAYER_SUBKEYS; ++probe) {
             bool empty_u = (layer_sub1_acc[l][u][0] == 0 && layer_sub1_acc[l][u][1] == 0);
-            if (empty_u || binary_xnor_popcnt_256(q1, layer_keys_sub1[l][u]) >= 228) break;
+            if (empty_u || vsa_bipolar_dot_256(q1, layer_keys_sub1[l][u]) >= 228) break;
             u = static_cast<uint16_t>((u + 1) & (LAYER_SUBKEYS - 1));
         }
         for (size_t probe = 0; probe < LAYER_SUBKEYS; ++probe) {
             bool empty_v = (layer_sub2_acc[l][v][0] == 0 && layer_sub2_acc[l][v][1] == 0);
-            if (empty_v || binary_xnor_popcnt_256(q2, layer_keys_sub2[l][v]) >= 228) break;
+            if (empty_v || vsa_bipolar_dot_256(q2, layer_keys_sub2[l][v]) >= 228) break;
             v = static_cast<uint16_t>((v + 1) & (LAYER_SUBKEYS - 1));
         }
 
@@ -6113,7 +6114,7 @@ MassivePretrainReport run_massive_multidomain_pretraining(
 
                 // Walk the 8-Layer Expert-Selects-Expert Relay:
                 // At Layer `l`, Expert `E^{(l)}` checks if it already has a neuron matching `ctx_bits`
-                // (`binary_xnor_popcnt_512 >= 460`) or an empty neuron slot `first_empty_r`.
+                // (`vsa_bipolar_dot_512 >= 460`) or an empty neuron slot `first_empty_r`.
                 // If all 16 neuron slots in `E^{(l)}` are occupied by other contexts, `E^{(l)}`
                 // steers the context to `E^{(l+1)}` in Layer `l + 1`!
                 uint32_t prev_pid = 0;
@@ -6137,7 +6138,7 @@ MassivePretrainReport run_massive_multidomain_pretraining(
                             continue;
                         }
                         occ_mask |= static_cast<uint16_t>(1U << r);
-                        if (binary_xnor_popcnt_512(ctx_bits, page.w_down_pos[r]) >= 472) {
+                        if (vsa_bipolar_dot_512(ctx_bits, page.w_down_pos[r]) >= 472) {
                             matching_r = static_cast<int>(r);
                             break;
                         }
@@ -6146,7 +6147,7 @@ MassivePretrainReport run_massive_multidomain_pretraining(
                     if (matching_r >= 0) {
                         if (ep == 0 && (s_idx % eval_sample_stride == 0)) {
                             ++ep1_total;
-                            if (binary_xnor_popcnt_512(targ_pos, page.w_up_pos[matching_r]) >= 480) {
+                            if (vsa_bipolar_dot_512(targ_pos, page.w_up_pos[matching_r]) >= 480) {
                                 ++ep1_correct;
                             }
                         }
@@ -6215,13 +6216,13 @@ MassivePretrainReport run_massive_multidomain_pretraining(
                 for (size_t r = 0; r < D_BOTTLENECK; ++r) {
                     if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
                     occ_mask |= static_cast<uint16_t>(1U << r);
-                    if (binary_xnor_popcnt_512(ctx_bits, page.w_down_pos[r]) >= 472) {
+                    if (vsa_bipolar_dot_512(ctx_bits, page.w_down_pos[r]) >= 472) {
                         match_r = static_cast<int>(r);
                         break;
                     }
                 }
                 if (match_r >= 0) {
-                    if (binary_xnor_popcnt_512(targ_pos, page.w_up_pos[match_r]) >= 480) hit = true;
+                    if (vsa_bipolar_dot_512(targ_pos, page.w_up_pos[match_r]) >= 480) hit = true;
                     break;
                 }
                 prev_pid = pid;
@@ -6265,7 +6266,7 @@ MassivePretrainReport run_massive_multidomain_pretraining(
                 for (size_t r = 0; r < D_BOTTLENECK; ++r) {
                     if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
                     occ_mask |= static_cast<uint16_t>(1U << r);
-                    if (binary_xnor_popcnt_512(ctx_bits, page.w_down_pos[r]) >= 472) {
+                    if (vsa_bipolar_dot_512(ctx_bits, page.w_down_pos[r]) >= 472) {
                         match_r = static_cast<int>(r);
                         break;
                     }
@@ -7321,13 +7322,97 @@ int main(int argc, char** argv) {
 // =============================================================================
 // Implementation of PopCount Second Brain C-ABI API (popcnt_brain.h)
 // =============================================================================
+//
+// Associative fallback (F22). The exact dictionary stays first: a raw
+// subject/relation pair that exists is answered without any sketch work. On a
+// miss, the query is resolved against the same fact population through a
+// 512-bit lexical SimHash (second_brain/assoc_sketch.h). A candidate is
+// eligible only when one field matches exactly after case/whitespace
+// normalization and the other clears its measured dot threshold, so a typo in
+// a short predicate cannot silently borrow a different relation's object.
+// Thresholds and their measured recall/FP live in measur/assoc_calib.cpp;
+// the integration probe (measur/capi_probe.c) pins the shipped behaviour.
+struct AssocFact {
+    uint64_t skey[hsaa_assoc::kW];
+    uint64_t rkey[hsaa_assoc::kW];
+    std::string subject_raw;
+    std::string relation_raw;
+    std::string subject_norm;
+    std::string relation_norm;
+    std::string object;
+};
+
 struct PopCountBrain {
     std::unique_ptr<AutoMappedWeightBank> bank_guard;
     std::unique_ptr<PureNeuralReasoningEngine> engine;
     size_t max_pages;
     size_t active_rules;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> direct_facts;
+    std::vector<AssocFact> assoc_facts;
 };
+
+namespace {
+
+// Measured on 300-fact populations (measur/assoc_calib.cpp):
+//   subject typo, exact relation : 297/300 (distinct words), 300/300 (template)
+//   relation typo, exact subject : 240/280 (multi-relation), 0 wrong relations
+//   case/whitespace variant      : 300/300
+//   near-duplicate / bogus       : 0/1,240 false hits at the shipped gate
+// The typo sits in the subject's random suffix: a one-char change there yields
+// a true-subject dot p10=218 (distinct) / p10=290 (template), so 200 keeps
+// 99-100% recall. It is not a margin over the best wrong neighbour -- template
+// subjects share "entity_", and a wrong neighbour can score up to 246; the
+// exact-relation requirement and the ds+dr ranking keep those out of the answer.
+constexpr int32_t kAssocMinSubjectDot = 200;
+constexpr int32_t kAssocMinRelationDot = 200;
+
+void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
+    for (AssocFact& f : brain->assoc_facts) {
+        if (f.subject_raw == subject && f.relation_raw == relation) {
+            f.object = object;
+            return;
+        }
+    }
+    AssocFact f;
+    f.subject_raw = subject;
+    f.relation_raw = relation;
+    f.object = object;
+    f.subject_norm = hsaa_assoc::normalize(subject);
+    f.relation_norm = hsaa_assoc::normalize(relation);
+    hsaa_assoc::sketch(f.subject_norm, f.skey);
+    hsaa_assoc::sketch(f.relation_norm, f.rkey);
+    brain->assoc_facts.push_back(std::move(f));
+}
+
+// Returns the best eligible stored fact, or nullptr. Deterministic: ties keep
+// the earliest stored fact (the vector is append-only except for in-place
+// object updates).
+const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, const char* relation) {
+    const std::string sn = hsaa_assoc::normalize(subject);
+    const std::string rn = hsaa_assoc::normalize(relation);
+    uint64_t qs[hsaa_assoc::kW];
+    uint64_t qr[hsaa_assoc::kW];
+    hsaa_assoc::sketch(sn, qs);
+    hsaa_assoc::sketch(rn, qr);
+
+    const AssocFact* best = nullptr;
+    int32_t best_score = -2147483647;
+    for (const AssocFact& f : brain->assoc_facts) {
+        const int32_t ds = hsaa_assoc::dot512(qs, f.skey);
+        const int32_t dr = hsaa_assoc::dot512(qr, f.rkey);
+        const bool same_subject = (sn == f.subject_norm) && dr >= kAssocMinRelationDot;
+        const bool same_relation = (rn == f.relation_norm) && ds >= kAssocMinSubjectDot;
+        if (!same_subject && !same_relation) continue;
+        const int32_t score = ds + dr;
+        if (score > best_score) {
+            best_score = score;
+            best = &f;
+        }
+    }
+    return best;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -7355,6 +7440,7 @@ int brain_store_fact(PopCountBrain* brain, const char* subject, const char* rela
     if (!brain || !subject || !relation || !object) return 0;
     brain->direct_facts[subject][relation] = object;
     brain->active_rules++;
+    assoc_upsert(brain, subject, relation, object);
 
     // Feed declarative statement into reasoning engine
     if (brain->engine) {
@@ -7374,6 +7460,12 @@ int brain_query_relation(PopCountBrain* brain, const char* subject, const char* 
             return 1;
         }
     }
+    // Associative fallback (documented in popcnt_brain.h): a lexical near-miss
+    // resolves to the stored object only within the calibrated thresholds.
+    if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
+        strncpy_s(out_object, max_len, f->object.c_str(), _TRUNCATE);
+        return 1;
+    }
     return 0;
 }
 
@@ -7386,7 +7478,13 @@ int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* 
             if (rit->second != object) {
                 return 1; // Conflict: stored object differs from proposed object
             }
+            return 0;
         }
+    }
+    // Same associative candidate set as brain_query_relation: a near-miss that
+    // resolves to a stored fact with a different object is a conflict.
+    if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
+        if (f->object != object) return 1;
     }
     return 0;
 }

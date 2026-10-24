@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 #include <algorithm>
 
@@ -170,13 +171,11 @@ int bench_run_step_profile(void* ctx, BenchmarkMetrics* out_metrics) {
 
     alignas(64) float in_vec[HIDDEN_DIM];
     alignas(64) float out_vec[HIDDEN_DIM];
-    alignas(64) float ref_vec[HIDDEN_DIM];
 
     // Seed deterministic input tensor
     for (size_t i = 0; i < HIDDEN_DIM; ++i) {
         in_vec[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.05));
         out_vec[i] = 0.0f;
-        ref_vec[i] = in_vec[i];
     }
 
     double t0 = bench_get_qpc_us();
@@ -184,13 +183,6 @@ int bench_run_step_profile(void* ctx, BenchmarkMetrics* out_metrics) {
     if (ctx != nullptr) {
         // Forward through active model context layer 0
         model_forward_layer(ctx, 0, in_vec, out_vec);
-
-        // Compute unquantized FP32 reference signal:
-        // Model layer output with sub-bit quantization error delta modeled as BSL-32T PTQ residual
-        for (size_t i = 0; i < HIDDEN_DIM; ++i) {
-            float quant_noise = (static_cast<float>(static_cast<int>(i % 7) - 3) * 0.0015f) * out_vec[i];
-            ref_vec[i] = out_vec[i] + quant_noise;
-        }
     } else {
         // Standalone mathematical forward simulation (AVX-512 / scalar GEMV step)
         for (size_t i = 0; i < HIDDEN_DIM; ++i) {
@@ -199,8 +191,6 @@ int bench_run_step_profile(void* ctx, BenchmarkMetrics* out_metrics) {
                 acc += in_vec[(i + j) % HIDDEN_DIM] * 0.03125f;
             }
             out_vec[i] = acc + in_vec[i];
-            float quant_noise = (static_cast<float>(static_cast<int>(i % 5) - 2) * 0.0012f) * out_vec[i];
-            ref_vec[i] = out_vec[i] + quant_noise;
         }
     }
 
@@ -215,8 +205,16 @@ int bench_run_step_profile(void* ctx, BenchmarkMetrics* out_metrics) {
     out_metrics->tokens_per_sec = (1000000.0 / lat);
     out_metrics->host_ram_working_set_mb = bench_get_host_ram_mb();
     out_metrics->gpu_vram_used_mb = bench_get_gpu_vram_mb();
-    out_metrics->cosine_similarity = bench_compute_cosine_similarity(ref_vec, out_vec, HIDDEN_DIM);
-    out_metrics->sqnr_db = bench_compute_sqnr_db(ref_vec, out_vec, HIDDEN_DIM);
+
+    // No reference exists here. The old code built ref_vec = out_vec + a fixed
+    // deterministic "quantization noise" and then compared out_vec against it,
+    // which produced cosine ~= 1 and SQNR ~= 120 dB by construction. The model_mod
+    // forward is FP32 (forward_gqa_block/forward_deltanet_block/forward_vsa_block
+    // contain no quantized weights), so a dequantized-FP32 reference cannot be
+    // computed in this path. Report N/A rather than a fabricated number.
+    out_metrics->accuracy_available = false;
+    out_metrics->cosine_similarity = std::numeric_limits<float>::quiet_NaN();
+    out_metrics->sqnr_db = std::numeric_limits<float>::quiet_NaN();
 
     return 0;
 }

@@ -1,55 +1,80 @@
-# E2E Test Infra: Native C++/CUDA Hybrid Neural Research Laboratory
+# Test Infrastructure
 
-## Test Philosophy
-- Opaque-box, requirement-driven. Derived strictly from `ORIGINAL_REQUEST.md` and user-facing specifications without dependence on implementation design details.
-- Methodology: Category-Partition + Boundary Value Analysis (BVA) + Pairwise Combinatorial Testing + Real-World Workload Testing.
-- Pure Native Execution: Test runner and tests must compile and run on Windows MSVC 2022 + CUDA with zero Python runtime dependencies.
+**Status:** describes the suites that exist in the tree today. Measured results
+and the current readiness statement are in `TEST_READY.md`.
 
-## Feature Inventory & Test Coverage Requirements (N=16 features)
-| # | Feature | Requirement Source | Tier 1 (>=5) | Tier 2 (>=5) | Tier 3 (Pairwise) | Tier 4 (Workload) |
-|---|---------|-------------------|:------------:|:------------:|:-----------------:|:-----------------:|
-| 1 | F1.1 Unified Build Orchestrator | R1 Acceptance | 5 | 5 | Pair 1 | App 1 |
-| 2 | F1.2 CUDA sm_86 Tensor Engine | R1 Acceptance | 5 | 5 | Pair 2 | App 2 |
-| 3 | F1.3 AVX-512 VSA Computational Core | R1 Acceptance | 5 | 5 | Pair 3 | App 3 |
-| 4 | F1.4 Hybrid CPU-GPU Interop Bridge | R1 Acceptance | 5 | 5 | Pair 4 | App 4 |
-| 5 | F2.1 Dynamic VsaMemoryDatabase | R2 Acceptance | 5 | 5 | Pair 5 | App 5 |
-| 6 | F2.2 True VSA Fact Engine | R2 Acceptance | 5 | 5 | Pair 6 | App 6 |
-| 7 | F2.3 Online Memory Mutation API | R2 Acceptance | 5 | 5 | Pair 7 | App 7 |
-| 8 | F2.4 Multi-Instance Hot-Swapping | R2 Acceptance | 5 | 5 | Pair 8 | App 8 |
-| 9 | F3.1 Dynamic Precision Switching | R3 Acceptance | 5 | 5 | Pair 9 | App 1 |
-| 10 | F3.2 Online Weight Plasticity | R3 Acceptance | 5 | 5 | Pair 10 | App 2 |
-| 11 | F3.3 Layer Block Polymorphism | R3 Acceptance | 5 | 5 | Pair 11 | App 3 |
-| 12 | F3.4 Architecture Modification API | R3 Acceptance | 5 | 5 | Pair 12 | App 4 |
-| 13 | F4.1 Microsecond Profiler | R4 Acceptance | 5 | 5 | Pair 13 | App 5 |
-| 14 | F4.2 Workstation Hardware Tracker | R4 Acceptance | 5 | 5 | Pair 14 | App 6 |
-| 15 | F4.3 Numerical Accuracy Metrics | R4 Acceptance | 5 | 5 | Pair 15 | App 7 |
-| 16 | F4.4 Boundary & Adversarial Suite | R4 Acceptance | 5 | 5 | Pair 16 | App 8 |
+## 1. Layers
 
-## Test Architecture
-- Test Runner: Native binary `build/tests/e2e_runner.exe` invoked by `build.bat test`.
-- Exit semantics: Exit code 0 on all tests passing; non-zero exit code with detailed failure report on any failure.
-- Directory layout:
-  - `tests/e2e_test_runner.cpp`: Main test harness and reporting framework.
-  - `tests/tier1_feature_tests.cpp`: 80 Tier 1 unit & functional feature tests.
-  - `tests/tier2_boundary_tests.cpp`: 80 Tier 2 boundary, corner case, and stress tests.
-  - `tests/tier3_pairwise_tests.cpp`: 16 Tier 3 cross-feature interaction tests.
-  - `tests/tier4_workload_tests.cpp`: 8 Tier 4 real-world application scenario benchmarks.
+- **Per-module suites** (built and run by `build.bat`):
+  `test_bridge`, `test_vsa_db`, `test_model_mod`, `test_hssa`, `test_bench`,
+  plus the second-brain gates (`tests\build_popcnt_backoff_tests.bat`,
+  `tests\build_popcnt_selector_tests.bat`) and the C-ABI probe
+  (`second_brain\measur\build_capi_probe.bat`).
+- **Native E2E** (`tests\e2e_test_runner.cpp`): links the real modules and
+  exercises the public C-ABI end to end (VSA DB, second brain, HSSA,
+  model_mod, bench_runner). 43 checks; exit code 0 only if all pass.
+  Built and run by `tests\build_tests.bat run`; `build.bat test` delegates to it.
+- **Adversarial / stress suites** (`tests\build_stress*.bat`,
+  `build_hssa_m1..m3_tests.bat`, `build_challenger2.bat`): boundary matrices,
+  concurrency, lifecycle and leak checks, CUDA M2, mutation-flip sensitivity.
+- **Benchmarks** (`tests\build_bench_model_mod.bat`,
+  `build_bench_hot_swap.bat`, `build_stress_bench.bat`): numerical fidelity
+  against independent software references plus latency/throughput.
+- **Regression driver** (`second_brain\measur\regress_par.py`): serial phase
+  (gates, engine library, associative calibration, CUDA M2 on an idle host),
+  parallel phase (module suites, C-ABI probe, E2E, corpus), serial phase
+  (adversarial/benchmark suites, PTQ host validation). A step fails on a
+  non-zero exit code or a `[FAIL]` line in its log.
 
-## Real-World Application Scenarios (Tier 4)
-| # | Scenario | Features Exercised | Target Metric |
-|---|----------|--------------------|---------------|
-| 1 | Hybrid Associative Retrieval + Tensor Projection | F1.3, F1.4, F1.2, F4.1 | Forward step < 15 ms, Cosine > 0.99 |
-| 2 | Online Continuous Knowledge Mutation & Hot-Swapping | F2.1, F2.3, F2.4, F4.2 | Zero memory leak, swap time < 100 us |
-| 3 | Dynamic Quantization Cascade (2-bit Draft -> 4-bit Target) | F3.1, F1.2, F4.1, F4.3 | Zero VRAM reallocation, delta eval < 2 ms |
-| 4 | Online Plastic Adapter Training (TT16 SVD update) | F3.2, F1.4, F4.1, F4.3 | SVD rank update < 25 us, loss reduction > 50% |
-| 5 | Execution Block Hot-Swapping (GQA vs DeltaNet vs VSA) | F3.3, F1.2, F1.3, F4.1 | Seamless layer toggle without process restart |
-| 6 | Heavy Knowledge Graph Conflict Resolution at Scale | F2.2, F2.3, F4.1, F4.2 | 10,000 facts indexed, recall latency < 5 us |
-| 7 | Multi-Model Checkpoint Coexistence in VRAM | F1.2, F2.4, F4.2 | 2 active models concurrently in < 3,500 MB VRAM |
-| 8 | Stress & Adversarial Robustness (0-1-N-NULL-BOUND) | F4.4, F1.1-F4.3 | Zero crash, graceful error return on invalid inputs |
+## 2. Rules
 
-## Coverage Thresholds
-- Tier 1: >= 5 tests per feature (Total: 80 tests)
-- Tier 2: >= 5 tests per feature (Total: 80 tests)
-- Tier 3: >= 16 pairwise interaction tests (Total: 16 tests)
-- Tier 4: >= 8 realistic workload application scenarios (Total: 8 tests)
-- **Minimum Test Suite Total: 184 tests**
+- Tests link production objects; there is no mock engine and no source-text
+  inspection. The deleted `tests/tier1..4_*.cpp` + `test_harness.h` suite was
+  exactly that and had reported "184/184" without running the engine.
+- A test script propagates the runner's exit code. Scripts that ran the
+  executable inside an `if (...)` block used to report 0 unconditionally because
+  `%ERRORLEVEL%` was expanded at parse time; those were rewritten.
+- Assertions are only relaxed when the pinned contract itself was wrong (e.g.
+  the fabricated profiler accuracy, the pre-gate "return nearest anyway"
+  behaviour, the stale "vector count == 1" after fact bindings were added to
+  the unified vector table). Each such change is accompanied by the measured
+  contract that replaces it.
+- Performance thresholds are host-sensitive. HSSA M2 Test 3 (400 us step
+  ceiling) runs serially, never inside the parallel regression phase; the
+  measured range in that mode is 360-392 us.
+
+## 3. Layout
+
+```
+tests/
+  e2e_test_runner.cpp          real E2E over the public C-ABI
+  build_tests.bat              builds + runs the E2E (real modules)
+  test_bridge.cpp              bridge round trip suite
+  test_vsa_db.cpp              VSA DB contract + resonance gate
+  test_model_mod.cpp           model modification suite
+  test_hssa.cpp                HSSA conformance suite
+  test_bench_runner.cpp        profiler metrics suite
+  stress_vsa_db.cpp            concurrent VSA stress
+  stress_bench_runner.cpp      profiler adversarial stress
+  stress_tier5_system.cpp      integrated concurrency/lifecycle stress
+  stress_tier5_adversarial.cpp boundary/leak adversarial stress
+  stress_model_mod.cpp         model_mod stress
+  bench_model_mod.cpp          model_mod numerical fidelity benchmark
+  bench_vsa_hot_swap.cpp       vector scan / hot-swap benchmark
+  test_ptq_validation.cpp      PTQ host tiling/rank rejection guards
+  test_hssa_m1.cpp             HSSA M1 adversarial
+  test_hssa_m2.cpp             HSSA M2 CUDA adversarial
+  test_hssa_m3.cpp             HSSA M3 adversarial
+  build_*.bat                  per-suite build/run scripts
+```
+
+## 4. Coverage boundaries
+
+- No pretrained checkpoint is shipped, so no perplexity or generation-quality
+  benchmark is claimed. `model_mod` is FP32/procedural; `bench_model_mod`
+  checks SIMD against scalar references.
+- The CUDA path in HSSA is a measurement-only GEMV/DMA microbenchmark with a
+  synthetic matrix; its output is not blended into the model state. The kernel
+  math is checked against a CPU reference in `test_hssa_m2.exe`.
+- The profiler reports accuracy as N/A unless a genuine reference exists; NaN
+  is the sentinel, and consumers print/check N/A rather than a fabricated value.

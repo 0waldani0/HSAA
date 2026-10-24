@@ -135,19 +135,30 @@ static int cmd_bench(int argc, char** argv) {
               << std::setw(20) << "<= 4,096 MB"
               << (final_metrics.gpu_vram_used_mb <= MAX_WORKSTATION_VRAM_MB ? "PASS" : "FAIL") << "\n";
 
-    // Cosine similarity
-    std::string cos_str = std::to_string(final_metrics.cosine_similarity).substr(0, 8);
-    std::cout << std::left << std::setw(34) << "Cosine Similarity"
-              << std::setw(26) << cos_str
-              << std::setw(20) << "> 0.99000"
-              << (final_metrics.cosine_similarity > 0.99f ? "PASS" : "FAIL") << "\n";
+    // Cosine similarity / SQNR: only meaningful with a real reference. The
+    // model_mod forward is FP32, so bench_run_step_profile reports N/A.
+    if (final_metrics.accuracy_available) {
+        std::string cos_str = std::to_string(final_metrics.cosine_similarity).substr(0, 8);
+        std::cout << std::left << std::setw(34) << "Cosine Similarity"
+                  << std::setw(26) << cos_str
+                  << std::setw(20) << "> 0.99000"
+                  << (final_metrics.cosine_similarity > 0.99f ? "PASS" : "FAIL") << "\n";
 
-    // SQNR dB
-    std::string sqnr_str = std::to_string(final_metrics.sqnr_db).substr(0, 7) + " dB";
-    std::cout << std::left << std::setw(34) << "Quantization SQNR (dB)"
-              << std::setw(26) << sqnr_str
-              << std::setw(20) << "> 30.00 dB"
-              << (final_metrics.sqnr_db > 30.0f ? "PASS" : "FAIL") << "\n";
+        std::string sqnr_str = std::to_string(final_metrics.sqnr_db).substr(0, 7) + " dB";
+        std::cout << std::left << std::setw(34) << "Quantization SQNR (dB)"
+                  << std::setw(26) << sqnr_str
+                  << std::setw(20) << "> 30.00 dB"
+                  << (final_metrics.sqnr_db > 30.0f ? "PASS" : "FAIL") << "\n";
+    } else {
+        std::cout << std::left << std::setw(34) << "Cosine Similarity"
+                  << std::setw(26) << "N/A"
+                  << std::setw(20) << "-"
+                  << "N/A (FP32 forward, no quantized reference)\n";
+        std::cout << std::left << std::setw(34) << "Quantization SQNR (dB)"
+                  << std::setw(26) << "N/A"
+                  << std::setw(20) << "-"
+                  << "N/A (FP32 forward, no quantized reference)\n";
+    }
 
     std::cout << "========================================================================================\n\n";
 

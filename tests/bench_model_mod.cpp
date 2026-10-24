@@ -719,13 +719,18 @@ static bool bench_layer_types_numerical_fidelity() {
             ref_query[w] = word;
         }
 
-        // Query reference DB
+        // Query reference DB. The 500 fact bindings are unrelated to a random
+        // probe and do not resonate under the 0.40 gate; store the probe itself so
+        // this benchmark exercises the hit path (sim = 1.0) in both the reference
+        // and model_forward_layer instead of silently comparing two miss paths.
+        vsa_db_insert_vector(db, 0xDEAD0000ULL + (uint64_t)iter, ref_query);
         uint64_t ref_best[8];
-        float ref_sim = 1.0f;
+        float ref_sim = 0.0f;
         int found = vsa_db_query_vector(db, ref_query, ref_best, &ref_sim);
         if (!found) {
-            std::memcpy(ref_best, ref_query, sizeof(ref_best));
-            ref_sim = 1.0f;
+            // Mirror the production contract: a miss contributes no projection.
+            std::memset(ref_best, 0, sizeof(ref_best));
+            ref_sim = 0.0f;
         }
 
         // Project reference

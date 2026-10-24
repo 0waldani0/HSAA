@@ -250,7 +250,12 @@ int main() {
         ADVERSARIAL_CHECK("Host RAM growth across 200 steps <= 5 MB (no leak)", (ram_final - ram_initial) <= 5);
         ADVERSARIAL_CHECK("Final step latency > 0.0 us", m.latency_us > 0.0);
         ADVERSARIAL_CHECK("Final step throughput > 10,000 tok/s", m.tokens_per_sec > 10000.0);
-        ADVERSARIAL_CHECK("Final cosine similarity > 0.999", m.cosine_similarity > 0.999f);
+        // The profiled layer is FP32, so there is no quantized reference to compare
+        // against. The old check pinned a number that was manufactured by adding
+        // deterministic noise to the output; the honest contract is N/A.
+        ADVERSARIAL_CHECK("Accuracy is reported unavailable, not fabricated", !m.accuracy_available);
+        ADVERSARIAL_CHECK("Cosine is NaN (N/A), not a synthetic ~1.0", std::isnan(m.cosine_similarity));
+        ADVERSARIAL_CHECK("SQNR is NaN (N/A), not a synthetic ~120 dB", std::isnan(m.sqnr_db));
 
         model_destroy_context(ctx);
         ADVERSARIAL_CHECK("ModelContext cleanly destroyed", true);

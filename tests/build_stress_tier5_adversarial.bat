@@ -37,14 +37,11 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo [+] Built successfully: "%BUILD_DIR%\stress_tier5_adversarial.exe"
 
-if "%1"=="run" (
-    echo [*] Executing Tier 5 Adversarial Stress Tests...
-    "%BUILD_DIR%\stress_tier5_adversarial.exe"
-    exit /b %ERRORLEVEL%
-)
+if "%1"=="run" goto :run_tests
+if "%1"=="" goto :run_tests
+exit /b 0
 
-if "%1"=="" (
-    echo [*] Executing Tier 5 Adversarial Stress Tests...
-    "%BUILD_DIR%\stress_tier5_adversarial.exe"
-    exit /b %ERRORLEVEL%
-)
+:run_tests
+echo [*] Executing Tier 5 Adversarial Stress Tests...
+"%BUILD_DIR%\stress_tier5_adversarial.exe"
+exit /b %ERRORLEVEL%

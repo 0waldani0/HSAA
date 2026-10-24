@@ -40,14 +40,11 @@ if %ERRORLEVEL% EQU 0 (
     exit /b %ERRORLEVEL%
 )
 
-if "%1"=="run" (
-    echo [*] Executing stress_bench_runner.exe...
-    "%OUT_DIR%stress_bench_runner.exe"
-    exit /b %ERRORLEVEL%
-)
+if "%1"=="run" goto :run_tests
+if "%1"=="" goto :run_tests
+exit /b 0
 
-if "%1"=="" (
-    echo [*] Executing stress_bench_runner.exe...
-    "%OUT_DIR%stress_bench_runner.exe"
-    exit /b %ERRORLEVEL%
-)
+:run_tests
+echo [*] Executing stress_bench_runner.exe...
+"%OUT_DIR%stress_bench_runner.exe"
+exit /b %ERRORLEVEL%

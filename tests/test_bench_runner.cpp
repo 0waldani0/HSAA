@@ -136,8 +136,13 @@ int main() {
         TEST_CHECK("m.tokens_per_sec > 0.0", m.tokens_per_sec > 0.0);
         TEST_CHECK("m.host_ram_working_set_mb > 0", m.host_ram_working_set_mb > 0);
         TEST_CHECK("m.gpu_vram_used_mb > 0", m.gpu_vram_used_mb > 0);
-        TEST_CHECK("m.cosine_similarity > 0.99f", m.cosine_similarity > 0.99f);
-        TEST_CHECK("m.sqnr_db > 30.0f", m.sqnr_db > 30.0f);
+        // The profiled layer is FP32 and has no quantized reference. The old
+        // assertions pinned numbers that bench_run_step_profile produced by
+        // adding deterministic noise to its own output; the honest contract is
+        // N/A, not cosine ~= 1 / SQNR ~= 120 dB.
+        TEST_CHECK("m.accuracy_available == false", !m.accuracy_available);
+        TEST_CHECK("m.cosine_similarity is NaN (N/A)", std::isnan(m.cosine_similarity));
+        TEST_CHECK("m.sqnr_db is NaN (N/A)", std::isnan(m.sqnr_db));
 
         ModelContext* ctx = model_create_context(4);
         TEST_CHECK("ModelContext created (4 layers)", ctx != nullptr);

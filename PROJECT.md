@@ -194,15 +194,18 @@ project upgrade/
 │   ├── popcnt_brain.cpp           # 512-bit SIMD kernels
 │   └── test_c_api.cpp             # C-ABI integration test
 ├── tests/
-│   ├── e2e_test_runner.cpp        # Standalone native E2E test harness
-│   ├── tier1_feature_tests.cpp    # Tier 1 tests (5 per feature = 80 tests)
-│   ├── tier2_boundary_tests.cpp   # Tier 2 boundary/corner cases (80 tests)
-│   ├── tier3_pairwise_tests.cpp   # Tier 3 cross-feature combinations (16 tests)
-│   ├── tier4_workload_tests.cpp   # Tier 4 real-world application scenarios (8 tests)
-│   ├── test_hssa.cpp             # HSSA M1 conformance suite
-│   ├── test_hssa_m1.cpp           # HSSA M1 adversarial (O(1) state invariance, 0-1-N-NULL-BOUND)
-│   ├── test_hssa_m2.cpp           # HSSA M2 adversarial (pinned zero-copy DMA, sm_86 GEMV)
-│   ├── test_hssa_m3.cpp           # HSSA M3 adversarial (neuro-symbolic gate, autoregressive decode)
+│   ├── e2e_test_runner.cpp        # Real E2E over the public C-ABI (43 checks)
+│   ├── build_tests.bat            # Builds and runs the E2E (production objects)
+│   ├── test_hssa.cpp              # HSSA conformance suite
+│   ├── test_vsa_db.cpp            # VSA DB contract and resonance gate
+│   ├── test_model_mod.cpp         # Model modification suite
+│   ├── test_bench_runner.cpp      # Profiler metrics suite
+│   ├── stress_*.cpp               # Concurrency, lifecycle and adversarial stress
+│   ├── bench_model_mod.cpp        # Numerical fidelity benchmark (scalar reference)
+│   ├── bench_vsa_hot_swap.cpp     # Vector scan / hot-swap benchmark
+│   ├── test_hssa_m1.cpp           # HSSA M1 adversarial (state invariance, boundaries)
+│   ├── test_hssa_m2.cpp           # HSSA M2 adversarial (pinned DMA, sm_86 GEMV)
+│   ├── test_hssa_m3.cpp           # HSSA M3 adversarial (neuro-symbolic gate, decode)
 │   └── build_hssa_m*_tests.bat    # Per-milestone build/run orchestrators
 └── build/                         # Output directory for bin, obj, cubin
 ```

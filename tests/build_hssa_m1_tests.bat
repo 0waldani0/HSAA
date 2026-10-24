@@ -76,13 +76,11 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo [+] Build succeeded: "%OUT_DIR%test_hssa_m1.exe"
 
-if "%1"=="run" (
-    echo.
-    echo ================================================================================
-    echo [*] Executing HSSA Milestone M1 Adversarial Stress Suite...
-    echo ================================================================================
-    "%OUT_DIR%test_hssa_m1.exe"
-    exit /b %ERRORLEVEL%
-)
+if not "%1"=="run" exit /b 0
 
-exit /b 0
+echo.
+echo ================================================================================
+echo [*] Executing HSSA Milestone M1 Adversarial Stress Suite...
+echo ================================================================================
+"%OUT_DIR%test_hssa_m1.exe"
+exit /b %ERRORLEVEL%

@@ -32,6 +32,11 @@ int vsa_db_flush(VsaDbHandle* db);
 int vsa_db_clone(const VsaDbHandle* src, VsaDbHandle** dst, const char* new_persist_path);
 
 // Online Mutation & Retrieval
+// insert_fact also registers the fact's 512-bit binding (XNOR(rel_key, obj))
+// in the unified vector table under key hash(subject, relation), so a stored
+// fact is reachable by vector distance as well as by exact strings. Deleting a
+// fact removes that binding; mutating reuses the string-heap block when it
+// fits and compacts the heap when it does not.
 int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const char* obj);
 int vsa_db_delete_fact(VsaDbHandle* db, const char* subj, const char* rel);
 int vsa_db_mutate_fact(VsaDbHandle* db, const char* subj, const char* rel, const char* new_obj);
@@ -39,10 +44,19 @@ int vsa_db_query_relation(VsaDbHandle* db, const char* subj, const char* rel, ch
 int vsa_db_check_conflict(VsaDbHandle* db, const char* subj, const char* rel, const char* obj);
 
 // Raw 512-bit Vector Operations (Argmax Cosine Scan)
+// insert_vector upserts by key_hash. query_vector scans the active vectors
+// only and applies a resonance gate (normalized Hamming similarity >= 0.40);
+// below it the function returns 0 and leaves *out_sim at 0.0 instead of
+// returning an arbitrary "closest" slot from a non-empty table. The gate is
+// calibrated: independent balanced 512-bit vectors score 0 +/- 0.044, so 0.40
+// is ~9 sigma; an all-zero probe against a 180-ones vector scores 0.297 and is
+// still a miss (pinned by tests/test_vsa_db.cpp).
 int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512);
 int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* out_best_vec, float* out_sim);
 
 // Telemetry & Introspection Helpers
+// The count getters take the database mutex; persist_path/capacity are
+// immutable after create and are safe to read without it.
 VsaDbCapacity vsa_db_get_capacity(const VsaDbHandle* db);
 size_t vsa_db_get_fact_count(const VsaDbHandle* db);
 size_t vsa_db_get_vector_count(const VsaDbHandle* db);

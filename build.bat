@@ -115,20 +115,20 @@ REM ============================================================================
 if not exist "%BUILD_DIR%\kernel.cubin" (
     echo [*] Kernel cubin missing, compiling cubin first...
     nvcc -cubin -arch=sm_86 -O3 "%ROOT_DIR%legacy_ptq\kernel.cu" -o "%BUILD_DIR%\kernel.cubin"
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 )
 echo [*] Compiling Legacy PTQ CUDA Driver Engine...
 if exist "%ROOT_DIR%legacy_ptq\ptq_cuda.c" (
     echo [*] Compiling PTQ CUDA modular library...
     cl.exe %MSVC_C_FLAGS% /I"%ROOT_DIR%legacy_ptq" /c "%ROOT_DIR%legacy_ptq\ptq_cuda.c" /Fo:"%BUILD_DIR%\ptq_cuda.obj"
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
     lib.exe /nologo /OUT:"%BUILD_DIR%\ptq_cuda.lib" "%BUILD_DIR%\ptq_cuda.obj"
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
     cl.exe %MSVC_C_FLAGS% /I"%ROOT_DIR%legacy_ptq" "%ROOT_DIR%legacy_ptq\engine.c" "%BUILD_DIR%\ptq_cuda.lib" /Fe:"%BUILD_DIR%\legacy_ptq.exe" /Fo:"%BUILD_DIR%\engine.obj" %LINK_FLAGS%
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 ) else (
     cl.exe %MSVC_C_FLAGS% /I"%ROOT_DIR%legacy_ptq" "%ROOT_DIR%legacy_ptq\engine.c" /Fe:"%BUILD_DIR%\legacy_ptq.exe" /Fo:"%BUILD_DIR%\engine.obj" %LINK_FLAGS%
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 )
 echo [+] Legacy PTQ engine built: "%BUILD_DIR%\legacy_ptq.exe"
 if "%1"=="ptq" exit /b 0
@@ -142,13 +142,15 @@ cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%second_brain" "%ROOT_DIR%second_brain\popcn
 if %ERRORLEVEL% NEQ 0 (
     echo [!] AVX-512 popcnt_brain failed, attempting AVX2 fallback...
     cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX2 /openmp /EHsc /utf-8 /wd4068 /I"%ROOT_DIR%second_brain" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" %LINK_FLAGS%
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 )
 echo [+] PopCount Second Brain built: "%BUILD_DIR%\popcnt_brain.exe"
 
 echo [*] Creating popcnt_brain.lib static library...
 cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_LIB /I"%ROOT_DIR%second_brain" /c "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
+if errorlevel 1 exit /b 1
 lib.exe /nologo /OUT:"%BUILD_DIR%\popcnt_brain.lib" "%BUILD_DIR%\popcnt_brain_lib.obj"
+if errorlevel 1 exit /b 1
 if "%1"=="brain" exit /b 0
 
 REM ============================================================================
@@ -170,7 +172,8 @@ if "%1"=="bridge" exit /b 0
 if "%1"=="test_bridge" (
     echo [*] Executing Hybrid Bridge tests...
     "%BUILD_DIR%\test_bridge.exe"
-    exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 REM ============================================================================
@@ -192,7 +195,8 @@ if "%1"=="vsa_db" exit /b 0
 if "%1"=="test_vsa_db" (
     echo [*] Executing Dynamic VSA Database tests...
     "%BUILD_DIR%\test_vsa_db.exe"
-    exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 REM ============================================================================
@@ -215,7 +219,8 @@ if "%1"=="model_mod" exit /b 0
 if "%1"=="test_model_mod" (
     echo [*] Executing Model Modification tests...
     "%BUILD_DIR%\test_model_mod.exe"
-    exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 REM ============================================================================
@@ -227,25 +232,27 @@ if not exist "%BUILD_DIR%\obj_hssa" mkdir "%BUILD_DIR%\obj_hssa"
 if not exist "%BUILD_DIR%\popcnt_brain.lib" (
     echo [*] popcnt_brain.lib missing, building second_brain first...
     call :build_second_brain
+    if errorlevel 1 exit /b 1
 )
 if not exist "%BUILD_DIR%\ptq_cuda.lib" (
     echo [*] ptq_cuda.lib missing, building ptq first...
     call :build_ptq
+    if errorlevel 1 exit /b 1
 )
 if not exist "%BUILD_DIR%\bridge.obj" (
     echo [*] Compiling bridge.obj...
     cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%legacy_ptq" /c "%ROOT_DIR%src\bridge.cpp" /Fo:"%BUILD_DIR%\bridge.obj"
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 )
 if not exist "%BUILD_DIR%\vsa_db.obj" (
     echo [*] Compiling vsa_db.obj...
     cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /c "%ROOT_DIR%src\vsa_db.cpp" /Fo:"%BUILD_DIR%\vsa_db.obj"
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 )
 if not exist "%BUILD_DIR%\model_mod.obj" (
     echo [*] Compiling model_mod.obj...
     cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%legacy_ptq" /c "%ROOT_DIR%src\model_mod.cpp" /Fo:"%BUILD_DIR%\model_mod.obj"
-    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
 )
 echo [*] Compiling hssa.obj...
 cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%legacy_ptq" /c "%ROOT_DIR%src\hssa.cpp" /Fo:"%BUILD_DIR%\hssa.obj"
@@ -270,15 +277,12 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b %ERRORLEVEL%
 )
 echo [+] HSSA test executable built: "%BUILD_DIR%\test_hssa.exe"
-if "%1"=="hssa" (
-    echo [*] Executing HSSA Engine verification tests...
-    "%BUILD_DIR%\test_hssa.exe"
-    exit /b %ERRORLEVEL%
-)
+if "%1"=="hssa" exit /b 0
 if "%1"=="test_hssa" (
     echo [*] Executing HSSA Engine verification tests...
     "%BUILD_DIR%\test_hssa.exe"
-    exit /b %ERRORLEVEL%
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 REM ============================================================================
@@ -288,10 +292,12 @@ REM ============================================================================
 if not exist "%BUILD_DIR%\popcnt_brain.lib" (
     echo [*] popcnt_brain.lib missing, building second_brain first...
     call :build_second_brain
+    if errorlevel 1 exit /b 1
 )
 if not exist "%BUILD_DIR%\ptq_cuda.lib" (
     echo [*] ptq_cuda.lib missing, building ptq first...
     call :build_ptq
+    if errorlevel 1 exit /b 1
 )
 echo [*] Compiling Native Research Laboratory CLI (upgrade_lab.exe)...
 if not exist "%BUILD_DIR%\obj_lab" mkdir "%BUILD_DIR%\obj_lab"
@@ -319,6 +325,7 @@ REM ============================================================================
 if not exist "%BUILD_DIR%\popcnt_brain.lib" (
     echo [*] popcnt_brain.lib missing, building second_brain first...
     call :build_second_brain
+    if errorlevel 1 exit /b 1
 )
 echo [*] Compiling Benchmark Runner Test Harness (test_bench_runner.exe)...
 if not exist "%BUILD_DIR%\obj_test_bench" mkdir "%BUILD_DIR%\obj_test_bench"
@@ -370,28 +377,11 @@ REM the gates a second time.
 goto :build_brain_gates
 
 :build_e2e
-if exist "%ROOT_DIR%tests\e2e_test_runner.cpp" (
-    echo [*] Compiling Native E2E Test Runner...
-    cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%tests" /I"%ROOT_DIR%legacy_ptq" ^
-        "%ROOT_DIR%tests\e2e_test_runner.cpp" ^
-        "%ROOT_DIR%tests\tier1_feature_tests.cpp" ^
-        "%ROOT_DIR%tests\tier2_boundary_tests.cpp" ^
-        "%ROOT_DIR%tests\tier3_pairwise_tests.cpp" ^
-        "%ROOT_DIR%tests\tier4_workload_tests.cpp" ^
-        "%BUILD_DIR%\popcnt_brain.lib" ^
-        /Fe:"%BUILD_DIR%\e2e_test_runner.exe" /Fo:"%BUILD_DIR%\\" %LINK_FLAGS%
-    if %ERRORLEVEL% NEQ 0 (
-        echo [ERROR] E2E test runner compilation failed.
-        exit /b %ERRORLEVEL%
-    )
-    echo [*] Running Native E2E Test Suite...
-    "%BUILD_DIR%\e2e_test_runner.exe"
-    exit /b %ERRORLEVEL%
-) else (
-    echo [*] Executing PopCount Second Brain integration tests...
-    "%BUILD_DIR%\popcnt_brain.exe"
-    exit /b %ERRORLEVEL%
-)
+REM The E2E suite links the real engine objects and asserts behaviour. The old
+REM tier1..4 runner only inspected source text (for example, whether build.bat
+REM contained the word "clean") and never executed a single engine function.
+call "%ROOT_DIR%tests\build_tests.bat" run
+exit /b %ERRORLEVEL%
 
 echo [SUCCESS] Complete native laboratory built successfully in "%BUILD_DIR%".
 exit /b 0

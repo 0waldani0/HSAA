@@ -14,8 +14,13 @@ struct BenchmarkMetrics {
     double tokens_per_sec;          // Forward throughput
     size_t host_ram_working_set_mb; // Win32 GetProcessMemoryInfo (<= 32,768 MB)
     size_t gpu_vram_used_mb;        // CUDA Driver API cuMemGetInfo (<= 4,096 MB)
-    float  cosine_similarity;       // Numerical accuracy
-    float  sqnr_db;                 // Signal-to-quantization-noise ratio
+    /* Accuracy is only meaningful when a genuine reference exists. model_mod's
+     * forward is plain FP32: there is no quantized weight container to dequantize
+     * in this path, so bench_run_step_profile reports N/A here instead of
+     * manufacturing a reference by adding noise to the output. */
+    bool   accuracy_available;
+    float  cosine_similarity;       // NaN when accuracy_available == false
+    float  sqnr_db;                 // NaN when accuracy_available == false
 };
 
 #ifdef __cplusplus

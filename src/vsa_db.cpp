@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
+#include <unordered_map>
 #include <algorithm>
 #include <mutex>
 #include <atomic>
@@ -79,6 +81,13 @@ struct alignas(64) DbHeader {
 };
 static_assert(sizeof(DbHeader) == 4096, "DbHeader must be exactly 4096 bytes");
 
+// Compact in-RAM copy of one active vector. The mmap table is sparse; queries
+// scan this array instead of the whole capacity (see query_vector).
+struct VectorEntry {
+    uint64_t key_hash;
+    uint64_t vec[8];
+};
+
 struct VsaDbHandle {
     VsaDbCapacity capacity;
     size_t total_bytes;
@@ -87,14 +96,23 @@ struct VsaDbHandle {
     HANDLE file_handle;
     HANDLE mapping_handle;
     std::string persist_path;
-    std::mutex db_mutex;
+    mutable std::mutex db_mutex;
+    // Dense active-vector index: one entry per occupied vector-table slot.
+    // vec_pos maps key_hash -> index in vec_dense for O(1) update/remove.
+    // Not persisted: rebuilt from the mmap table on create(reopen) and clone.
+    std::vector<VectorEntry> vec_dense;
+    std::unordered_map<uint64_t, size_t> vec_pos;
 };
 
 // =============================================================================
 // AVX-512 & Deterministic VSA Mathematical Kernels
 // =============================================================================
 
-inline int32_t binary_xnor_popcnt_512(const uint64_t* a_bits, const uint64_t* b_bits) {
+// The VSA database's distance primitive returns the RAW number of equal bits
+// in [0, 512]. The second_brain engine has a same-shaped helper with the
+// opposite convention (a signed bipolar dot in [-512, +512]); the names are
+// deliberately distinct so a future shared header cannot silently swap them.
+inline int32_t vsa_hamming_matches_512(const uint64_t* a_bits, const uint64_t* b_bits) {
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VPOPCNTDQ__)
     __m512i va = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(a_bits));
     __m512i vb = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(b_bits));
@@ -186,6 +204,59 @@ inline uint64_t hash_relation_key(const char* subj, const char* rel) {
 }
 
 // =============================================================================
+// Dense Active-Vector Index
+// =============================================================================
+// The mmap vector table has `vector_table_capacity` slots (up to 1,048,576 in
+// VSA_CAP_LARGE) but only `vector_count` occupied ones. Scanning the capacity
+// touched every empty slot (128 MB of cache lines for one live vector). The
+// query path scans vec_dense instead; the table stays the persisted source of
+// truth and the index is rebuilt from it on open.
+
+static void vector_index_rebuild(VsaDbHandle* db) {
+    db->vec_dense.clear();
+    db->vec_pos.clear();
+    if (!db->base_ptr) return;
+    const DbHeader* hdr = reinterpret_cast<const DbHeader*>(db->base_ptr);
+    const VsaVectorSlot* table = reinterpret_cast<const VsaVectorSlot*>(
+        reinterpret_cast<const uint8_t*>(db->base_ptr) + hdr->vector_table_offset);
+    for (uint32_t i = 0; i < hdr->vector_table_capacity; ++i) {
+        if (!table[i].occupied) continue;
+        if (db->vec_pos.find(table[i].key_hash) != db->vec_pos.end()) continue;
+        VectorEntry e;
+        e.key_hash = table[i].key_hash;
+        std::memcpy(e.vec, table[i].vec, sizeof(e.vec));
+        db->vec_pos.emplace(e.key_hash, db->vec_dense.size());
+        db->vec_dense.push_back(e);
+    }
+}
+
+static void vector_index_upsert_locked(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512) {
+    const auto it = db->vec_pos.find(key_hash);
+    if (it != db->vec_pos.end()) {
+        std::memcpy(db->vec_dense[it->second].vec, vec_512, sizeof(uint64_t) * 8);
+        return;
+    }
+    VectorEntry e;
+    e.key_hash = key_hash;
+    std::memcpy(e.vec, vec_512, sizeof(uint64_t) * 8);
+    db->vec_pos.emplace(key_hash, db->vec_dense.size());
+    db->vec_dense.push_back(e);
+}
+
+static void vector_index_remove_locked(VsaDbHandle* db, uint64_t key_hash) {
+    const auto it = db->vec_pos.find(key_hash);
+    if (it == db->vec_pos.end()) return;
+    const size_t pos = it->second;
+    const size_t last = db->vec_dense.size() - 1;
+    if (pos != last) {
+        db->vec_dense[pos] = db->vec_dense[last];
+        db->vec_pos[db->vec_dense[pos].key_hash] = pos;
+    }
+    db->vec_dense.pop_back();
+    db->vec_pos.erase(it);
+}
+
+// =============================================================================
 // String Heap Helpers
 // =============================================================================
 
@@ -212,6 +283,65 @@ static const char* string_heap_get(const VsaDbHandle* db, uint32_t offset) {
     if (!hdr || offset >= hdr->string_heap_capacity) return "";
     return reinterpret_cast<const char*>(db->base_ptr) + hdr->string_heap_offset + offset;
 }
+
+// Reclaim gaps left by long-object mutations and deletions. The heap is a bump
+// allocator: an overwritten or deleted block is unreachable the moment its
+// offset is replaced, and without compaction the heap would eventually refuse
+// writes while a single fact is still live (the F2.3 leak). This walks the
+// occupied fact slots, sorts live blocks by their current offset and slides
+// them down, updating the owning offset fields. Destinations never exceed
+// sources for an ascending walk, and memmove handles the overlap.
+struct HeapBlockRef {
+    uint32_t offset;
+    uint32_t len;
+    uint32_t* owner;
+};
+
+static void string_heap_compact(VsaDbHandle* db) {
+    DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
+    if (!hdr || hdr->string_heap_used == 0) return;
+    VsaFactSlot* table = reinterpret_cast<VsaFactSlot*>(
+        reinterpret_cast<uint8_t*>(db->base_ptr) + hdr->fact_table_offset);
+
+    std::vector<HeapBlockRef> refs;
+    refs.reserve(static_cast<size_t>(hdr->fact_count) * 3);
+    for (uint32_t i = 0; i < hdr->fact_table_capacity; ++i) {
+        VsaFactSlot* slot = &table[i];
+        if (!slot->occupied) continue;
+        if (slot->subj_offset != 0xFFFFFFFF) refs.push_back({slot->subj_offset, slot->subj_len, &slot->subj_offset});
+        if (slot->rel_offset != 0xFFFFFFFF) refs.push_back({slot->rel_offset, slot->rel_len, &slot->rel_offset});
+        if (slot->obj_offset != 0xFFFFFFFF) refs.push_back({slot->obj_offset, slot->obj_len, &slot->obj_offset});
+    }
+    std::sort(refs.begin(), refs.end(),
+              [](const HeapBlockRef& a, const HeapBlockRef& b) { return a.offset < b.offset; });
+
+    char* heap = reinterpret_cast<char*>(db->base_ptr) + hdr->string_heap_offset;
+    uint32_t dst = 0;
+    for (const HeapBlockRef& r : refs) {
+        std::memmove(heap + dst, heap + r.offset, static_cast<size_t>(r.len) + 1);
+        *r.owner = dst;
+        dst += r.len + 1;
+    }
+    hdr->string_heap_used = dst;
+}
+
+// Reserve the tail for a batch of allocations. Callers reserve the whole set
+// (subject+relation+object) before allocating any of them, so compaction cannot
+// invalidate an offset that has not been published to the fact table yet.
+static bool string_heap_reserve(VsaDbHandle* db, size_t needed) {
+    DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
+    if (!hdr) return false;
+    if (static_cast<size_t>(hdr->string_heap_used) + needed <= hdr->string_heap_capacity) {
+        return true;
+    }
+    string_heap_compact(db);
+    return static_cast<size_t>(hdr->string_heap_used) + needed <= hdr->string_heap_capacity;
+}
+
+// Defined with the raw-vector section below; declared here because fact
+// insertion keeps the unified vector index in sync (one fact = one binding).
+static int vector_table_upsert_locked(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512);
+static int vector_table_delete_locked(VsaDbHandle* db, uint64_t key_hash);
 
 static const char* slot_get_subj(const VsaDbHandle* db, const VsaFactSlot* slot) {
     if (slot->subj_offset == 0xFFFFFFFF) return slot->inline_subj;
@@ -343,6 +473,7 @@ VsaDbHandle* vsa_db_create(VsaDbCapacity cap, const char* persist_path) {
     } else {
         DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
         if (hdr->magic == VSA_DB_MAGIC && hdr->version == VSA_DB_VERSION) {
+            vector_index_rebuild(db);
             return db; // Successfully reopened existing DB
         }
     }
@@ -433,6 +564,7 @@ int vsa_db_clone(const VsaDbHandle* src, VsaDbHandle** dst, const char* new_pers
         std::lock_guard<std::mutex> lock(const_cast<VsaDbHandle*>(src)->db_mutex);
         std::memcpy(clone->base_ptr, src->base_ptr, src->total_bytes);
     }
+    vector_index_rebuild(clone);
 
     if (clone->is_mapped_file) {
         FlushViewOfFile(clone->base_ptr, clone->total_bytes);
@@ -481,21 +613,54 @@ int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const
         VsaFactSlot* slot = &table[idx];
         if (!slot->occupied || cur_psl > slot->psl) break;
         if (slot->key_hash == kh && slot_match_key(db, slot, subj, rel)) {
-            // Update in-place
-            std::memcpy(slot->obj_vec, obj_v, sizeof(uint64_t) * 8);
-            std::memcpy(slot->fact_vec, fact_v, sizeof(uint64_t) * 8);
+            const size_t o_len = std::strlen(obj);
 
-            size_t o_len = std::strlen(obj);
-            slot->obj_len = static_cast<uint32_t>(o_len);
+            // Every fallible step runs before the slot is touched. The upsert
+            // below cannot fail after this check: an existing binding is
+            // updated in place, and a missing one is only possible for a
+            // database written before bindings existed -- that case needs a
+            // free vector slot.
+            if (db->vec_pos.find(kh) == db->vec_pos.end() &&
+                hdr->vector_count >= hdr->vector_table_capacity) {
+                return -1;
+            }
+
+            uint32_t new_off = slot->obj_offset;
+            bool new_inline = false;
+            bool in_place = false;
             if (o_len < sizeof(slot->inline_obj)) {
+                new_inline = true;
+            } else if (slot->obj_offset != 0xFFFFFFFF && o_len <= slot->obj_len) {
+                in_place = true;
+            } else {
+                if (!string_heap_reserve(db, o_len + 1)) return -1;
+                if (!string_heap_allocate(db, obj, o_len, &new_off)) return -1;
+            }
+
+            // Commit the object string, then its binding words, then the
+            // vector-table entry. No allocation or failure path remains here.
+            if (new_inline) {
                 std::memcpy(slot->inline_obj, obj, o_len + 1);
                 slot->obj_offset = 0xFFFFFFFF;
+                slot->obj_len = static_cast<uint32_t>(o_len);
+            } else if (in_place) {
+                // The old heap block is large enough: overwrite it instead of
+                // bump-allocating a new one and orphaning the old (the F2.3
+                // leak). Compaction reclaims the tail of the block later.
+                char* dst = reinterpret_cast<char*>(db->base_ptr) + hdr->string_heap_offset + slot->obj_offset;
+                std::memcpy(dst, obj, o_len + 1);
+                slot->obj_len = static_cast<uint32_t>(o_len);
+                slot->inline_obj[0] = '\0';
             } else {
-                uint32_t off = 0;
-                if (!string_heap_allocate(db, obj, o_len, &off)) return -1;
-                slot->obj_offset = off;
+                slot->obj_offset = new_off;
+                slot->obj_len = static_cast<uint32_t>(o_len);
                 slot->inline_obj[0] = '\0';
             }
+
+            std::memcpy(slot->obj_vec, obj_v, sizeof(uint64_t) * 8);
+            std::memcpy(slot->fact_vec, fact_v, sizeof(uint64_t) * 8);
+            // Keep the unified vector index in step with the stored binding.
+            if (vector_table_upsert_locked(db, kh, fact_v) != 0) return -1;
             update_active_pages(db);
             return 0;
         }
@@ -503,12 +668,20 @@ int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const
         cur_psl++;
     }
 
-    // 5. Upfront capacity check before allocating strings or displacing slots
+    // 5. Upfront capacity checks for BOTH tables, before allocating strings or
+    // displacing slots. Every fact also owns one binding in the vector table.
     if (hdr->fact_count >= hdr->fact_table_capacity) {
         return -1;
     }
+    if (hdr->vector_count >= hdr->vector_table_capacity &&
+        db->vec_pos.find(kh) == db->vec_pos.end()) {
+        return -1;
+    }
 
-    // 6. Build incoming new slot
+    // 6. Build incoming new slot. Reserve the whole heap batch first: the
+    // three allocations below must not trigger a compaction between them,
+    // because `incoming` is not in the fact table yet and compaction could not
+    // rewrite its already-assigned offsets.
     VsaFactSlot incoming;
     std::memset(&incoming, 0, sizeof(VsaFactSlot));
     incoming.key_hash = kh;
@@ -519,38 +692,54 @@ int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const
     std::memcpy(incoming.rel_key, rel_key, sizeof(uint64_t) * 8);
     std::memcpy(incoming.fact_vec, fact_v, sizeof(uint64_t) * 8);
 
-    size_t s_len = std::strlen(subj);
+    const size_t s_len = std::strlen(subj);
+    const size_t r_len = std::strlen(rel);
+    const size_t o_len = std::strlen(obj);
+    const size_t heap_needed =
+        ((s_len < sizeof(incoming.inline_subj)) ? 0 : s_len + 1) +
+        ((r_len < sizeof(incoming.inline_rel)) ? 0 : r_len + 1) +
+        ((o_len < sizeof(incoming.inline_obj)) ? 0 : o_len + 1);
+    if (!string_heap_reserve(db, heap_needed)) return -1;
+    const uint32_t heap_before = hdr->string_heap_used;
+
     incoming.subj_len = static_cast<uint32_t>(s_len);
     if (s_len < sizeof(incoming.inline_subj)) {
         std::memcpy(incoming.inline_subj, subj, s_len + 1);
         incoming.subj_offset = 0xFFFFFFFF;
     } else {
         uint32_t off = 0;
-        if (!string_heap_allocate(db, subj, s_len, &off)) return -1;
+        if (!string_heap_allocate(db, subj, s_len, &off)) {
+            hdr->string_heap_used = heap_before;
+            return -1;
+        }
         incoming.subj_offset = off;
         incoming.inline_subj[0] = '\0';
     }
 
-    size_t r_len = std::strlen(rel);
     incoming.rel_len = static_cast<uint32_t>(r_len);
     if (r_len < sizeof(incoming.inline_rel)) {
         std::memcpy(incoming.inline_rel, rel, r_len + 1);
         incoming.rel_offset = 0xFFFFFFFF;
     } else {
         uint32_t off = 0;
-        if (!string_heap_allocate(db, rel, r_len, &off)) return -1;
+        if (!string_heap_allocate(db, rel, r_len, &off)) {
+            hdr->string_heap_used = heap_before;
+            return -1;
+        }
         incoming.rel_offset = off;
         incoming.inline_rel[0] = '\0';
     }
 
-    size_t o_len = std::strlen(obj);
     incoming.obj_len = static_cast<uint32_t>(o_len);
     if (o_len < sizeof(incoming.inline_obj)) {
         std::memcpy(incoming.inline_obj, obj, o_len + 1);
         incoming.obj_offset = 0xFFFFFFFF;
     } else {
         uint32_t off = 0;
-        if (!string_heap_allocate(db, obj, o_len, &off)) return -1;
+        if (!string_heap_allocate(db, obj, o_len, &off)) {
+            hdr->string_heap_used = heap_before;
+            return -1;
+        }
         incoming.obj_offset = off;
         incoming.inline_obj[0] = '\0';
     }
@@ -564,6 +753,9 @@ int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const
             incoming.psl = cur_psl;
             *slot = incoming;
             hdr->fact_count++;
+            // The capacity pre-check above makes this infallible unless the
+            // in-RAM index and the mmap table disagree; never skip it silently.
+            if (vector_table_upsert_locked(db, kh, fact_v) != 0) return -1;
             update_active_pages(db);
             return 0;
         }
@@ -618,6 +810,9 @@ int vsa_db_delete_fact(VsaDbHandle* db, const char* subj, const char* rel) {
             }
             std::memset(&table[curr], 0, sizeof(VsaFactSlot));
             hdr->fact_count--;
+            // Drop the fact's binding from the unified vector table. Older
+            // databases written before F22 may not have one; that returns 0.
+            vector_table_delete_locked(db, kh);
             update_active_pages(db);
             return 1;
         }
@@ -717,13 +912,11 @@ int vsa_db_check_conflict(VsaDbHandle* db, const char* subj, const char* rel, co
 // Raw 512-bit Vector Operations Implementation
 // =============================================================================
 
-int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512) {
-    if (!db || !vec_512) return -1;
-    std::lock_guard<std::mutex> lock(db->db_mutex);
-    if (!db->base_ptr) return -1;
-
+// Shared by the public raw-vector API and by fact insertion (one fact owns one
+// binding). Caller holds db_mutex.
+static int vector_table_upsert_locked(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512) {
     DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
-    uint32_t mask = hdr->vector_table_capacity - 1;
+    const uint32_t mask = hdr->vector_table_capacity - 1;
     uint32_t idx = static_cast<uint32_t>(key_hash & mask);
     uint16_t cur_psl = 0;
 
@@ -737,6 +930,7 @@ int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec
         if (!slot->occupied || cur_psl > slot->psl) break;
         if (slot->key_hash == key_hash) {
             std::memcpy(slot->vec, vec_512, sizeof(uint64_t) * 8);
+            vector_index_upsert_locked(db, key_hash, vec_512);
             return 0;
         }
         idx = (idx + 1) & mask;
@@ -763,6 +957,7 @@ int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec
             incoming.psl = cur_psl;
             *slot = incoming;
             hdr->vector_count++;
+            vector_index_upsert_locked(db, key_hash, vec_512);
             update_active_pages(db);
             return 0;
         }
@@ -780,18 +975,74 @@ int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec
     return -1; // Vector table full
 }
 
-int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* out_best_vec, float* out_sim) {
-    if (!db || !query_512 || !out_best_vec || !out_sim) return -1;
-    *out_sim = 0.0f; // Defensive initialization prevents undefined garbage
-    std::lock_guard<std::mutex> lock(db->db_mutex);
-    if (!db->base_ptr) return -1;
-
+// Backward-shift deletion (zero tombstones) that also keeps vector_count and
+// the dense index consistent. Caller holds db_mutex.
+static int vector_table_delete_locked(VsaDbHandle* db, uint64_t key_hash) {
     DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
     if (hdr->vector_count == 0) return 0;
+
+    const uint32_t mask = hdr->vector_table_capacity - 1;
+    uint32_t idx = static_cast<uint32_t>(key_hash & mask);
+    uint16_t cur_psl = 0;
 
     VsaVectorSlot* table = reinterpret_cast<VsaVectorSlot*>(
         reinterpret_cast<uint8_t*>(db->base_ptr) + hdr->vector_table_offset
     );
+
+    for (uint32_t probe = 0; probe < hdr->vector_table_capacity; ++probe) {
+        VsaVectorSlot* slot = &table[idx];
+        if (!slot->occupied || cur_psl > slot->psl) {
+            return 0; // Not found
+        }
+        if (slot->key_hash == key_hash) {
+            uint32_t curr = idx;
+            for (uint32_t shift_probe = 0; shift_probe < hdr->vector_table_capacity; ++shift_probe) {
+                const uint32_t next = (curr + 1) & mask;
+                VsaVectorSlot* next_slot = &table[next];
+                if (!next_slot->occupied || next_slot->psl == 0) break;
+                table[curr] = *next_slot;
+                table[curr].psl--;
+                curr = next;
+            }
+            std::memset(&table[curr], 0, sizeof(VsaVectorSlot));
+            hdr->vector_count--;
+            vector_index_remove_locked(db, key_hash);
+            update_active_pages(db);
+            return 1;
+        }
+        idx = (idx + 1) & mask;
+        cur_psl++;
+    }
+
+    return 0;
+}
+
+int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512) {
+    if (!db || !vec_512) return -1;
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    if (!db->base_ptr) return -1;
+    return vector_table_upsert_locked(db, key_hash, vec_512);
+}
+
+// A query must RESONATE with a stored vector, not merely be closer to one of
+// them than to the others. Without this gate any non-empty table answered
+// "best match" for an arbitrary probe and reported a similarity the caller
+// could not distinguish from knowledge.
+//
+// Calibration: two independent balanced 512-bit vectors agree on 256 +/- 11.3
+// bits, so normalized similarity is 0 +/- 0.044. 0.40 is ~9 sigma for the
+// largest table this API allows; a one-bit-flipped duplicate scores 0.996.
+// The gate must also survive unbalanced stored vectors: an all-zero probe
+// against a 180-ones vector agrees on 332/512 bits (0.297) and is still a
+// miss here -- see tests/test_vsa_db.cpp, test_raw_vector_argmax_scan.
+static constexpr float VSA_MIN_RESONANCE = 0.40f;
+
+int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* out_best_vec, float* out_sim) {
+    if (!db || !query_512 || !out_best_vec || !out_sim) return -1;
+    *out_sim = 0.0f; // A miss always reports zero, never stale similarity.
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    if (!db->base_ptr) return -1;
+    if (db->vec_dense.empty()) return 0;
 
     int best_matches = -1;
     const uint64_t* best_vec = nullptr;
@@ -802,14 +1053,12 @@ int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* ou
         const uint64_t* local_best_vec = nullptr;
 
         #pragma omp for nowait
-        for (int i = 0; i < static_cast<int>(hdr->vector_table_capacity); ++i) {
-            const VsaVectorSlot* slot = &table[i];
-            if (slot->occupied) {
-                int m = binary_xnor_popcnt_512(query_512, slot->vec);
-                if (m > local_best_matches) {
-                    local_best_matches = m;
-                    local_best_vec = slot->vec;
-                }
+        for (int i = 0; i < static_cast<int>(db->vec_dense.size()); ++i) {
+            const VectorEntry& e = db->vec_dense[i];
+            const int m = vsa_hamming_matches_512(query_512, e.vec);
+            if (m > local_best_matches) {
+                local_best_matches = m;
+                local_best_vec = e.vec;
             }
         }
 
@@ -822,15 +1071,15 @@ int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* ou
         }
     }
 
-    if (best_matches >= 0 && best_vec != nullptr) {
-        std::memcpy(out_best_vec, best_vec, sizeof(uint64_t) * 8);
-        float raw_sim = static_cast<float>(2 * best_matches - 512) / 512.0f;
-        if (std::isnan(raw_sim) || !std::isfinite(raw_sim)) raw_sim = 0.0f;
-        *out_sim = std::clamp(raw_sim, -1.0f, 1.0f);
-        return 1;
-    }
+    if (best_matches < 0 || best_vec == nullptr) return 0;
 
-    return 0;
+    const float raw_sim = static_cast<float>(2 * best_matches - 512) / 512.0f;
+    if (!std::isfinite(raw_sim) || raw_sim < VSA_MIN_RESONANCE) {
+        return 0; // Below resonance: the caller must treat this as a miss.
+    }
+    std::memcpy(out_best_vec, best_vec, sizeof(uint64_t) * 8);
+    *out_sim = std::clamp(raw_sim, -1.0f, 1.0f);
+    return 1;
 }
 
 // =============================================================================
@@ -842,19 +1091,25 @@ VsaDbCapacity vsa_db_get_capacity(const VsaDbHandle* db) {
 }
 
 size_t vsa_db_get_fact_count(const VsaDbHandle* db) {
-    if (!db || !db->base_ptr) return 0;
+    if (!db) return 0;
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    if (!db->base_ptr) return 0;
     const DbHeader* hdr = reinterpret_cast<const DbHeader*>(db->base_ptr);
     return hdr ? hdr->fact_count : 0;
 }
 
 size_t vsa_db_get_vector_count(const VsaDbHandle* db) {
-    if (!db || !db->base_ptr) return 0;
+    if (!db) return 0;
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    if (!db->base_ptr) return 0;
     const DbHeader* hdr = reinterpret_cast<const DbHeader*>(db->base_ptr);
     return hdr ? hdr->vector_count : 0;
 }
 
 size_t vsa_db_get_active_pages(const VsaDbHandle* db) {
-    if (!db || !db->base_ptr) return 0;
+    if (!db) return 0;
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    if (!db->base_ptr) return 0;
     const DbHeader* hdr = reinterpret_cast<const DbHeader*>(db->base_ptr);
     return hdr ? hdr->active_pages : 0;
 }

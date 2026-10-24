@@ -253,6 +253,13 @@ int ptq_gemv_sm86(
     uint32_t M = mat->M;
     uint32_t N = mat->N;
     uint32_t R = mat->R;
+
+    /* The kernel tiles rows by 32 and columns by 128. Anything else used to be
+     * truncated silently (cols >> 7, rows >> 5), producing a partial product.
+     * The fused TT epilogue also stages at most 16 ranks in shared memory. */
+    if ((N & 127u) != 0u || (M & 31u) != 0u) return -2;
+    if (((R >> 7) & 1u) != 0u && (R & 0x7Fu) > 16u) return -2;
+
     uint32_t gy = (split_k > 0) ? split_k : ptq_pick_split_k(N, 8);
     uint32_t gx = (M + 255) / 256;
 

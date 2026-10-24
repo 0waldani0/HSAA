@@ -37,8 +37,8 @@ if %ERRORLEVEL% EQU 0 (
     exit /b %ERRORLEVEL%
 )
 
-if "%1"=="run" (
-    echo [*] Executing bench_model_mod.exe...
-    "%OUT_DIR%bench_model_mod.exe"
-    exit /b %ERRORLEVEL%
-)
+if not "%1"=="run" exit /b 0
+
+echo [*] Executing bench_model_mod.exe...
+"%OUT_DIR%bench_model_mod.exe"
+exit /b %ERRORLEVEL%

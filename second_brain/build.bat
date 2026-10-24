@@ -30,9 +30,9 @@ cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /wd4068 /I"%SCR
 if %ERRORLEVEL% NEQ 0 (
     echo [!] AVX-512 compilation failed, falling back to AVX2...
     cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX2 /openmp /EHsc /wd4068 /I"%SCRIPT_DIR%." "%SCRIPT_DIR%popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" /link /STACK:33554432
-    if %ERRORLEVEL% NEQ 0 (
+    if errorlevel 1 (
         echo [!] Compilation failed!
-        exit /b %ERRORLEVEL%
+        exit /b 1
     )
 )
 echo [+] Build succeeded: "%BUILD_DIR%\popcnt_brain.exe"
@@ -40,13 +40,16 @@ echo [+] Build succeeded: "%BUILD_DIR%\popcnt_brain.exe"
 REM Build Static Library & C-ABI Test
 echo [*] Building PopCount Brain C-ABI Library Object...
 cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /wd4068 /DBUILDING_POPCNT_BRAIN_LIB /c "%SCRIPT_DIR%popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
+if errorlevel 1 exit /b 1
 lib.exe /nologo /OUT:"%BUILD_DIR%\popcnt_brain.lib" "%BUILD_DIR%\popcnt_brain_lib.obj"
+if errorlevel 1 exit /b 1
 if %ERRORLEVEL% EQU 0 (
     echo [+] Static library created: "%BUILD_DIR%\popcnt_brain.lib"
 )
 
 echo [*] Compiling C-ABI Integration Test...
 cl.exe /nologo /std:c++20 /O2 /EHsc /I"%SCRIPT_DIR%." "%SCRIPT_DIR%test_c_api.cpp" "%BUILD_DIR%\popcnt_brain.lib" /Fe:"%BUILD_DIR%\test_c_api.exe" /Fo:"%BUILD_DIR%\test_c_api.obj" /link /STACK:33554432
+if errorlevel 1 exit /b 1
 if %ERRORLEVEL% EQU 0 (
     echo [+] C-ABI test built: "%BUILD_DIR%\test_c_api.exe"
 )
@@ -54,15 +57,22 @@ if %ERRORLEVEL% EQU 0 (
 if "%1"=="run" (
     echo [*] Executing PopCount Second Brain Self-Test Suite...
     "%BUILD_DIR%\popcnt_brain.exe"
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 if "%1"=="test" (
     echo [*] Executing PopCount Second Brain C-ABI Integration Test...
     "%BUILD_DIR%\test_c_api.exe"
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 if "%1"=="all" (
     echo [*] Executing Full Suite...
     "%BUILD_DIR%\popcnt_brain.exe"
+    if errorlevel 1 exit /b 1
     "%BUILD_DIR%\test_c_api.exe"
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )

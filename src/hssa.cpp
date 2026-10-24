@@ -14,6 +14,8 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <mutex>
+#include <new>
 #include <vector>
 
 /*
@@ -75,6 +77,12 @@ HssaContext* hssa_create(uint32_t num_layers) {
     HssaContext* ctx = (HssaContext*)std::calloc(1, sizeof(HssaContext));
     if (!ctx) return nullptr;
 
+    ctx->state_lock = new (std::nothrow) std::mutex();
+    if (!ctx->state_lock) {
+        std::free(ctx);
+        return nullptr;
+    }
+
     ctx->config.num_layers = num_layers;
     ctx->config.hidden_dim = HSSA_HIDDEN_DIM;
     ctx->config.heads = HSSA_HEADS;
@@ -84,6 +92,8 @@ HssaContext* hssa_create(uint32_t num_layers) {
 
     ctx->layers = (HssaLayer*)std::calloc(num_layers, sizeof(HssaLayer));
     if (!ctx->layers) {
+        delete static_cast<std::mutex*>(ctx->state_lock);
+        ctx->state_lock = nullptr;
         std::free(ctx);
         return nullptr;
     }
@@ -249,6 +259,9 @@ void hssa_destroy(HssaContext* ctx) {
         vsa_db_destroy(ctx->global_vsa_db);
         ctx->global_vsa_db = nullptr;
     }
+
+    delete static_cast<std::mutex*>(ctx->state_lock);
+    ctx->state_lock = nullptr;
 
     std::free(ctx);
 }
@@ -528,6 +541,20 @@ static void relax_hopfield_attractor(const HssaContext* ctx, float* s, size_t ma
     const float tau = ctx->hopfield_tau;
     const float inv_tau = 1.0f / tau;
 
+    if (max_steps == 0 || M == 0) return;
+
+    // The associative recall in step 5 of hssa_forward_token writes the recalled
+    // memory into s immediately before this call. The iteration below maps s onto
+    // the span of the 16 attractor patterns; without a residual connection that
+    // replacement annihilated the recalled vector completely, so the VSA database
+    // had no measurable effect on the output. Keep the pre-relaxation state and
+    // blend it back once. This is a deliberate one-shot residual, not an energy
+    // minimiser: E = -tau*lse + 0.5*||s||^2 is neither convex nor concave, so it
+    // offers no monotonicity guarantee. The E2E measures the effect instead
+    // (relative L2 difference 0.099980 for a recalled vector).
+    alignas(64) float s_residual[HSSA_HIDDEN_DIM];
+    std::memcpy(s_residual, s, HSSA_HIDDEN_DIM * sizeof(float));
+
     alignas(64) float dots[HSSA_MAX_PATTERNS];
     alignas(64) float weights[HSSA_MAX_PATTERNS];
     alignas(64) float s_next[HSSA_HIDDEN_DIM];
@@ -572,6 +599,13 @@ static void relax_hopfield_attractor(const HssaContext* ctx, float* s, size_t ma
 
         std::memcpy(s, s_next, HSSA_HIDDEN_DIM * sizeof(float));
     }
+
+    // 0.5 * pre-relaxation residual + 0.5 * attractor state.
+    for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+        __m512 a = _mm512_loadu_ps(s_residual + j);
+        __m512 b = _mm512_loadu_ps(s + j);
+        _mm512_storeu_ps(s + j, _mm512_mul_ps(_mm512_add_ps(a, b), _mm512_set1_ps(0.5f)));
+    }
 }
 
 /*
@@ -582,6 +616,11 @@ static void relax_hopfield_attractor(const HssaContext* ctx, float* s, size_t ma
 
 int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, HssaTelemetry* out_telem) {
     if (!ctx || !in_vec || !out_vec) return -1;
+
+    // The scratchpads, Hopfield patterns and tt_u/tt_v cores are single-instance
+    // mutable state. hssa_update_tt16() mutates the cores from another thread, so
+    // every pass through this function holds the context lock.
+    std::lock_guard<std::mutex> state_guard(*static_cast<std::mutex*>(ctx->state_lock));
 
     double t_start = get_qpc_time_us();
 
@@ -606,7 +645,9 @@ int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, Hs
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t_bin_0);
 
-    const int BIN_REPS = 50;
+    // 50 repetitions only exist to average the per-call timer; without telemetry
+    // the extra 49 binarizations are pure waste on the hot path.
+    const int BIN_REPS = out_telem ? 50 : 1;
     for (int bi = 0; bi < BIN_REPS; ++bi) {
         dual_rail_binarize(ctx->scratch_in, ctx->scratch_vsa);
     }
@@ -657,10 +698,12 @@ int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, Hs
     // above roughly M,N >= 8192 or a >= 16-vector batch, neither of which
     // hidden_dim = 1024 produces.
     //
-    // The path itself is numerically correct (cosine 1.00000 / SQNR 137.6 dB against
-    // the CPU reference) and stays regression-locked by tests/test_hssa_m2.cpp, so it
-    // is disabled rather than deleted. Callers must opt in via hssa_init_cuda() or
-    // hssa_enable_cuda(ctx, true); the CLI exposes this as `upgrade_lab hssa --cuda`.
+    // The GEMV kernel itself matches a CPU reference (cosine 1.00000 / SQNR 137.6 dB
+    // in tests/test_hssa_m2.cpp), which is a kernel-level check only. The matrix is
+    // synthetic, so its output is not blended into the model state; this path exists
+    // to measure the DMA/GEMV round trip, not to accelerate the network. Callers must
+    // opt in via hssa_init_cuda() or hssa_enable_cuda(ctx, true); the CLI exposes
+    // this as `upgrade_lab hssa --cuda`.
     double dma_fwd_us = 0.0;
     double gemv_us = 0.0;
     double dma_rev_us = 0.0;
@@ -692,29 +735,29 @@ int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, Hs
             d_input, d_output,
             (CUdeviceptr)ctx->gpu_partials, (CUdeviceptr)ctx->gpu_tile_cnt,
             4, /* active_planes: 4-bit */
-            8, /* split_k: 8 */
+            0, /* split_k: 0 = auto (ptq_pick_split_k picks a divisor of cols/128);
+                  the old hard-coded 8 was only valid because 1024/128 = 8 */
             0  /* stream */
         );
         drv->cuCtxSynchronize();
         double t_gemv_1 = get_qpc_time_us();
         gemv_us = t_gemv_1 - t_gemv_0;
 
-        // Stage 3: Reverse GPU -> Host DMA & Residual Blending
+        // Stage 3: Reverse GPU -> Host DMA (measurement only)
+        //
+        // The matrix uploaded by hssa_init_cuda is synthetic (constant 0x55555555
+        // planes, 0.02 scales, 0.001 TT cores), not trained model weights. Blending
+        // its output into scratch_state -- the old 0.2/0.8 mix -- changed the model
+        // output by an arbitrary amount that no reference could justify. The DMA
+        // and GEMV still run and are timed; the bytes are copied back so the timing
+        // covers the whole round trip, but the result is deliberately discarded.
         double t_rev_0 = get_qpc_time_us();
         alignas(64) float gpu_res[HSSA_HIDDEN_DIM];
         drv->cuMemcpyDtoH(gpu_res, d_output, HSSA_HIDDEN_DIM * sizeof(float));
         double t_rev_1 = get_qpc_time_us();
         dma_rev_us = t_rev_1 - t_rev_0;
 
-        if (gemv_rc == 0) {
-            for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
-                __m512 s = _mm512_loadu_ps(&ctx->scratch_state[i]);
-                __m512 g = _mm512_loadu_ps(&gpu_res[i]);
-                __m512 blended = _mm512_fmadd_ps(g, _mm512_set1_ps(0.2f), _mm512_mul_ps(s, _mm512_set1_ps(0.8f)));
-                _mm512_storeu_ps(&ctx->scratch_state[i], blended);
-            }
-            cuda_done = true;
-        }
+        cuda_done = (gemv_rc == 0);
     }
 
     // 6. Modern Continuous Hopfield energy relaxation
@@ -1222,6 +1265,9 @@ int hssa_set_layer_vsa_db(HssaContext* ctx, uint32_t layer_idx, VsaDbHandle* db)
 int hssa_update_tt16(HssaContext* ctx, uint32_t layer_idx, const float* u_delta, const float* v_delta) {
     if (!ctx || !u_delta || !v_delta || layer_idx >= ctx->config.num_layers) return -1;
 
+    // Serialize against hssa_forward_token(), which reads these same cores.
+    std::lock_guard<std::mutex> state_guard(*static_cast<std::mutex*>(ctx->state_lock));
+
     HssaLayer* lyr = &ctx->layers[layer_idx];
     size_t sz = HSSA_TT16_CORE_SIZE;
 
@@ -1263,8 +1309,12 @@ int hssa_update_tt16(HssaContext* ctx, uint32_t layer_idx, const float* u_delta,
         lyr->tt_v[i] += v_delta[i];
     }
 
-    // Connect fused TT16 low-rank adapter updates over PCIe into device buffers
-    if (ctx->cuda_active && ctx->cuda_drv && ctx->gpu_matrix) {
+    // The GPU bridge owns ONE synthetic 1024x1024 matrix for the whole context and
+    // is a measurement-only microbenchmark: its GEMV output is never blended into
+    // scratch_state (see hssa_forward_token). There is no 28-layer device mirror.
+    // Layer 0's cores are mirrored so the benchmark's fused TT epilogue is fed real
+    // adapted data; updates to other layers stay host-side only.
+    if (layer_idx == 0 && ctx->cuda_active && ctx->cuda_drv && ctx->gpu_matrix) {
         CudaDrv* drv = (CudaDrv*)ctx->cuda_drv;
         PtqGpuMatrix* mat = (PtqGpuMatrix*)ctx->gpu_matrix;
         if (mat->d_tt_u) {

@@ -143,7 +143,11 @@ static bool test_persistence_lifecycle() {
     VsaDbHandle* db2 = vsa_db_create(VSA_CAP_MICRO, path);
     TEST_ASSERT(db2 != nullptr, "Failed to reopen existing DB from disk");
     TEST_ASSERT(vsa_db_get_fact_count(db2) == 25, "Fact count mismatch after reopen");
-    TEST_ASSERT(vsa_db_get_vector_count(db2) == 1, "Vector count mismatch after reopen");
+    // Contract after F22: every stored fact also registers its 512-bit binding
+    // in the unified vector table, so 25 facts + 1 raw vector = 26. The point of
+    // the assertion is that the vector index survives persistence, not the old
+    // count -- an unindexed fact is exactly the defect this pins shut.
+    TEST_ASSERT(vsa_db_get_vector_count(db2) == 26, "Vector count mismatch after reopen");
 
     for (int i = 0; i < 25; ++i) {
         std::string s = "Entity_" + std::to_string(i);
@@ -224,6 +228,8 @@ static bool test_online_mutation_and_deletion() {
         vsa_db_insert_fact(db, s.c_str(), "has_id", std::to_string(i * 100).c_str());
     }
     TEST_ASSERT(vsa_db_get_fact_count(db) == 50, "Fact count should be 50");
+    // Each fact owns one binding in the unified vector table (F22).
+    TEST_ASSERT(vsa_db_get_vector_count(db) == 50, "Each fact must register a vector binding");
 
     // 2. Mutate 10 facts online
     for (int i = 0; i < 10; ++i) {
@@ -240,6 +246,7 @@ static bool test_online_mutation_and_deletion() {
     TEST_ASSERT(vsa_db_query_relation(db, "Item_3", "has_id", out, sizeof(out)) == 0, "Deleted fact should not be found");
     TEST_ASSERT(vsa_db_delete_fact(db, "Item_3", "has_id") == 0, "Repeated delete should return 0");
     TEST_ASSERT(vsa_db_get_fact_count(db) == 49, "Fact count should decrease to 49");
+    TEST_ASSERT(vsa_db_get_vector_count(db) == 49, "Deleting a fact must drop its vector binding");
 
     // Verify remaining facts are still queryable despite backward shifting
     vsa_db_query_relation(db, "Item_4", "has_id", out, sizeof(out));
@@ -352,6 +359,65 @@ static bool test_raw_vector_argmax_scan() {
     TEST_ASSERT(res == 1, "Argmax search failed");
     TEST_ASSERT(std::abs(sim - 1.0f) < 1e-4f, "Target should still match exactly");
     TEST_ASSERT(elapsed_us < 500.0, "Argmax scan should complete in under 500 us");
+
+    // 4. A non-resonant probe must be a miss. The all-zero vector is not
+    //    stored and agrees with a random 512-bit vector on ~50% of bits; before
+    //    the resonance gate the function answered 1 for any probe as long as
+    //    the table was non-empty.
+    //    The zero probe is deliberately the hard case: one of the 200 vectors
+    //    above has only 180 ones, so zero agrees with it on 332/512 bits
+    //    (similarity 0.297) -- above the old 0.25 gate. 0.40 rejects it.
+    uint64_t v_unrelated[VSA_WORDS] = {0, 0, 0, 0, 0, 0, 0, 0};
+    sim = -123.0f;
+    TEST_ASSERT(vsa_db_query_vector(db, v_unrelated, retrieved, &sim) == 0,
+                "Non-resonant probe must miss");
+    TEST_ASSERT(sim == 0.0f, "A miss must report 0.0 similarity");
+
+    vsa_db_destroy(db);
+    return true;
+}
+
+// =============================================================================
+// Test 6b: Long-String Heap Reuse & Compaction (F2.3 leak)
+// =============================================================================
+
+static bool test_long_string_heap_reuse() {
+    VsaDbHandle* db = vsa_db_create(VSA_CAP_MICRO, nullptr);
+    TEST_ASSERT(db != nullptr, "Create failed");
+
+    // 700-byte subject and object do not fit inline, so both live in the string
+    // heap. The MICRO heap is 1,568,768 bytes; 1,700 growing mutations need
+    // ~2.6 MB of bump allocations, so this only succeeds if compaction reclaims
+    // the orphaned blocks. 1,200 iterations stayed below the capacity and never
+    // exercised the compaction path at all.
+    const std::string subject(700, 's');
+    const std::string first(700, 'a');
+    TEST_ASSERT(vsa_db_insert_fact(db, subject.c_str(), "blob", first.c_str()) == 0,
+                "Long-string insert failed");
+
+    for (int i = 0; i < 1700; ++i) {
+        const std::string v(700 + static_cast<size_t>(i), (i % 2) ? 'b' : 'c');
+        TEST_ASSERT(vsa_db_mutate_fact(db, subject.c_str(), "blob", v.c_str()) == 0,
+                    "Growing long-string mutation failed (heap not reclaimed)");
+    }
+
+    // Same-length overwrites must reuse the existing block, not grow the heap.
+    for (int i = 0; i < 3000; ++i) {
+        const std::string v(1900, (i % 2) ? 'b' : 'c');
+        TEST_ASSERT(vsa_db_mutate_fact(db, subject.c_str(), "blob", v.c_str()) == 0,
+                    "Same-length long-string mutation failed");
+    }
+
+    std::vector<char> out(2048, 0);
+    TEST_ASSERT(vsa_db_query_relation(db, subject.c_str(), "blob", out.data(), out.size()) == 1,
+                "Long-string fact disappeared");
+    TEST_ASSERT(std::string(1900, 'b') == out.data(), "Last long value mismatch");
+    TEST_ASSERT(vsa_db_get_fact_count(db) == 1, "Fact count should stay 1");
+    TEST_ASSERT(vsa_db_get_vector_count(db) == 1, "Vector binding count should stay 1");
+
+    TEST_ASSERT(vsa_db_delete_fact(db, subject.c_str(), "blob") == 1, "Long-string delete failed");
+    TEST_ASSERT(vsa_db_get_fact_count(db) == 0, "Fact count after delete");
+    TEST_ASSERT(vsa_db_get_vector_count(db) == 0, "Vector binding must be removed with the fact");
 
     vsa_db_destroy(db);
     return true;
@@ -490,6 +556,7 @@ int main() {
     RUN_TEST(test_online_mutation_and_deletion);
     RUN_TEST(test_conflict_checking);
     RUN_TEST(test_raw_vector_argmax_scan);
+    RUN_TEST(test_long_string_heap_reuse);
     RUN_TEST(test_multi_instance_hot_swapping);
     RUN_TEST(test_adversarial_boundaries);
 

@@ -53,6 +53,11 @@ def bat(path, timeout=3600):
     run(os.path.basename(path), ["cmd", "/c", path], timeout)
 
 
+def bat_run(path, timeout=3600):
+    """Build and execute a test script (its `run` mode propagates the exit code)."""
+    run(os.path.basename(path) + " run", ["cmd", "/c", path, "run"], timeout)
+
+
 def target(name, timeout=3600):
     run("build.bat " + name, ["cmd", "/c", os.path.join(ROOT, "build.bat"), name], timeout)
 
@@ -62,6 +67,12 @@ t0 = time.time()
 bat(os.path.join(ROOT, "tests", "build_popcnt_backoff_tests.bat"), 1800)
 bat(os.path.join(ROOT, "tests", "build_popcnt_selector_tests.bat"), 1800)
 target("brain", 2400)
+# The calibration includes the same assoc_sketch.h the engine includes, so the
+# recall/false-positive table is generated from shipped math, not copied.
+bat(os.path.join(ROOT, "second_brain", "measur", "build_assoc_calib.bat"), 1800)
+# The CUDA microbenchmark runs here, alone: its Test 3 asserts a 400 us step
+# ceiling, and overlapping it with the parallel phase pushed it to 402-455 us.
+bat_run(os.path.join(ROOT, "tests", "build_hssa_m2_tests.bat"), 1800)
 print("phase A: %.0fs" % (time.time() - t0), flush=True)
 
 print("=== phase B: the independent steps (parallel) ===", flush=True)
@@ -107,9 +118,21 @@ with ThreadPoolExecutor(max_workers=5) as pool:
 print("phase B: %.0fs" % (time.time() - t0), flush=True)
 
 print()
+print("=== phase C: adversarial and benchmark suites (serial) ===", flush=True)
+t0 = time.time()
+for script in ("build_stress.bat", "build_stress_bench.bat",
+               "build_stress_tier5.bat", "build_stress_tier5_adversarial.bat",
+               "build_challenger2.bat", "build_hssa_m1_tests.bat",
+               "build_hssa_m3_tests.bat", "build_bench_model_mod.bat",
+               "build_bench_hot_swap.bat", "build_ptq_validation.bat"):
+    bat_run(os.path.join(ROOT, "tests", script), 1800)
+print("phase C: %.0fs" % (time.time() - t0), flush=True)
+
+print()
 print("=== THE VERDICT ===")
 for name, rc, ok in sorted(results):
     print("  %-28s exit=%-8s %s" % (name, rc, "PASS" if ok else "FAIL"))
 bad = [n for n, rc, ok in results if not ok]
 print()
 print("REGRESSION:", "ALL GREEN" if not bad else "RED: " + ", ".join(bad))
+sys.exit(0 if not bad else 1)

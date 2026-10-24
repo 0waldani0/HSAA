@@ -526,32 +526,34 @@ static bool test_rh_vector_table_boundaries() {
     T5_ASSERT(std::fabs(sim - 1.0f) < 1.0e-5f, "Exact vector similarity must be 1.0");
     T5_ASSERT(std::memcmp(best_vec, v_alt, sizeof(v_alt)) == 0, "Best vector must match alt vector");
 
-    // Query exact opposite
+    // Query exact opposite: under the 0.40 resonance gate this is a miss. The
+    // closest stored vectors score 0.0 (v_zero/v_ones) and -1.0 (v_alt), i.e.
+    // no resonance; returning "nearest anyway" was the pre-gate behaviour.
     uint64_t v_opp[8];
     for (int i = 0; i < 8; ++i) v_opp[i] = ~v_alt[i]; // 0x5555555555555555ULL
     int q_opp = vsa_db_query_vector(db, v_opp, best_vec, &sim);
-    T5_ASSERT(q_opp == 1, "Opposite vector query must succeed");
-    // The closest vector in DB to v_opp (which has 256 bits set):
-    // against v_ones: 256 matches (sim = 0)
-    // against v_zero: 256 matches (sim = 0)
-    // against v_alt: 0 matches (sim = -1)
-    // So best similarity will be 0.0f (with v_ones or v_zero)
-    T5_ASSERT(sim >= 0.0f, "Best match for opposite of alt must be >= 0.0");
+    T5_ASSERT(q_opp == 0, "Non-resonant opposite vector must be rejected");
+    T5_ASSERT(sim == 0.0f, "Rejected probe leaves similarity at 0.0");
 
-    // Insert 500 pseudorandom vectors and query concurrently
+    // Insert 500 pseudorandom vectors and query with a resonant probe: one bit
+    // flipped from the last stored vector (similarity 510/512 = 0.996). A random
+    // probe scores ~0 against all 503 entries and must be rejected by the gate.
     std::mt19937_64 rng(42);
+    uint64_t rv_last[8] = {0};
     for (int i = 0; i < 500; ++i) {
         uint64_t rv[8];
         for (int w = 0; w < 8; ++w) rv[w] = rng();
         vsa_db_insert_vector(db, 0x4000 + i, rv);
+        if (i == 499) std::memcpy(rv_last, rv, sizeof(rv));
     }
     T5_ASSERT(vsa_db_get_vector_count(db) == 503, "Vector count must be 503");
 
     uint64_t probe_vec[8];
-    for (int w = 0; w < 8; ++w) probe_vec[w] = rng();
+    std::memcpy(probe_vec, rv_last, sizeof(probe_vec));
+    probe_vec[0] ^= 1ULL;
     int q_stress = vsa_db_query_vector(db, probe_vec, best_vec, &sim);
-    T5_ASSERT(q_stress == 1, "Parallel OpenMP vector scan must succeed");
-    T5_ASSERT(sim >= -1.0f && sim <= 1.0f, "Similarity must be bounded within [-1.0, 1.0]");
+    T5_ASSERT(q_stress == 1, "Resonant probe over 503 vectors must succeed");
+    T5_ASSERT(sim > 0.99f, "One-bit-flipped probe similarity must be > 0.99");
 
     vsa_db_destroy(db);
     return true;
@@ -579,7 +581,18 @@ static bool test_rh_persistence_and_cloning() {
     VsaDbHandle* db1_reopened = vsa_db_create(VSA_CAP_MICRO, path1);
     T5_ASSERT(db1_reopened != nullptr, "Failed to re-open persistent DB1");
     T5_ASSERT(vsa_db_get_fact_count(db1_reopened) == 2, "Fact count must be 2 after re-opening");
-    T5_ASSERT(vsa_db_get_vector_count(db1_reopened) == 1, "Vector count must be 1 after re-opening");
+    // The two facts own one binding vector each (F22 unification), plus the raw
+    // vector inserted above: 2 + 1 = 3 occupied slots in the shared vector table.
+    T5_ASSERT(vsa_db_get_vector_count(db1_reopened) == 3, "Vector count must be 3 after re-opening");
+
+    // The raw vector itself must also survive the reopen.
+    uint64_t probe_v[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    probe_v[0] ^= 1ULL;
+    uint64_t got_v[8] = {0};
+    float got_sim = 0.0f;
+    T5_ASSERT(vsa_db_query_vector(db1_reopened, probe_v, got_v, &got_sim) == 1 &&
+                  got_sim > 0.99f,
+              "Persisted raw vector must be queryable after reopen");
 
     char qbuf[64] = {0};
     int q_rc = vsa_db_query_relation(db1_reopened, "Arch", "Engine", qbuf, sizeof(qbuf));

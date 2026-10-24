@@ -34,14 +34,11 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo [+] Stress test executable built: "%BUILD_DIR%\stress_model_mod.exe"
 
-if "%1"=="run" (
-    echo [*] Executing Adversarial Stress Tests...
-    "%BUILD_DIR%\stress_model_mod.exe"
-    exit /b %ERRORLEVEL%
-)
+if "%1"=="run" goto :run_tests
+if "%1"=="" goto :run_tests
+exit /b 0
 
-if "%1"=="" (
-    echo [*] Executing Adversarial Stress Tests...
-    "%BUILD_DIR%\stress_model_mod.exe"
-    exit /b %ERRORLEVEL%
-)
+:run_tests
+echo [*] Executing Adversarial Stress Tests...
+"%BUILD_DIR%\stress_model_mod.exe"
+exit /b %ERRORLEVEL%

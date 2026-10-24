@@ -306,8 +306,11 @@ int model_set_layer_precision(void* ctx, uint32_t layer_idx, QuantPrecision prec
         return -3;
     }
 
-    // $O(1)$ runtime precision toggle with zero VRAM reallocation
-    reinterpret_cast<std::atomic<QuantPrecision>*>(&m->layers[layer_idx].precision)->store(prec, std::memory_order_release);
+    // $O(1)$ runtime precision toggle with zero VRAM reallocation.
+    // atomic_ref is the C++20 tool for atomically accessing a plain object:
+    // reinterpret_cast<std::atomic<T>*> over a non-atomic member is UB.
+    std::atomic_ref<QuantPrecision>(m->layers[layer_idx].precision)
+        .store(prec, std::memory_order_release);
     return 0;
 }
 
@@ -315,7 +318,9 @@ QuantPrecision model_get_layer_precision(const void* ctx, uint32_t layer_idx) {
     if (!ctx) return QUANT_4BIT;
     const ModelContext* m = (const ModelContext*)ctx;
     if (layer_idx >= m->num_layers) return QUANT_4BIT;
-    return reinterpret_cast<const std::atomic<QuantPrecision>*>(&m->layers[layer_idx].precision)->load(std::memory_order_acquire);
+    return std::atomic_ref<QuantPrecision>(
+               const_cast<QuantPrecision&>(m->layers[layer_idx].precision))
+        .load(std::memory_order_acquire);
 }
 
 /*
@@ -455,7 +460,8 @@ int model_swap_layer_block(void* ctx, uint32_t layer_idx, LayerType new_type) {
     }
 
     // Zero-allocation, atomic release store (<50 ns)
-    reinterpret_cast<std::atomic<LayerType>*>(&m->layers[layer_idx].layer_type)->store(new_type, std::memory_order_release);
+    std::atomic_ref<LayerType>(m->layers[layer_idx].layer_type)
+        .store(new_type, std::memory_order_release);
     return 0;
 }
 
@@ -463,7 +469,9 @@ LayerType model_get_layer_type(const void* ctx, uint32_t layer_idx) {
     if (!ctx) return LAYER_GQA_ATTENTION;
     const ModelContext* m = (const ModelContext*)ctx;
     if (layer_idx >= m->num_layers) return LAYER_GQA_ATTENTION;
-    return reinterpret_cast<const std::atomic<LayerType>*>(&m->layers[layer_idx].layer_type)->load(std::memory_order_acquire);
+    return std::atomic_ref<LayerType>(
+               const_cast<LayerType&>(m->layers[layer_idx].layer_type))
+        .load(std::memory_order_acquire);
 }
 
 /*
@@ -479,7 +487,8 @@ int model_forward_layer(void* ctx, uint32_t layer_idx, const float* in_vec, floa
     if (!in_vec || !out_vec) return -1;
 
     ModelLayerConfig* lyr = &m->layers[layer_idx];
-    LayerType current_type = reinterpret_cast<std::atomic<LayerType>*>(&lyr->layer_type)->load(std::memory_order_acquire);
+    LayerType current_type =
+        std::atomic_ref<LayerType>(lyr->layer_type).load(std::memory_order_acquire);
 
     // 1. Dispatch base layer operator
     switch (current_type) {
