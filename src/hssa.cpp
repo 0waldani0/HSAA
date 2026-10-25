@@ -1510,7 +1510,7 @@ int hssa_interpolate_continuous_states(
     float* out_state
 ) {
     if (!state_a || !state_b || !out_state) return -1;
-    const float t = std::max(0.0f, std::min(1.0f, alpha));
+    const float t = (std::max)(0.0f, (std::min)(1.0f, alpha));
 
     __m512 acc_aa = _mm512_setzero_ps();
     __m512 acc_bb = _mm512_setzero_ps();
@@ -1536,7 +1536,7 @@ int hssa_interpolate_continuous_states(
 
     if (norm_a > 1e-6f && norm_b > 1e-6f) {
         float cos_theta = dot_ab / (norm_a * norm_b);
-        cos_theta = std::max(-1.0f, std::min(1.0f, cos_theta));
+        cos_theta = (std::max)(-1.0f, (std::min)(1.0f, cos_theta));
         if (cos_theta < 0.9995f && cos_theta > -0.9995f) {
             float omega = std::acos(cos_theta);
             float sin_omega = std::sin(omega);

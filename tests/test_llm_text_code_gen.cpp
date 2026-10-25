@@ -620,17 +620,24 @@ int main() {
           cos_to_a[2] > 0.45 && cos_to_b[2] > 0.45,
           "T11.4: deep geodesic interpolation maintains unit norm and strictly monotonic cosine progression from A to B");
 
-    // T11.5: Continuous space invariance across brain_save_state / brain_load_state (brain vs brain2)
+    // T11.5: Continuous space invariance across brain_save_state / brain_load_state
+    const char* t11_5_file = "build/test_t11_5_state.tsv";
+    brain_save_state(brain2, t11_5_file);
+    PopCountBrain* brain_t11_5 = brain_create(4096, "build/test_llm_t11_5.bin");
+    brain_load_state(brain_t11_5, t11_5_file);
     float vec_b1[512] = {0.0f};
     float vec_b2[512] = {0.0f};
-    brain_embed_continuous(brain,  "Семантический резонанс и голографическая память", vec_b1);
-    brain_embed_continuous(brain2, "Семантический резонанс и голографическая память", vec_b2);
+    brain_embed_continuous(brain_t11_5, "Семантический резонанс и голографическая память", vec_b1);
+    brain_embed_continuous(brain2,       "Семантический резонанс и голографическая память", vec_b2);
     double dot_b1_b2 = 0.0;
     for (int d = 0; d < 512; ++d) {
         dot_b1_b2 += static_cast<double>(vec_b1[d]) * static_cast<double>(vec_b2[d]);
     }
+    std::printf("[T11.5 Save/Load Manifold Cosine]: %.6f\n\n", dot_b1_b2);
     check(dot_b1_b2 > 0.9999,
           "T11.5: continuous representation manifold is deterministically reconstructed on brain_load_state (cosine > 0.9999)");
+    brain_destroy(brain_t11_5);
+    std::filesystem::remove(t11_5_file, ec);
 
     // T11.6: High-speed AVX-512 continuous embedding & interpolation throughput benchmark
     auto t_cont0 = std::chrono::steady_clock::now();
@@ -647,6 +654,46 @@ int main() {
                 cont_us_per_call, kContIters);
     check(cont_us_per_call < 2500.0 && bench_tok[0] != '\0',
           "T11.6: AVX-512 continuous manifold interpolation executes in < 2.5 ms/call");
+
+    // -------------------------------------------------------------------------
+    // TEST 12: Deep Context Horizon Scaling Gate (L > 32 up to 64 tokens)
+    // -------------------------------------------------------------------------
+    // T12.1: Deep 45+ token C++ prefix with full multi-line loop context completes with 'acc;' and '}'
+    std::memset(buf, 0, sizeof(buf));
+    const char* deep_cpp_prompt =
+        "int sum_array(const int* data, int len) {\n"
+        "    int acc = 0;\n"
+        "    for (int i = 0; i < len; ++i) {\n"
+        "        acc += data[i];\n"
+        "    }\n"
+        "    return";
+    int n_deep_cpp = brain_generate(brain2, deep_cpp_prompt, buf, sizeof(buf), 16, 0.0f);
+    std::string s_deep_cpp(buf);
+    std::printf("[T12.1 Deep Context Horizon C++ (48-token prompt)]:\n  %s\n\n", s_deep_cpp.c_str());
+    check(n_deep_cpp >= 2 && s_deep_cpp.find("return acc;") != std::string::npos &&
+          has_balanced_delimiters(s_deep_cpp),
+          "T12.1: deep context horizon (48-token C++ prefix) matches beyond L=32 and completes return acc; with balanced braces");
+
+    // T12.2: Deep 45+ token Python binary_search prefix completes with ' -1'
+    std::memset(buf, 0, sizeof(buf));
+    const char* deep_py_prompt =
+        "def binary_search(arr, target):\n"
+        "    left = 0\n"
+        "    right = len(arr) - 1\n"
+        "    while left <= right:\n"
+        "        mid = (left + right) // 2\n"
+        "        if arr[mid] == target:\n"
+        "            return mid\n"
+        "        if arr[mid] < target:\n"
+        "            left = mid + 1\n"
+        "        else:\n"
+        "            right = mid - 1\n"
+        "    return";
+    int n_deep_py = brain_generate(brain2, deep_py_prompt, buf, sizeof(buf), 16, 0.0f);
+    std::string s_deep_py(buf);
+    std::printf("[T12.2 Deep Context Horizon Python (52-token prompt)]:\n  %s\n\n", s_deep_py.c_str());
+    check(n_deep_py >= 1 && s_deep_py.find("return -1") != std::string::npos,
+          "T12.2: deep context horizon (52-token Python prefix) completes return -1 from beyond L=32 context window");
 
     brain_destroy(brain2);
 

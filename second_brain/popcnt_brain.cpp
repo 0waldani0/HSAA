@@ -8307,9 +8307,12 @@ struct CodeProseTokenizer {
 };
 
 struct PopCountGenerativeLLM {
-    static constexpr int MAX_HORIZON = 32;
+    static constexpr int MAX_HORIZON = 64;
     static constexpr int MAX_ROLE_HORIZON = 6;
     static constexpr int SHORTLIST_CAP = 48;
+
+    int highest_trained_horizon = 0;
+    int highest_trained_reg_horizon = 0;
 
     // 4-byte bitfield-compressed NextTokenEntry (50% RAM reduction vs 8-byte struct,
     // fitting 16 entries per 64-byte L1 cache line across all horizon tables).
@@ -8583,8 +8586,12 @@ struct PopCountGenerativeLLM {
                 int32_t q = static_cast<int32_t>(std::lround(raw_cont[t][d] * scale));
                 q = std::max(-15, std::min(15, q));
                 if (q == 0) {
-                    const uint64_t* msk = vocab_morph_sketch[t].data();
-                    q = ((msk[d >> 6] >> (d & 63)) & 1ULL) ? 1 : -1;
+                    if (t < vocab_morph_sketch.size()) {
+                        const uint64_t* msk = vocab_morph_sketch[t].data();
+                        q = ((msk[d >> 6] >> (d & 63)) & 1ULL) ? 1 : -1;
+                    } else {
+                        q = 1;
+                    }
                 }
                 tok_cont_emb[t][d] = static_cast<int8_t>(q);
                 nsq += q * q;
@@ -8834,6 +8841,8 @@ struct PopCountGenerativeLLM {
         skip_table.clear();
         top_unigrams.clear();
         segment_records.clear();
+        highest_trained_horizon = 0;
+        highest_trained_reg_horizon = 0;
         tok_cont_emb.clear();
         tok_next_cont_centroid.clear();
         seg_cont_centroid.clear();
@@ -9031,6 +9040,13 @@ struct PopCountGenerativeLLM {
                 }
             }
 
+            if (L >= 5 && raw_h.empty() && raw_reg.empty()) {
+                break;
+            }
+
+            if (!raw_h.empty()) highest_trained_horizon = L;
+            if (!raw_reg.empty()) highest_trained_reg_horizon = L;
+
             horizon_tables[L].reserve(raw_h.size());
             for (auto it = raw_h.begin(); it != raw_h.end(); ) {
                 horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
@@ -9122,7 +9138,8 @@ struct PopCountGenerativeLLM {
 
                 std::unordered_map<int, int64_t> scores;
                 std::unordered_map<int, int> max_l_seen;
-                const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, pos));
+                const int active_max_h = (highest_trained_horizon > 0) ? highest_trained_horizon : MAX_HORIZON;
+                const int max_L = static_cast<int>(std::min<size_t>(active_max_h, pos));
                 for (int L = max_L; L >= 1; --L) {
                     uint64_t key = make_horizon_key(seq.data(), pos, L);
                     auto it = horizon_tables[L].find(key);
@@ -9495,11 +9512,15 @@ struct PopCountGenerativeLLM {
             return true;
         };
 
+        highest_trained_horizon = 0;
+        highest_trained_reg_horizon = 0;
         for (int L = 1; L <= MAX_HORIZON; ++L) {
             if (!read_htable(horizon_tables[L])) return false;
+            if (!horizon_tables[L].empty()) highest_trained_horizon = L;
         }
         for (int L = 1; L <= MAX_HORIZON; ++L) {
             if (!read_htable(reg_horizon_tables[L])) return false;
+            if (!reg_horizon_tables[L].empty()) highest_trained_reg_horizon = L;
         }
         for (int L = 1; L <= MAX_ROLE_HORIZON; ++L) {
             if (!read_htable(role_horizon_tables[L])) return false;
@@ -9938,8 +9959,10 @@ int PopCountGenerativeLLM::generate(
     bool has_direct_prefix_match = false;
     bool has_l2_prefix_match = false;
     if (!prompt_toks.empty()) {
-        const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, ctx.size()));
-        const int max_rL = static_cast<int>(std::min<size_t>(MAX_HORIZON, reg_ctx.size()));
+        const int active_max_h = (highest_trained_horizon > 0) ? highest_trained_horizon : MAX_HORIZON;
+        const int active_max_rh = (highest_trained_reg_horizon > 0) ? highest_trained_reg_horizon : MAX_HORIZON;
+        const int max_L = static_cast<int>(std::min<size_t>(active_max_h, ctx.size()));
+        const int max_rL = static_cast<int>(std::min<size_t>(active_max_rh, reg_ctx.size()));
         for (int L = std::max(max_L, max_rL); L >= 2; --L) {
             if (L <= max_L) {
                 uint64_t k = make_horizon_key(ctx.data(), ctx.size(), L);
@@ -10239,8 +10262,11 @@ int PopCountGenerativeLLM::generate(
             }
         }
 
+        const int active_max_h = (highest_trained_horizon > 0) ? highest_trained_horizon : MAX_HORIZON;
+        const int active_max_rh = (highest_trained_reg_horizon > 0) ? highest_trained_reg_horizon : MAX_HORIZON;
+
         if (!reg_to_tok.empty()) {
-            const int max_rL = static_cast<int>(std::min<size_t>(MAX_HORIZON, reg_ctx.size()));
+            const int max_rL = static_cast<int>(std::min<size_t>(active_max_rh, reg_ctx.size()));
             int highest_reg_L = 0;
             for (int L = max_rL; L >= 1; --L) {
                 uint64_t rkey = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
@@ -10294,7 +10320,7 @@ int PopCountGenerativeLLM::generate(
         }
 
         if (reg_to_tok.empty() || cand_scores.empty()) {
-            const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, ctx.size()));
+            const int max_L = static_cast<int>(std::min<size_t>(active_max_h, ctx.size()));
             int highest_exact_L = 0;
             for (int L = max_L; L >= 1; --L) {
                 uint64_t key = make_horizon_key(ctx.data(), ctx.size(), L);
