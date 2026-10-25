@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <chrono>
+#include <fstream>
 #include "../second_brain/popcnt_brain.h"
 
 static int g_passed = 0;
@@ -224,7 +226,6 @@ int main() {
           s_restored.find("return val_x") != std::string::npos,
           "T7.4: restored brain_generate synthesizes zero-shot renamed code identically");
 
-    brain_destroy(brain2);
     std::error_code ec;
     std::filesystem::remove(std::filesystem::u8path(state_file), ec);
 
@@ -263,6 +264,275 @@ int main() {
     check(q_morph_ok == 1 && std::strcmp(q_morph, "оптический_канал") == 0,
           "T8.3: joint subject+relation morphological inflection resolved via VSA similarity in brain_query_relation");
     brain_destroy(brain3);
+
+    // -------------------------------------------------------------------------
+    // TEST 8.4-8.7: Morphological Question Routing, Mid-Sentence Alignment & Local Scope Registers
+    // -------------------------------------------------------------------------
+    std::memset(buf, 0, sizeof(buf));
+    int n_q_short = brain_generate(
+        brain2,
+        "Почему не нужна видеокарта для обучения и генерации?",
+        buf, sizeof(buf), 45, 0.0f);
+    std::string s_q_short(buf);
+    std::memset(buf, 0, sizeof(buf));
+    int n_q_morph = brain_generate(
+        brain2,
+        "Почему не нужна видеокарта для обучения и генерации?",
+        buf, sizeof(buf), 64, 0.0f);
+    std::string s_q_morph(buf);
+    std::printf("[T8.4 Morphological Question Routing] (%d tokens):\n  %s\n\n", n_q_morph, buf);
+    check(n_q_short >= 20 && s_q_short.back() == '.' &&
+          n_q_morph >= 40 && s_q_morph.find("видеокарты") != std::string::npos &&
+          s_q_morph.back() == '.',
+          "T8.4: inflected question ('видеокарта/обучения/генерации') routes to GPU/CPU paragraph & ends at sentence boundary");
+
+    std::memset(buf, 0, sizeof(buf));
+    int n_mid_morph = brain_generate(
+        brain2,
+        "Архитектуры PopCount заменяют матричные умножения",
+        buf, sizeof(buf), 30, 0.0f);
+    std::string s_mid_morph(buf);
+    std::memset(buf, 0, sizeof(buf));
+    int n_prep_ctx = brain_generate(
+        brain2,
+        "Гипермерная память VSA связывает понятия через",
+        buf, sizeof(buf), 25, 0.0f);
+    std::string s_prep_ctx(buf);
+    std::printf("[T8.5 Mid-Sentence & Preposition Continuation]:\n  1) %s\n  2) %s\n\n",
+                s_mid_morph.c_str(), s_prep_ctx.c_str());
+    check(n_mid_morph >= 5 && s_mid_morph.find("с плавающей точкой") != std::string::npos &&
+          !s_mid_morph.empty() && s_mid_morph.back() == '.' &&
+          n_prep_ctx >= 4 && s_prep_ctx.find("побитовое исключающее ИЛИ") != std::string::npos &&
+          !s_prep_ctx.empty() && s_prep_ctx.back() == '.',
+          "T8.5: inflected mid-sentence prefix & skipped-word preposition prefix continue seamlessly and terminate cleanly at '.'");
+
+    std::memset(buf, 0, sizeof(buf));
+    int n_local_cpp = brain_generate(
+        brain2,
+        "int sum_array(const int* data, int len) {\n    int acc = 0;",
+        buf, sizeof(buf), 48, 0.0f);
+    std::string s_local_cpp(buf);
+    std::printf("[T8.6 Local Variable Register C++] (%d tokens):\n  %s\n\n", n_local_cpp, buf);
+    check(n_local_cpp >= 10 &&
+          s_local_cpp.find("acc += data[i]") != std::string::npos &&
+          s_local_cpp.find("return acc") != std::string::npos,
+          "T8.6: local variable 'acc' + parameters 'data, len' generalized across 26+ token loop horizon via <reg_0..7>");
+
+    std::memset(buf, 0, sizeof(buf));
+    int n_local_py = brain_generate(
+        brain2,
+        "def factorial_iter(n):\n    prod = 1",
+        buf, sizeof(buf), 28, 0.0f);
+    std::string s_local_py(buf);
+    std::printf("[T8.7 Local Variable Register Python] (%d tokens):\n  %s\n\n", n_local_py, buf);
+    check(n_local_py >= 8 &&
+          s_local_py.find("prod = prod * i") != std::string::npos &&
+          s_local_py.find("return prod") != std::string::npos,
+          "T8.7: Python local variable 'prod' generalized inside loop body and return statement");
+
+    // -------------------------------------------------------------------------
+    // TEST 9: Rigorous Critique Adversarial Regression Suite (T9.1 - T9.5)
+    // -------------------------------------------------------------------------
+    // T9.1: Compiled binary model serialization (#__POPCNT_LLM_BIN2__) without
+    // storing raw training corpus text or re-running train_corpus on load
+    const char* bin2_file = "build/test_compiled_bin2.tsv";
+    int save_bin2 = brain_save_state(brain2, bin2_file);
+    bool has_bin2_header = false;
+    {
+        std::ifstream ifs(bin2_file, std::ios::binary);
+        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        has_bin2_header = (content.find("#__POPCNT_LLM_BIN2__ ") != std::string::npos) &&
+                          (content.find("#__POPCNT_LLM_LZ1__ ") == std::string::npos);
+    }
+    PopCountBrain* brain_fast = brain_create(4096, "build/test_llm_fast_load.bin");
+    auto t_load_start = std::chrono::steady_clock::now();
+    int load_bin2 = brain_load_state(brain_fast, bin2_file);
+    auto t_load_end = std::chrono::steady_clock::now();
+    double load_ms = std::chrono::duration<double, std::milli>(t_load_end - t_load_start).count();
+    std::memset(buf, 0, sizeof(buf));
+    int n_fast_gen = brain_generate(brain_fast, "def clamp(x_val, lo_v, hi_v):", buf, sizeof(buf), 64, 0.0f);
+    std::string s_fast_gen(buf);
+    std::printf("[T9.1 Compiled Model Deserialization]: %.3f ms vs train %.3f ms (has_bin2_header=%d)\n",
+                load_ms, stats.train_time_ms, has_bin2_header ? 1 : 0);
+    check(save_bin2 == 1 && load_bin2 == 1 && has_bin2_header &&
+          load_ms < 50.0 && load_ms < stats.train_time_ms * 0.45 &&
+          n_fast_gen >= 15 && s_fast_gen.find("return hi_v") != std::string::npos,
+          "T9.1: brain_save_state writes compiled binary tables (#__POPCNT_LLM_BIN2__) & loads in <50ms without retraining");
+    brain_destroy(brain_fast);
+    std::filesystem::remove(bin2_file, ec);
+
+    // T9.2: Same-arity C++ function disambiguation (sum_array vs max_array)
+    PopCountBrain* brain_arity = brain_create(2048, "build/test_llm_arity.bin");
+    const char* arity_corpus =
+        "int sum_array(const int* arr, int n) {\n"
+        "    int total = 0;\n"
+        "    for (int i = 0; i < n; ++i) {\n"
+        "        total += arr[i];\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n\n"
+        "int max_array(const int* arr, int n) {\n"
+        "    int best = arr[0];\n"
+        "    for (int i = 1; i < n; ++i) {\n"
+        "        if (arr[i] > best) best = arr[i];\n"
+        "    }\n"
+        "    return best;\n"
+        "}\n";
+    BrainTrainStats arity_stats{};
+    int arity_tr_ok = brain_train_corpus(brain_arity, arity_corpus, 4, &arity_stats);
+    std::memset(buf, 0, sizeof(buf));
+    int n_sum_arity = brain_generate(
+        brain_arity,
+        "int compute_sum(const int* data, int len) {",
+        buf, sizeof(buf), 48, 0.0f);
+    std::string s_sum_arity(buf);
+    std::memset(buf, 0, sizeof(buf));
+    int n_max_arity = brain_generate(
+        brain_arity,
+        "int find_max(const int* data, int len) {",
+        buf, sizeof(buf), 48, 0.0f);
+    std::string s_max_arity(buf);
+    std::printf("[T9.2 Same-Arity Disambiguation]:\n  sum -> %s\n  max -> %s\n\n",
+                s_sum_arity.c_str(), s_max_arity.c_str());
+    check(arity_tr_ok == 1 &&
+          n_sum_arity >= 12 && s_sum_arity.find("+= data[i]") != std::string::npos &&
+          s_sum_arity.find("return ") != std::string::npos &&
+          n_max_arity >= 12 && s_max_arity.find("if (data[i] >") != std::string::npos &&
+          s_max_arity.find("return ") != std::string::npos,
+          "T9.2: same-arity functions (sum_array vs max_array) disambiguated with complete return statement");
+
+    // -------------------------------------------------------------------------
+    // TEST 10: Self-Audit Adversarial Regression Suite (T10.1 - T10.5)
+    // -------------------------------------------------------------------------
+    // T10.1: Short prose sentence (<12 tokens) stops at period without dangling tail,
+    // and C++ function body with max_tokens=48 completes its `return` before `}`
+    check(!s_prep_ctx.empty() && s_prep_ctx.back() == '.' &&
+          s_prep_ctx.find("по смысловому маршруту") == std::string::npos &&
+          s_max_arity.find("return best;") != std::string::npos,
+          "T10.1: short sentence (<12 steps) terminates at period & C++ function completes return statement before closing brace");
+
+    // T10.2: Neutral function name with body prefix disambiguation (active_target_segment
+    // tie-break must NOT overpower a longer L=10 reg_horizon_tables match)
+    std::memset(buf, 0, sizeof(buf));
+    int n_neutral_max = brain_generate(
+        brain_arity,
+        "int process_items(const int* data, int len) {\n"
+        "    int best = data[0];\n"
+        "    for (int i = 1; i < len; ++i) {",
+        buf, sizeof(buf), 32, 0.0f);
+    std::string s_neutral_max(buf);
+    std::printf("[T10.2 Neutral Function Name + Body Prefix]:\n  %s\n\n", s_neutral_max.c_str());
+    check(n_neutral_max >= 8 &&
+          s_neutral_max.find("if (data[i] > best)") != std::string::npos &&
+          s_neutral_max.find("+=") == std::string::npos &&
+          s_neutral_max.find("return best;") != std::string::npos,
+          "T10.2: neutral function name with max_array body prefix preserves L=10 horizon match without sum_array override");
+
+    // T10.3: Multi-token C++ uniform initialization `int best{data[0]};`
+    std::memset(buf, 0, sizeof(buf));
+    int n_multi_brace = brain_generate(
+        brain_arity,
+        "int find_max(const int* data, int len) {\n"
+        "    int best{data[0]};",
+        buf, sizeof(buf), 48, 0.0f);
+    std::string s_multi_brace(buf);
+    std::printf("[T10.3 Multi-Token Brace Init `int best{data[0]};`]:\n  %s\n\n", s_multi_brace.c_str());
+    check(n_multi_brace >= 12 &&
+          s_multi_brace.find("if (data[i] > best) best = data[i];") != std::string::npos &&
+          s_multi_brace.find("return best;") != std::string::npos,
+          "T10.3: multi-token C++ brace initialization `int best{data[0]};` canonicalizes to `<reg_4> = <reg_0> [ 0 ] ;`");
+    brain_destroy(brain_arity);
+
+    // T9.3: C++ uniform brace initialization (int acc{0};) and uninitialized declaration (int acc;)
+    std::memset(buf, 0, sizeof(buf));
+    int n_brace_cpp = brain_generate(
+        brain2,
+        "int sum_array(const int* data, int len) {\n    int acc{0};",
+        buf, sizeof(buf), 48, 0.0f);
+    std::string s_brace_cpp(buf);
+    std::memset(buf, 0, sizeof(buf));
+    int n_uninit_cpp = brain_generate(
+        brain2,
+        "int sum_array(const int* data, int len) {\n    int acc;",
+        buf, sizeof(buf), 48, 0.0f);
+    std::string s_uninit_cpp(buf);
+    std::printf("[T9.3 Uniform & Uninitialized Local C++ Decls]:\n  brace  -> %s\n  uninit -> %s\n\n",
+                s_brace_cpp.c_str(), s_uninit_cpp.c_str());
+    check(n_brace_cpp >= 10 && s_brace_cpp.find("acc += data[i]") != std::string::npos &&
+          s_brace_cpp.find("return acc") != std::string::npos &&
+          n_uninit_cpp >= 10 && s_uninit_cpp.find("acc += data[i]") != std::string::npos &&
+          s_uninit_cpp.find("return acc") != std::string::npos,
+          "T9.3: C++ uniform initialization 'int acc{0};' and uninitialized 'int acc;' bind to <reg_4> and generalize");
+
+    // T9.4: Dynamic neural vocabulary growth beyond +64 unseen OOV prompt tokens
+    std::string oov_prompt;
+    for (int i = 0; i < 85; ++i) {
+        oov_prompt += "oov_dynamic_tok_" + std::to_string(i) + " ";
+    }
+    oov_prompt += "Как работает архитектура PopCount?";
+    std::memset(buf, 0, sizeof(buf));
+    int n_oov = brain_generate(brain2, oov_prompt.c_str(), buf, sizeof(buf), 32, 0.0f);
+    std::string s_oov(buf);
+    check(n_oov >= 8 && s_oov.find("PopCount") != std::string::npos,
+          "T9.4: >80 unseen OOV tokens dynamically expand sublinear_net vocabulary without freezing or crashing");
+
+    // T9.5: TSV injection protection (\t, \n, \r, \\, #__POPCNT_LLM_) in brain_save_state / brain_load_state
+    const char* adv_subj = "узел\tс_табом\nи_переводом_строки";
+    const char* adv_rel  = "#__POPCNT_LLM_BIN2__\\инъекция";
+    const char* adv_obj  = "значение\r\nс_возвратом\tкаретки";
+    brain_store_fact(brain2, adv_subj, adv_rel, adv_obj);
+    const char* tsv_inj_file = "build/test_tsv_injection.tsv";
+    int save_inj = brain_save_state(brain2, tsv_inj_file);
+    PopCountBrain* brain_inj = brain_create(4096, "build/test_llm_inj.bin");
+    int load_inj = brain_load_state(brain_inj, tsv_inj_file);
+    char inj_ans[256] = {0};
+    int q_inj_ok = brain_query_relation(brain_inj, adv_subj, adv_rel, inj_ans, sizeof(inj_ans));
+    check(save_inj == 1 && load_inj == 1 && q_inj_ok == 1 && std::strcmp(inj_ans, adv_obj) == 0,
+          "T9.5: TSV escaping protects brain_save_state/brain_load_state against embedded \\t, \\n, \\r, \\\\, and # headers");
+
+    // T10.4: Fact overwrite & case-variant deduplication + idempotent brain_load_state
+    PopCountBrain* brain_dedup = brain_create(1024, "build/test_llm_dedup.bin");
+    brain_store_fact(brain_dedup, "Alice", "role", "developer");
+    brain_store_fact(brain_dedup, "alice", "ROLE", "architect");
+    brain_store_fact(brain_dedup, "ALICE", "Role", "principal_engineer");
+    size_t dedup_pages = 0, dedup_rules = 0;
+    brain_get_stats(brain_dedup, &dedup_pages, &dedup_rules);
+    char dedup_ans[128] = {0};
+    int q_dedup_ok = brain_query_relation(brain_dedup, "alice", "role", dedup_ans, sizeof(dedup_ans));
+    const char* dedup_file = "build/test_dedup_state.tsv";
+    brain_save_state(brain_dedup, dedup_file);
+    // Load twice into the same instance to verify idempotence
+    int ld1 = brain_load_state(brain_dedup, dedup_file);
+    int ld2 = brain_load_state(brain_dedup, dedup_file);
+    size_t dedup_pages_after = 0, dedup_rules_after = 0;
+    brain_get_stats(brain_dedup, &dedup_pages_after, &dedup_rules_after);
+    check(dedup_rules == 1 && q_dedup_ok == 1 &&
+          std::strcmp(dedup_ans, "principal_engineer") == 0 &&
+          ld1 == 1 && ld2 == 1 && dedup_rules_after == 1,
+          "T10.4: case-variant fact overwrites update in-place without inflating active_rules, and brain_load_state is idempotent");
+    brain_destroy(brain_dedup);
+    std::filesystem::remove(dedup_file, ec);
+
+    // T10.5: Corrupted #__POPCNT_LLM_BIN2__ header rejection in brain_load_state
+    const char* corrupt_file = "build/test_corrupt_bin2.tsv";
+    {
+        std::ofstream ofs(corrupt_file, std::ios::binary);
+        ofs << "#__POPCNT_LLM_BIN2__ 999999 ZZZ_INVALID_HEX\n";
+    }
+    int load_corrupt1 = brain_load_state(brain_inj, corrupt_file);
+    {
+        std::ofstream ofs(corrupt_file, std::ios::binary);
+        // Valid hex, but bogus magic / truncated binary payload
+        ofs << "#__POPCNT_LLM_BIN2__ 100 00010203040506070809\n";
+    }
+    int load_corrupt2 = brain_load_state(brain_inj, corrupt_file);
+    check(load_corrupt1 == 0 && load_corrupt2 == 0,
+          "T10.5: corrupted #__POPCNT_LLM_BIN2__ headers (invalid hex or truncated binary payload) are deterministically rejected");
+    brain_destroy(brain_inj);
+    std::filesystem::remove(tsv_inj_file, ec);
+    std::filesystem::remove(corrupt_file, ec);
+
+    brain_destroy(brain2);
 
     std::printf("================================================================\n");
     std::printf("  SUMMARY: %d Passed, %d Failed\n", g_passed, g_failed);

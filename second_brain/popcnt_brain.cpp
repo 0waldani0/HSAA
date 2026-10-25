@@ -85,6 +85,22 @@
 #include <unordered_set>
 #include <vector>
 
+#if !defined(_WIN32)
+#ifndef _TRUNCATE
+#define _TRUNCATE (static_cast<size_t>(-1))
+#endif
+inline int strncpy_s(char* dest, size_t destsz, const char* src, size_t count) {
+    if (!dest || destsz == 0) return -1;
+    if (!src) { dest[0] = '\0'; return -1; }
+    size_t n = std::strlen(src);
+    if (count != _TRUNCATE && count < n) n = count;
+    if (n >= destsz) n = destsz - 1;
+    std::memcpy(dest, src, n);
+    dest[n] = '\0';
+    return 0;
+}
+#endif
+
 // -----------------------------------------------------------------------------
 // Architecture Constants (Exact 4 KB Linux Virtual Memory Page Alignment)
 // -----------------------------------------------------------------------------
@@ -330,7 +346,7 @@ inline int32_t ternary_popcnt_dot_512(
     const uint64_t* __restrict__ sign_bits,
     const uint64_t mag_planes[NUM_BIT_PLANES][WORDS_PER_VEC]
 ) {
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VPOPCNTDQ__)
     __m512i vwp = _mm512_loadu_si512((const __m512i*)w_pos);
     __m512i vwn = _mm512_loadu_si512((const __m512i*)w_neg);
     __m512i vs  = _mm512_loadu_si512((const __m512i*)sign_bits);
@@ -382,7 +398,7 @@ inline int32_t vsa_bipolar_dot_512(
     const uint64_t* __restrict__ a_bits,
     const uint64_t* __restrict__ b_bits
 ) {
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VPOPCNTDQ__)
     __m512i va = _mm512_loadu_si512((const __m512i*)a_bits);
     __m512i vb = _mm512_loadu_si512((const __m512i*)b_bits);
     __m512i vxnor = _mm512_ternarylogic_epi64(va, vb, va, 0x99);
@@ -841,6 +857,13 @@ int deduce_multihop_in_1gb_bank_cpp(
     int* __restrict__ out_chain_ids,
     int32_t* __restrict__ out_final_bit_agreement
 ) {
+    if (out_final_bit_agreement) *out_final_bit_agreement = 0;
+    if (!mmap_bank_base || !vocab_pos || !out_chain_ids || vocab_size <= 0 ||
+        start_token_id < 0 || start_token_id >= vocab_size || max_hops <= 0) {
+        return 0;
+    }
+    if (max_hops > MAX_MULTIHOP_HOPS) max_hops = MAX_MULTIHOP_HOPS;
+
     int curr_id = start_token_id;
     out_chain_ids[0] = curr_id;
     int chain_len = 1;
@@ -1711,6 +1734,26 @@ static void populate_single_page_deterministic(TernaryMLPExpertPage* pages, uint
 #if defined(_WIN32)
 MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
     if (!filepath) return nullptr;
+    std::string spath(filepath);
+    if (spath.size() >= 9 && spath.compare(spath.size() - 9, 9, ".llm_bank") == 0) {
+        const size_t mapping_bytes = BANK_MODEL_BYTES;
+        HANDLE hMap = CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            NULL,
+            PAGE_READWRITE,
+            static_cast<DWORD>(mapping_bytes >> 32),
+            static_cast<DWORD>(mapping_bytes & 0xFFFFFFFFULL),
+            NULL
+        );
+        if (!hMap) return nullptr;
+        void* ptr = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, mapping_bytes);
+        if (!ptr) {
+            CloseHandle(hMap);
+            return nullptr;
+        }
+        return new MappedWeightBank{INVALID_HANDLE_VALUE, hMap, ptr, BANK_MODEL_BYTES, mapping_bytes, {}};
+    }
+
     int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
     if (wlen <= 0) return nullptr;
     std::vector<wchar_t> wpath(wlen);
@@ -1862,6 +1905,19 @@ static void mmu_demand_page_sigsegv_handler(int sig, siginfo_t* si, void* uctx) 
 }
 
 MappedWeightBank* open_or_create_1gb_bank(const char* filepath) {
+    if (!filepath) return nullptr;
+    std::string spath(filepath);
+    if (spath.size() >= 9 && spath.compare(spath.size() - 9, 9, ".llm_bank") == 0) {
+        const size_t mapping_bytes = BANK_MODEL_BYTES;
+        void* ptr = mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED) return nullptr;
+        return new MappedWeightBank{-1, ptr, BANK_MODEL_BYTES, mapping_bytes, {}};
+    }
+    std::filesystem::path fpath = std::filesystem::u8path(filepath);
+    if (fpath.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(fpath.parent_path(), ec);
+    }
     int fd = open(filepath, O_RDWR | O_CREAT, 0644);
     if (fd < 0) return nullptr;
     const size_t mapping_bytes = BANK_MAPPING_BYTES;
@@ -1913,6 +1969,30 @@ void close_1gb_bank(MappedWeightBank* bank) {
     if (bank->fd >= 0) close(bank->fd);
     delete bank;
 }
+
+struct AutoMappedWeightBank {
+    MappedWeightBank* bank = nullptr;
+    std::string filepath;
+
+    AutoMappedWeightBank(const std::string& path) : filepath(path) {
+        bank = open_or_create_1gb_bank(path.c_str());
+    }
+
+    ~AutoMappedWeightBank() {
+        if (bank) {
+            close_1gb_bank(bank);
+            bank = nullptr;
+        }
+        if (!filepath.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(filepath), ec);
+        }
+    }
+
+    MappedWeightBank* get() const { return bank; }
+    MappedWeightBank* operator->() const { return bank; }
+    explicit operator bool() const { return bank != nullptr; }
+};
 #endif
 
 // -----------------------------------------------------------------------------
@@ -2823,7 +2903,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
     // research-scale change rather than a patch. Kept here as the record of
     // that measurement so the next attempt starts from it.
 
-NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t seed)
+NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t seed, bool skip_init = false)
         : bank(b), vocab_size(v_size),
           // The router writes one id per selected page into the caller's
           // uint32_t[16] buffer, so the count is bounded HERE and not only in
@@ -2832,7 +2912,7 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
           embeddings(v_size * D_MODEL, 0),
           vocab_pos(v_size * WORDS_PER_VEC, 0),
           vocab_neg(v_size * WORDS_PER_VEC, 0),
-          tree_nodes(((1U << TREE_DEPTH) - 1U) * WORDS_PER_VEC, 0),
+          tree_nodes(skip_init ? 0 : (((1U << TREE_DEPTH) - 1U) * WORDS_PER_VEC), 0),
           swa_count(0),
           has_active_prompt_half(false),
           generation_step_counter(0) {
@@ -2840,6 +2920,11 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         std::memset(sub2_acc, 0, sizeof(sub2_acc));
         std::memset(canonical_slot_query_bits, 0, sizeof(canonical_slot_query_bits));
         std::memset(active_prompt_half, 0, sizeof(active_prompt_half));
+
+        if (skip_init) {
+            reset_state();
+            return;
+        }
 
         auto next_rand = [&]() -> uint64_t {
             seed ^= seed >> 12;
@@ -4867,6 +4952,11 @@ struct PureNeuralReasoningEngine {
         int32_t* out_bit_agreement = nullptr,
         uint32_t* out_page_id = nullptr
     ) const {
+        if (!model || subj_id < 0 || subj_id >= model->vocab_size || rel < 0 || rel >= REL_COUNT) {
+            if (out_bit_agreement) *out_bit_agreement = 0;
+            if (out_page_id) *out_page_id = ALLOC_NO_PAGE;
+            return -1;
+        }
         const uint64_t* s_bits = &model->vocab_pos[subj_id * WORDS_PER_VEC];
         uint64_t rel_key[WORDS_PER_VEC];
         vsa_make_relational_key_512(s_bits, rel_hypervecs[rel], rel_key);
@@ -4968,6 +5058,16 @@ struct PureNeuralReasoningEngine {
     // in `trajectory_role_slots[best_mem_idx]`, we replace its Identity Subspace
     // (`ffn_out[256..511]`) with the live entity unbound from the 4 KB VSA pages
     // and re-run `compute_vocab_logits_popcnt`!
+    void store_declarative_statement_fast(const std::string& user_text) {
+        std::vector<int> u_ids = tokenizer.encode_line("<|user|> " + user_text, false);
+        UnsupervisedSemanticFrame f = parse_frame_unsupervised(u_ids);
+        if (f.src_entity >= 0 || f.host_entity >= 0) {
+            int deduced_prop = -1;
+            int deduced_old_cipher = -1;
+            consolidate_declarative_statement_in_4kb_pages(f, &deduced_prop, &deduced_old_cipher);
+        }
+    }
+
     DialogueTurnResult chat_and_reason_native(const std::string& user_text) {
         auto t0 = std::chrono::steady_clock::now();
         arm_hardware_mmu_page_trap(bank);
@@ -6014,7 +6114,8 @@ MassivePretrainReport run_massive_multidomain_pretraining(
              it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
             if (ec || !it->is_regular_file(ec)) continue;
             std::string path = it->path().string();
-            if (path.ends_with(".txt") || path.ends_with(".rst") || path.ends_with(".md")) {
+            std::string ext = it->path().extension().string();
+            if (ext == ".txt" || ext == ".rst" || ext == ".md") {
                 std::ifstream ifs(path);
                 if (!ifs) continue;
                 ++rep.real_vm_files_harvested;
@@ -7855,10 +7956,12 @@ struct CodeProseTokenizer {
     void extract_scope_registers(
         const std::vector<int>& seq,
         std::vector<int>& out_reg_to_tok,
-        std::unordered_map<int, int>& out_tok_to_reg
+        std::unordered_map<int, int>& out_tok_to_reg,
+        int* out_func_name_tok = nullptr
     ) const {
         out_reg_to_tok.clear();
         out_tok_to_reg.clear();
+        if (out_func_name_tok) *out_func_name_tok = -1;
 
         const int id_lparen = get_word_id("(");
         const int id_rparen = get_word_id(")");
@@ -7866,6 +7969,7 @@ struct CodeProseTokenizer {
         const int id_colon  = get_word_id(":");
         const int id_assign = get_word_id("=");
         const int id_lbrace = get_word_id("{");
+        const int id_semi   = get_word_id(";");
         if (id_lparen < 0 || id_rparen < 0) return;
 
         size_t header_limit = std::min<size_t>(seq.size(), 24);
@@ -7890,6 +7994,7 @@ struct CodeProseTokenizer {
                 }
                 if (has_sig_prefix) {
                     open_p = i;
+                    if (out_func_name_tok) *out_func_name_tok = seq[i - 1];
                     break;
                 }
             }
@@ -7914,6 +8019,7 @@ struct CodeProseTokenizer {
 
         size_t slot_start = open_p + 1;
         int angle_depth = 0;
+        int param_count = 0;
         for (size_t i = open_p + 1; i <= close_p; ++i) {
             const std::string& w = id_to_word[seq[i]];
             if (w == "<") ++angle_depth;
@@ -7947,15 +8053,151 @@ struct CodeProseTokenizer {
                     }
                 }
                 if (param_tok >= 0 && out_tok_to_reg.find(param_tok) == out_tok_to_reg.end()) {
-                    if (static_cast<int>(out_reg_to_tok.size()) < NUM_REGS) {
-                        int reg_id = TOK_REG_0 + static_cast<int>(out_reg_to_tok.size());
-                        out_reg_to_tok.push_back(param_tok);
+                    if (param_count < 4) {
+                        int reg_id = TOK_REG_0 + param_count;
+                        if (out_reg_to_tok.size() <= static_cast<size_t>(param_count)) {
+                            out_reg_to_tok.resize(static_cast<size_t>(param_count + 1), -1);
+                        }
+                        out_reg_to_tok[param_count] = param_tok;
                         out_tok_to_reg[param_tok] = reg_id;
+                        ++param_count;
                     }
                 }
                 slot_start = i + 1;
             }
         }
+
+        // Bind local variables declared in the function body (`int acc = 0;`, `int acc{0};`,
+        // `int acc;`, `int a = 0, b = 1;`, or Python `prod = 1`) to <reg_4> .. <reg_7>,
+        // excluding `for (...)` loop counters.
+        int local_slot = 4;
+        bool in_for_header = false;
+        int for_paren_depth = 0;
+        bool in_cpp_decl_stmt = false;
+        const int id_for = get_word_id("for");
+        for (size_t i = close_p + 1; i < seq.size() && local_slot < NUM_REGS; ++i) {
+            if (seq[i] == id_for) {
+                in_for_header = true;
+                in_cpp_decl_stmt = false;
+                for_paren_depth = 0;
+                continue;
+            }
+            if (in_for_header) {
+                if (seq[i] == id_lparen) ++for_paren_depth;
+                else if (seq[i] == id_rparen) {
+                    --for_paren_depth;
+                    if (for_paren_depth <= 0) in_for_header = false;
+                } else if (seq[i] == id_colon || seq[i] == TOK_NL) {
+                    in_for_header = false;
+                }
+                continue;
+            }
+            if (seq[i] == id_semi || seq[i] == TOK_NL) {
+                in_cpp_decl_stmt = false;
+                continue;
+            }
+            int cand = seq[i];
+            if (cand < 0 || cand >= static_cast<int>(id_to_word.size())) continue;
+            const std::string& cw = id_to_word[cand];
+            if (is_type_starter(cw) && cw != "const" && cw != "static" && cw != "inline" && cw != "constexpr") {
+                in_cpp_decl_stmt = true;
+                continue;
+            }
+            if (!is_identifier_str(cw) || is_code_keyword(cw) || is_type_starter(cw)) continue;
+            if (out_tok_to_reg.find(cand) != out_tok_to_reg.end()) continue;
+
+            const int next_t = (i + 1 < seq.size()) ? seq[i + 1] : -1;
+            const int prev_t = (i >= 1) ? seq[i - 1] : -1;
+            const std::string& prev_w = (prev_t >= 0 && prev_t < static_cast<int>(id_to_word.size())) ? id_to_word[prev_t] : "";
+
+            bool is_typed_cpp_decl = in_cpp_decl_stmt &&
+                (is_type_starter(prev_w) || prev_w == "*" || prev_w == "&" || prev_t == id_comma) &&
+                (next_t == id_assign || next_t == id_lbrace || next_t == id_semi || next_t == id_comma);
+            bool is_untyped_assign = (next_t == id_assign) &&
+                (is_ind_token(prev_t) || prev_t == TOK_NL || is_type_starter(prev_w) || prev_w == "*" || prev_w == "&");
+
+            if (is_typed_cpp_decl || is_untyped_assign) {
+                if (out_reg_to_tok.size() <= static_cast<size_t>(local_slot)) {
+                    out_reg_to_tok.resize(static_cast<size_t>(local_slot + 1), -1);
+                }
+                out_reg_to_tok[local_slot] = cand;
+                out_tok_to_reg[cand] = TOK_REG_0 + local_slot;
+                ++local_slot;
+            }
+        }
+    }
+
+    // Normalize C++ uniform initialization (`int <reg_4> { 0 } ;`, `int <reg_4> { <reg_0> [ 0 ] } ;`)
+    // and default-uninitialized local declarations (`int <reg_4> ;`) in the register projection stream
+    // into `int <reg_4> = <expr> ;` so they match the canonical `reg_horizon_tables` suffix.
+    std::vector<int> project_and_canonicalize_reg_seq(
+        const std::vector<int>& seq,
+        const std::unordered_map<int, int>& tok_to_reg
+    ) const {
+        const int id_lbrace = get_word_id("{");
+        const int id_rbrace = get_word_id("}");
+        const int id_assign = get_word_id("=");
+        const int id_semi   = get_word_id(";");
+        const int id_comma  = get_word_id(",");
+        const int id_zero   = get_word_id("0");
+
+        std::vector<int> raw_r(seq.size());
+        for (size_t i = 0; i < seq.size(); ++i) {
+            auto it = tok_to_reg.find(seq[i]);
+            raw_r[i] = (it != tok_to_reg.end()) ? it->second : seq[i];
+        }
+        if (id_assign < 0 || id_semi < 0) return raw_r;
+
+        std::vector<int> out;
+        out.reserve(raw_r.size() + 4);
+        for (size_t i = 0; i < raw_r.size(); ++i) {
+            int rt = raw_r[i];
+            out.push_back(rt);
+            if (rt >= TOK_REG_0 + 4 && rt < TOK_REG_0 + NUM_REGS && i >= 1) {
+                int prev = raw_r[i - 1];
+                const std::string& pw = (prev >= 0 && prev < static_cast<int>(id_to_word.size())) ? id_to_word[prev] : "";
+                if (is_type_starter(pw) || pw == "*" || pw == "&" || prev == id_comma) {
+                    // Pattern 1 & 2: `<type_or_comma> <reg_k> { <expr...> } [;|,]` -> `<type_or_comma> <reg_k> = <expr...|0> [;|,]`
+                    if (id_lbrace >= 0 && id_rbrace >= 0 && i + 2 < raw_r.size() && raw_r[i + 1] == id_lbrace) {
+                        size_t close_b = i + 2;
+                        int depth = 1;
+                        while (close_b < raw_r.size() && (close_b - (i + 1)) <= 16) {
+                            if (raw_r[close_b] == id_semi || raw_r[close_b] == TOK_NL) break;
+                            if (raw_r[close_b] == id_lbrace) ++depth;
+                            else if (raw_r[close_b] == id_rbrace) {
+                                --depth;
+                                if (depth == 0) break;
+                            }
+                            ++close_b;
+                        }
+                        if (depth == 0 && close_b + 1 < raw_r.size() &&
+                            (raw_r[close_b + 1] == id_semi || raw_r[close_b + 1] == id_comma)) {
+                            out.push_back(id_assign);
+                            if (close_b == i + 2) {
+                                if (id_zero >= 0) out.push_back(id_zero);
+                            } else {
+                                for (size_t k = i + 2; k < close_b; ++k) {
+                                    out.push_back(raw_r[k]);
+                                }
+                            }
+                            out.push_back(raw_r[close_b + 1]);
+                            i = close_b + 1;
+                            continue;
+                        }
+                    }
+                    // Pattern 3: `<type_or_comma> <reg_k> [;|,]` -> `<type_or_comma> <reg_k> = 0 [;|,]`
+                    if (id_zero >= 0 && i + 1 < raw_r.size() &&
+                        (raw_r[i + 1] == id_semi || raw_r[i + 1] == id_comma)) {
+                        out.push_back(id_assign);
+                        out.push_back(id_zero);
+                        out.push_back(raw_r[i + 1]);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        return out;
     }
 
     std::string decode_tokens(const std::vector<int>& tids) const {
@@ -8065,12 +8307,12 @@ struct CodeProseTokenizer {
 };
 
 struct PopCountGenerativeLLM {
-    static constexpr int MAX_HORIZON = 24;
+    static constexpr int MAX_HORIZON = 32;
     static constexpr int MAX_ROLE_HORIZON = 6;
     static constexpr int SHORTLIST_CAP = 48;
 
     // 4-byte bitfield-compressed NextTokenEntry (50% RAM reduction vs 8-byte struct,
-    // fitting 16 entries per 64-byte L1 cache line across all 54 horizon tables).
+    // fitting 16 entries per 64-byte L1 cache line across all horizon tables).
     struct NextTokenEntry {
         int32_t tok : 20;
         uint32_t count : 12;
@@ -8080,6 +8322,10 @@ struct PopCountGenerativeLLM {
     struct SegmentTopicRecord {
         uint64_t topic_sketch[hsaa_assoc::kW];
         std::vector<int> tokens;
+        std::vector<int> unique_content_tokens;
+        std::vector<int> scope_reg_to_tok;
+        std::vector<int> reg_tokens;
+        int func_name_tok = -1;
     };
 
     CodeProseTokenizer tokenizer;
@@ -8094,12 +8340,79 @@ struct PopCountGenerativeLLM {
     std::vector<NextTokenEntry> top_unigrams;
 
     std::vector<std::array<uint64_t, hsaa_assoc::kW>> token_topic_sketch;
+    std::vector<std::array<uint64_t, hsaa_assoc::kW>> vocab_morph_sketch;
     std::vector<SegmentTopicRecord> segment_records;
 
     std::string last_trained_corpus;
     int last_trained_epochs = 0;
     BrainTrainStats last_stats{};
     bool is_trained = false;
+
+    static std::vector<std::string> split_identifier_subwords(const std::string& ident) {
+        std::vector<std::string> parts;
+        std::string cur;
+        for (size_t i = 0; i < ident.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(ident[i]);
+            if (c == '_') {
+                if (!cur.empty()) {
+                    parts.push_back(cur);
+                    cur.clear();
+                }
+                continue;
+            }
+            if (i > 0 && std::isupper(c) && std::islower(static_cast<unsigned char>(ident[i - 1]))) {
+                if (!cur.empty()) {
+                    parts.push_back(cur);
+                    cur.clear();
+                }
+            }
+            cur.push_back(static_cast<char>(std::tolower(c)));
+        }
+        if (!cur.empty()) parts.push_back(cur);
+        return parts;
+    }
+
+    static int64_t identifier_similarity_score(const std::string& a, const std::string& b) {
+        if (a.empty() || b.empty()) return 0;
+        if (a == b) return 4096LL;
+        static const std::unordered_set<std::string> generic_parts = {
+            "array", "arr", "list", "vec", "vector", "data", "buf", "buffer",
+            "val", "value", "values", "elem", "elements", "item", "items",
+            "func", "fn", "iter", "impl", "helper", "calc", "compute", "find", "get"
+        };
+        auto pa = split_identifier_subwords(a);
+        auto pb = split_identifier_subwords(b);
+        int64_t score = 0;
+        for (const auto& sa : pa) {
+            if (sa.size() < 2) continue;
+            for (const auto& sb : pb) {
+                if (sb.size() < 2) continue;
+                if (sa == sb) {
+                    score += (generic_parts.find(sa) == generic_parts.end()) ? 3072LL : 384LL;
+                } else if (sa.size() >= 3 && sb.size() >= 3) {
+                    if (sa.find(sb) != std::string::npos || sb.find(sa) != std::string::npos) {
+                        score += 1536LL;
+                    } else {
+                        uint64_t ska[hsaa_assoc::kW], skb[hsaa_assoc::kW];
+                        hsaa_assoc::sketch(sa, ska);
+                        hsaa_assoc::sketch(sb, skb);
+                        int32_t d = hsaa_assoc::dot512(ska, skb);
+                        if (d >= 240) score += static_cast<int64_t>(d) * 3LL;
+                    }
+                }
+            }
+        }
+        std::string na = hsaa_assoc::normalize(a.c_str());
+        std::string nb = hsaa_assoc::normalize(b.c_str());
+        if (na.size() >= 3 && nb.size() >= 3) {
+            uint64_t fska[hsaa_assoc::kW], fskb[hsaa_assoc::kW];
+            hsaa_assoc::sketch(na, fska);
+            hsaa_assoc::sketch(nb, fskb);
+            int32_t fd = hsaa_assoc::dot512(fska, fskb);
+            if (fd >= 210) score += static_cast<int64_t>(fd) * 2LL;
+        }
+        return score;
+    }
 
     static int count_bucket(uint32_t c) {
         if (c == 0) return 0;
@@ -8243,6 +8556,15 @@ struct PopCountGenerativeLLM {
         };
 
         const size_t vocab_sz = tokenizer.id_to_word.size();
+        vocab_morph_sketch.assign(vocab_sz, {0, 0, 0, 0, 0, 0, 0, 0});
+        for (size_t t = 0; t < vocab_sz; ++t) {
+            std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[t].c_str());
+            if (nw.empty()) nw = tokenizer.id_to_word[t];
+            hsaa_assoc::sketch(nw, vocab_morph_sketch[t].data());
+        }
+
+        std::vector<std::vector<int>> reg_seqs;
+        reg_seqs.reserve(seqs.size());
         {
             std::vector<std::array<int32_t, 512>> tok_topic_acc(vocab_sz);
             for (auto& arr : tok_topic_acc) arr.fill(0);
@@ -8259,7 +8581,20 @@ struct PopCountGenerativeLLM {
                 SegmentTopicRecord rec;
                 compute_token_bundle_512(seq, rec.topic_sketch);
                 rec.tokens = seq;
-                segment_records.push_back(rec);
+                std::unordered_set<int> seen_content;
+                for (int st : seq) {
+                    if (st >= 0 && static_cast<size_t>(st) < vocab_sz &&
+                        is_content_token(tokenizer.id_to_word[st]) &&
+                        seen_content.insert(st).second) {
+                        rec.unique_content_tokens.push_back(st);
+                    }
+                }
+                std::unordered_map<int, int> seg_tok_to_reg;
+                tokenizer.extract_scope_registers(seq, rec.scope_reg_to_tok, seg_tok_to_reg, &rec.func_name_tok);
+                if (!rec.scope_reg_to_tok.empty()) {
+                    rec.reg_tokens = tokenizer.project_and_canonicalize_reg_seq(seq, seg_tok_to_reg);
+                    reg_seqs.push_back(rec.reg_tokens);
+                }
 
                 for (int t : seq) {
                     if (t >= 0 && static_cast<size_t>(t) < vocab_sz) {
@@ -8271,6 +8606,7 @@ struct PopCountGenerativeLLM {
                         }
                     }
                 }
+                segment_records.push_back(std::move(rec));
 
                 for (size_t pos = 1; pos < seq.size(); ++pos) {
                     const int target = seq[pos];
@@ -8362,63 +8698,45 @@ struct PopCountGenerativeLLM {
             }
         }
 
-        // Precompute scope-register sequences once so horizon construction can run in low-RAM batches
-        std::vector<std::vector<int>> reg_seqs;
-        reg_seqs.reserve(seqs.size());
-        for (const auto& seq : seqs) {
-            std::vector<int> reg_to_tok;
-            std::unordered_map<int, int> tok_to_reg;
-            tokenizer.extract_scope_registers(seq, reg_to_tok, tok_to_reg);
-            if (!reg_to_tok.empty()) {
-                std::vector<int> rseq(seq.size());
-                for (size_t i = 0; i < seq.size(); ++i) {
-                    auto it = tok_to_reg.find(seq[i]);
-                    rseq[i] = (it != tok_to_reg.end()) ? it->second : seq[i];
-                }
-                reg_seqs.push_back(std::move(rseq));
-            }
-        }
-
-        // Build horizon tables in bounded batches of 6 levels to eliminate 50-map simultaneous RAM spikes
-        for (int batch_start = 1; batch_start <= MAX_HORIZON; batch_start += 6) {
-            const int batch_end = std::min(MAX_HORIZON, batch_start + 5);
-            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h[7];
-            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg[7];
+        // Build horizon tables level by level (L = 1..MAX_HORIZON).
+        // For L >= 5, only suffixes whose (L-1)-suffix was ambiguous (size() > 1) need to be
+        // stored, since an unambiguous suffix at L-1 >= 4 already uniquely determines the successor.
+        for (int L = 1; L <= MAX_HORIZON; ++L) {
+            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h;
+            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg;
 
             for (const auto& seq : seqs) {
-                for (size_t pos = 1; pos < seq.size(); ++pos) {
-                    const int target = seq[pos];
-                    const int max_L = static_cast<int>(std::min<size_t>(batch_end, pos));
-                    for (int L = batch_start; L <= max_L; ++L) {
-                        uint64_t key = make_horizon_key(seq.data(), pos, L);
-                        raw_h[L - batch_start][key][target]++;
+                for (size_t pos = static_cast<size_t>(L); pos < seq.size(); ++pos) {
+                    if (L >= 5) {
+                        uint64_t prev_key = make_horizon_key(seq.data(), pos, L - 1);
+                        auto pit = horizon_tables[L - 1].find(prev_key);
+                        if (pit == horizon_tables[L - 1].end() || pit->second.size() <= 1) continue;
                     }
+                    uint64_t key = make_horizon_key(seq.data(), pos, L);
+                    raw_h[key][seq[pos]]++;
                 }
             }
             for (const auto& rseq : reg_seqs) {
-                for (size_t pos = 1; pos < rseq.size(); ++pos) {
-                    const int rtarget = rseq[pos];
-                    const int max_L = static_cast<int>(std::min<size_t>(batch_end, pos));
-                    for (int L = batch_start; L <= max_L; ++L) {
-                        uint64_t rkey = make_horizon_key(rseq.data(), pos, L);
-                        raw_reg[L - batch_start][rkey][rtarget]++;
+                for (size_t pos = static_cast<size_t>(L); pos < rseq.size(); ++pos) {
+                    if (L >= 5) {
+                        uint64_t prev_rkey = make_horizon_key(rseq.data(), pos, L - 1);
+                        auto prit = reg_horizon_tables[L - 1].find(prev_rkey);
+                        if (prit == reg_horizon_tables[L - 1].end() || prit->second.size() <= 1) continue;
                     }
+                    uint64_t rkey = make_horizon_key(rseq.data(), pos, L);
+                    raw_reg[rkey][rseq[pos]]++;
                 }
             }
 
-            for (int L = batch_start; L <= batch_end; ++L) {
-                auto& rh = raw_h[L - batch_start];
-                horizon_tables[L].reserve(rh.size());
-                for (auto it = rh.begin(); it != rh.end(); ) {
-                    horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
-                    it = rh.erase(it);
-                }
-                auto& rr = raw_reg[L - batch_start];
-                reg_horizon_tables[L].reserve(rr.size());
-                for (auto it = rr.begin(); it != rr.end(); ) {
-                    reg_horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
-                    it = rr.erase(it);
-                }
+            horizon_tables[L].reserve(raw_h.size());
+            for (auto it = raw_h.begin(); it != raw_h.end(); ) {
+                horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                it = raw_h.erase(it);
+            }
+            reg_horizon_tables[L].reserve(raw_reg.size());
+            for (auto it = raw_reg.begin(); it != raw_reg.end(); ) {
+                reg_horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                it = raw_reg.erase(it);
             }
         }
         reg_seqs.clear();
@@ -8464,10 +8782,7 @@ struct PopCountGenerativeLLM {
             int net_vocab = static_cast<int>(std::max<size_t>(128, tokenizer.id_to_word.size() + 64));
             sublinear_net = std::make_unique<NativeSublinearLLM>(lbank, net_vocab, 4, false, 2026);
             for (size_t tid = 0; tid < tokenizer.id_to_word.size(); ++tid) {
-                std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[tid].c_str());
-                if (nw.empty()) nw = tokenizer.id_to_word[tid];
-                uint64_t sk[hsaa_assoc::kW];
-                hsaa_assoc::sketch(nw, sk);
+                const uint64_t* sk = vocab_morph_sketch[tid].data();
                 for (int w = 0; w < WORDS_PER_VEC; ++w) {
                     sublinear_net->vocab_pos[tid * WORDS_PER_VEC + w] = sk[w];
                     sublinear_net->vocab_neg[tid * WORDS_PER_VEC + w] = ~sk[w];
@@ -8563,7 +8878,7 @@ struct PopCountGenerativeLLM {
                                 &sublinear_net->vocab_neg[static_cast<size_t>(kv.first) * WORDS_PER_VEC],
                                 sb, mp
                             );
-                            kv.second += static_cast<int64_t>(ste_dot) / 32LL;
+                            kv.second += static_cast<int64_t>(ste_dot) * 4LL;
                         }
                     }
                 }
@@ -8611,16 +8926,356 @@ struct PopCountGenerativeLLM {
     }
 
     void ensure_token_capacity(int tok_id) {
-        if (static_cast<size_t>(tok_id) >= token_topic_sketch.size()) {
-            std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[tok_id].c_str());
-            if (nw.empty()) nw = tokenizer.id_to_word[tok_id];
+        if (tok_id < 0) return;
+        const size_t target_sz = tokenizer.id_to_word.size();
+        while (vocab_morph_sketch.size() < target_sz) {
+            size_t idx = vocab_morph_sketch.size();
+            std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[idx].c_str());
+            if (nw.empty()) nw = tokenizer.id_to_word[idx];
             std::array<uint64_t, hsaa_assoc::kW> sk{};
             hsaa_assoc::sketch(nw, sk.data());
-            token_topic_sketch.resize(tokenizer.id_to_word.size(), sk);
+            vocab_morph_sketch.push_back(sk);
         }
-        while (tok_to_role.size() < tokenizer.id_to_word.size()) {
+        while (token_topic_sketch.size() < target_sz) {
+            size_t idx = token_topic_sketch.size();
+            token_topic_sketch.push_back(vocab_morph_sketch[idx]);
+        }
+        while (tok_to_role.size() < target_sz) {
             tok_to_role.push_back(static_cast<int>(tok_to_role.size()));
         }
+        if (sublinear_net && static_cast<size_t>(tok_id) >= static_cast<size_t>(sublinear_net->vocab_size)) {
+            const int old_v = sublinear_net->vocab_size;
+            const int new_v = static_cast<int>(std::max<size_t>(target_sz + 32, static_cast<size_t>(old_v + 64)));
+            sublinear_net->vocab_pos.resize(static_cast<size_t>(new_v) * WORDS_PER_VEC, 0ULL);
+            sublinear_net->vocab_neg.resize(static_cast<size_t>(new_v) * WORDS_PER_VEC, ~0ULL);
+            sublinear_net->embeddings.resize(static_cast<size_t>(new_v) * D_MODEL, -12);
+            for (int tid = old_v; tid < static_cast<int>(target_sz); ++tid) {
+                const uint64_t* sk = vocab_morph_sketch[tid].data();
+                for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                    sublinear_net->vocab_pos[static_cast<size_t>(tid) * WORDS_PER_VEC + w] = sk[w];
+                    sublinear_net->vocab_neg[static_cast<size_t>(tid) * WORDS_PER_VEC + w] = ~sk[w];
+                    for (int b = 0; b < 64; ++b) {
+                        sublinear_net->embeddings[static_cast<size_t>(tid) * D_MODEL + w * 64 + b] =
+                            ((sk[w] >> b) & 1ULL) ? 12 : -12;
+                    }
+                }
+            }
+            sublinear_net->vocab_size = new_v;
+        }
+    }
+
+    static constexpr uint64_t COMPILED_LLM_MAGIC = 0x50434C4C4D424932ULL; // "PCLLMBI2"
+
+    std::string serialize_compiled_model() const {
+        NativeSublinearLLM::StateBlob b;
+        b.u64(COMPILED_LLM_MAGIC);
+        b.u32(static_cast<uint32_t>(last_trained_epochs));
+        b.raw(&last_stats, sizeof(BrainTrainStats));
+
+        const uint32_t vocab_sz = static_cast<uint32_t>(tokenizer.id_to_word.size());
+        b.u32(vocab_sz);
+        for (const std::string& w : tokenizer.id_to_word) {
+            b.str(w);
+        }
+
+        b.u32(static_cast<uint32_t>(tok_to_role.size()));
+        if (!tok_to_role.empty()) {
+            b.raw(tok_to_role.data(), tok_to_role.size() * sizeof(int));
+        }
+
+        b.u32(static_cast<uint32_t>(top_unigrams.size()));
+        if (!top_unigrams.empty()) {
+            b.raw(top_unigrams.data(), top_unigrams.size() * sizeof(NextTokenEntry));
+        }
+
+        b.u32(static_cast<uint32_t>(token_topic_sketch.size()));
+        if (!token_topic_sketch.empty()) {
+            b.raw(token_topic_sketch.data(), token_topic_sketch.size() * sizeof(std::array<uint64_t, hsaa_assoc::kW>));
+        }
+
+        b.u32(static_cast<uint32_t>(vocab_morph_sketch.size()));
+        if (!vocab_morph_sketch.empty()) {
+            b.raw(vocab_morph_sketch.data(), vocab_morph_sketch.size() * sizeof(std::array<uint64_t, hsaa_assoc::kW>));
+        }
+
+        b.u32(static_cast<uint32_t>(segment_records.size()));
+        for (const auto& rec : segment_records) {
+            b.raw(rec.topic_sketch, sizeof(rec.topic_sketch));
+            b.u32(static_cast<uint32_t>(rec.func_name_tok));
+            auto write_ivec = [&b](const std::vector<int>& v) {
+                b.u32(static_cast<uint32_t>(v.size()));
+                if (!v.empty()) b.raw(v.data(), v.size() * sizeof(int));
+            };
+            write_ivec(rec.tokens);
+            write_ivec(rec.unique_content_tokens);
+            write_ivec(rec.scope_reg_to_tok);
+            write_ivec(rec.reg_tokens);
+        }
+
+        auto write_htable = [&b](const std::unordered_map<uint64_t, std::vector<NextTokenEntry>>& tbl) {
+            b.u32(static_cast<uint32_t>(tbl.size()));
+            for (const auto& kv : tbl) {
+                b.u64(kv.first);
+                b.u32(static_cast<uint32_t>(kv.second.size()));
+                if (!kv.second.empty()) {
+                    b.raw(kv.second.data(), kv.second.size() * sizeof(NextTokenEntry));
+                }
+            }
+        };
+
+        for (int L = 1; L <= MAX_HORIZON; ++L) write_htable(horizon_tables[L]);
+        for (int L = 1; L <= MAX_HORIZON; ++L) write_htable(reg_horizon_tables[L]);
+        for (int L = 1; L <= MAX_ROLE_HORIZON; ++L) write_htable(role_horizon_tables[L]);
+
+        b.u32(static_cast<uint32_t>(skip_table.size()));
+        for (const auto& kv : skip_table) {
+            b.u32(static_cast<uint32_t>(kv.first));
+            b.u32(static_cast<uint32_t>(kv.second.size()));
+            if (!kv.second.empty()) {
+                b.raw(kv.second.data(), kv.second.size() * sizeof(NextTokenEntry));
+            }
+        }
+
+        if (sublinear_net && sublinear_net->bank && sublinear_net->bank->base_ptr) {
+            b.u32(static_cast<uint32_t>(sublinear_net->vocab_size));
+            b.u32(static_cast<uint32_t>(sublinear_net->vocab_pos.size()));
+            if (!sublinear_net->vocab_pos.empty()) {
+                b.raw(sublinear_net->vocab_pos.data(), sublinear_net->vocab_pos.size() * sizeof(uint64_t));
+            }
+            b.raw(sublinear_net->wc_pos, sizeof(sublinear_net->wc_pos));
+            b.raw(sublinear_net->wc_neg, sizeof(sublinear_net->wc_neg));
+            b.raw(sublinear_net->wf_pos, sizeof(sublinear_net->wf_pos));
+            b.raw(sublinear_net->wf_neg, sizeof(sublinear_net->wf_neg));
+            b.raw(sublinear_net->keys_sub1, sizeof(sublinear_net->keys_sub1));
+            b.raw(sublinear_net->keys_sub2, sizeof(sublinear_net->keys_sub2));
+
+            const auto* pages = static_cast<const TernaryMLPExpertPage*>(sublinear_net->bank->base_ptr);
+            struct SparseSlot {
+                uint32_t pid;
+                uint32_t r;
+            };
+            std::vector<SparseSlot> active_slots;
+            for (uint32_t pid : sublinear_net->trained_pages) {
+                if (pid >= TOTAL_EXPERTS) continue;
+                const auto& page = pages[pid];
+                for (uint32_t r_idx = 0; r_idx < D_BOTTLENECK; ++r_idx) {
+                    if ((page.w_down_pos[r_idx][0] | page.w_down_neg[r_idx][0]) != 0ULL) {
+                        active_slots.push_back({pid, r_idx});
+                    }
+                }
+            }
+            b.u32(static_cast<uint32_t>(active_slots.size()));
+            for (const auto& sl : active_slots) {
+                const auto& page = pages[sl.pid];
+                b.u32(sl.pid);
+                b.u32(sl.r);
+                b.raw(page.w_down_pos[sl.r], WORDS_PER_VEC * sizeof(uint64_t));
+                b.raw(page.w_down_neg[sl.r], WORDS_PER_VEC * sizeof(uint64_t));
+                b.raw(page.w_up_pos[sl.r],   WORDS_PER_VEC * sizeof(uint64_t));
+                b.raw(page.w_up_neg[sl.r],   WORDS_PER_VEC * sizeof(uint64_t));
+            }
+        } else {
+            b.u32(0U);
+        }
+
+        return std::string(reinterpret_cast<const char*>(b.bytes.data()), b.bytes.size());
+    }
+
+    bool deserialize_compiled_model(const std::string& bank_base_path, const std::string& raw_blob) {
+        is_trained = false;
+        NativeSublinearLLM::StateReader r{
+            reinterpret_cast<const uint8_t*>(raw_blob.data()),
+            raw_blob.size(),
+            0
+        };
+        uint64_t magic = 0;
+        uint32_t ep = 0;
+        if (!r.u64(magic) || magic != COMPILED_LLM_MAGIC) return false;
+        if (!r.u32(ep)) return false;
+        last_trained_epochs = static_cast<int>(ep);
+        if (!r.raw(&last_stats, sizeof(BrainTrainStats))) return false;
+
+        uint32_t vocab_sz = 0;
+        if (!r.u32(vocab_sz) ||
+            vocab_sz < static_cast<uint32_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS) ||
+            vocab_sz > 2000000U) {
+            return false;
+        }
+        tokenizer.word_to_id.clear();
+        tokenizer.id_to_word.clear();
+        tokenizer.id_to_word.reserve(vocab_sz);
+        for (uint32_t i = 0; i < vocab_sz; ++i) {
+            std::string w;
+            if (!r.str(w)) return false;
+            tokenizer.word_to_id[w] = static_cast<int>(i);
+            tokenizer.id_to_word.push_back(std::move(w));
+        }
+
+        uint32_t role_sz = 0;
+        if (!r.u32(role_sz) || role_sz != vocab_sz) return false;
+        tok_to_role.resize(role_sz);
+        if (role_sz > 0 && !r.raw(tok_to_role.data(), role_sz * sizeof(int))) return false;
+        for (int rv : tok_to_role) {
+            if (rv < 0 || static_cast<uint32_t>(rv) >= vocab_sz) return false;
+        }
+
+        auto valid_entries = [vocab_sz](const std::vector<NextTokenEntry>& vec) -> bool {
+            for (const auto& e : vec) {
+                if (e.tok < 0 || static_cast<uint32_t>(e.tok) >= vocab_sz) return false;
+            }
+            return true;
+        };
+
+        uint32_t uni_sz = 0;
+        if (!r.u32(uni_sz) || uni_sz > vocab_sz) return false;
+        top_unigrams.resize(uni_sz);
+        if (uni_sz > 0 && !r.raw(top_unigrams.data(), uni_sz * sizeof(NextTokenEntry))) return false;
+        if (!valid_entries(top_unigrams)) return false;
+
+        uint32_t tts_sz = 0;
+        if (!r.u32(tts_sz) || tts_sz != vocab_sz) return false;
+        token_topic_sketch.resize(tts_sz);
+        if (tts_sz > 0 && !r.raw(token_topic_sketch.data(), tts_sz * sizeof(std::array<uint64_t, hsaa_assoc::kW>))) return false;
+
+        uint32_t vms_sz = 0;
+        if (!r.u32(vms_sz) || vms_sz != vocab_sz) return false;
+        vocab_morph_sketch.resize(vms_sz);
+        if (vms_sz > 0 && !r.raw(vocab_morph_sketch.data(), vms_sz * sizeof(std::array<uint64_t, hsaa_assoc::kW>))) return false;
+
+        uint32_t seg_sz = 0;
+        if (!r.u32(seg_sz) || seg_sz > 1000000U) return false;
+        segment_records.clear();
+        segment_records.resize(seg_sz);
+        auto read_ivec = [&r, vocab_sz](std::vector<int>& v, bool allow_neg) -> bool {
+            uint32_t n = 0;
+            if (!r.u32(n) || n > 5000000U) return false;
+            v.resize(n);
+            if (n > 0 && !r.raw(v.data(), n * sizeof(int))) return false;
+            for (int tid : v) {
+                if (allow_neg && tid == -1) continue;
+                if (tid < 0 || static_cast<uint32_t>(tid) >= vocab_sz) return false;
+            }
+            return true;
+        };
+        for (uint32_t i = 0; i < seg_sz; ++i) {
+            auto& rec = segment_records[i];
+            uint32_t fn_tok = 0;
+            if (!r.raw(rec.topic_sketch, sizeof(rec.topic_sketch))) return false;
+            if (!r.u32(fn_tok)) return false;
+            rec.func_name_tok = static_cast<int>(fn_tok);
+            if (rec.func_name_tok != -1 &&
+                (rec.func_name_tok < 0 || static_cast<uint32_t>(rec.func_name_tok) >= vocab_sz)) {
+                return false;
+            }
+            if (!read_ivec(rec.tokens, false) ||
+                !read_ivec(rec.unique_content_tokens, false) ||
+                !read_ivec(rec.scope_reg_to_tok, true) ||
+                !read_ivec(rec.reg_tokens, false)) {
+                return false;
+            }
+        }
+
+        auto read_htable = [&r, &valid_entries](std::unordered_map<uint64_t, std::vector<NextTokenEntry>>& tbl) -> bool {
+            uint32_t n = 0;
+            if (!r.u32(n) || n > 5000000U) return false;
+            tbl.clear();
+            tbl.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t k = 0;
+                uint32_t m = 0;
+                if (!r.u64(k) || !r.u32(m) || m > 1024U) return false;
+                std::vector<NextTokenEntry> vec(m);
+                if (m > 0 && !r.raw(vec.data(), m * sizeof(NextTokenEntry))) return false;
+                if (!valid_entries(vec)) return false;
+                tbl.emplace(k, std::move(vec));
+            }
+            return true;
+        };
+
+        for (int L = 1; L <= MAX_HORIZON; ++L) {
+            if (!read_htable(horizon_tables[L])) return false;
+        }
+        for (int L = 1; L <= MAX_HORIZON; ++L) {
+            if (!read_htable(reg_horizon_tables[L])) return false;
+        }
+        for (int L = 1; L <= MAX_ROLE_HORIZON; ++L) {
+            if (!read_htable(role_horizon_tables[L])) return false;
+        }
+
+        uint32_t skip_sz = 0;
+        if (!r.u32(skip_sz) || skip_sz > 2000000U) return false;
+        skip_table.clear();
+        skip_table.reserve(skip_sz);
+        for (uint32_t i = 0; i < skip_sz; ++i) {
+            uint32_t k = 0, m = 0;
+            if (!r.u32(k) || k >= vocab_sz || !r.u32(m) || m > 1024U) return false;
+            std::vector<NextTokenEntry> vec(m);
+            if (m > 0 && !r.raw(vec.data(), m * sizeof(NextTokenEntry))) return false;
+            if (!valid_entries(vec)) return false;
+            skip_table.emplace(static_cast<int>(k), std::move(vec));
+        }
+
+        uint32_t saved_net_vocab = 0;
+        if (!r.u32(saved_net_vocab) || saved_net_vocab > 4000000U) return false;
+        if (saved_net_vocab > 0) {
+            uint32_t vpos_sz = 0;
+            if (!r.u32(vpos_sz) || vpos_sz != saved_net_vocab * WORDS_PER_VEC) return false;
+            std::string llm_bank_path = bank_base_path + ".llm_bank";
+            const bool freshly_mapped = (!llm_bank_guard || !llm_bank_guard->get());
+            if (freshly_mapped) {
+                llm_bank_guard = std::make_unique<AutoMappedWeightBank>(llm_bank_path);
+            }
+            MappedWeightBank* lbank = llm_bank_guard->get();
+            if (!lbank || !lbank->base_ptr) return false;
+
+            sublinear_net = std::make_unique<NativeSublinearLLM>(
+                lbank, static_cast<int>(saved_net_vocab), 4, false, 2026, /*skip_init=*/true);
+            if (!r.raw(sublinear_net->vocab_pos.data(), vpos_sz * sizeof(uint64_t)) ||
+                !r.raw(sublinear_net->wc_pos, sizeof(sublinear_net->wc_pos)) ||
+                !r.raw(sublinear_net->wc_neg, sizeof(sublinear_net->wc_neg)) ||
+                !r.raw(sublinear_net->wf_pos, sizeof(sublinear_net->wf_pos)) ||
+                !r.raw(sublinear_net->wf_neg, sizeof(sublinear_net->wf_neg)) ||
+                !r.raw(sublinear_net->keys_sub1, sizeof(sublinear_net->keys_sub1)) ||
+                !r.raw(sublinear_net->keys_sub2, sizeof(sublinear_net->keys_sub2))) {
+                return false;
+            }
+            for (size_t i = 0; i < vpos_sz; ++i) {
+                uint64_t vp = sublinear_net->vocab_pos[i];
+                sublinear_net->vocab_neg[i] = ~vp;
+                int8_t* emb_row = &sublinear_net->embeddings[i * 64];
+                for (size_t b = 0; b < 64; ++b) {
+                    emb_row[b] = ((vp >> b) & 1ULL) ? 12 : -12;
+                }
+            }
+
+            uint32_t n_slots = 0;
+            if (!r.u32(n_slots) || n_slots > TOTAL_EXPERTS * D_BOTTLENECK) return false;
+            auto* pages = static_cast<TernaryMLPExpertPage*>(lbank->base_ptr);
+            std::unordered_set<uint32_t> restored_pages;
+            for (uint32_t i = 0; i < n_slots; ++i) {
+                uint32_t pid = 0, r_idx = 0;
+                if (!r.u32(pid) || !r.u32(r_idx) || pid >= TOTAL_EXPERTS || r_idx >= D_BOTTLENECK) {
+                    return false;
+                }
+                if (restored_pages.insert(pid).second) {
+                    if (!freshly_mapped) {
+                        std::memset(&pages[pid], 0, sizeof(TernaryMLPExpertPage));
+                    }
+                    sublinear_net->trained_pages.push_back(pid);
+                }
+                auto& page = pages[pid];
+                if (!r.raw(page.w_down_pos[r_idx], WORDS_PER_VEC * sizeof(uint64_t)) ||
+                    !r.raw(page.w_down_neg[r_idx], WORDS_PER_VEC * sizeof(uint64_t)) ||
+                    !r.raw(page.w_up_pos[r_idx],   WORDS_PER_VEC * sizeof(uint64_t)) ||
+                    !r.raw(page.w_up_neg[r_idx],   WORDS_PER_VEC * sizeof(uint64_t))) {
+                    return false;
+                }
+            }
+        }
+        if (r.at != r.n) return false;
+
+        is_trained = true;
+        return true;
     }
 
     int generate(
@@ -8651,8 +9306,21 @@ constexpr int32_t kAssocMinSubjectDot = 200;
 constexpr int32_t kAssocMinRelationDot = 200;
 
 void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
+    const std::string sn = hsaa_assoc::normalize(subject);
+    const std::string rn = hsaa_assoc::normalize(relation);
     for (AssocFact& f : brain->assoc_facts) {
-        if (f.subject_raw == subject && f.relation_raw == relation) {
+        const bool exact_raw = (f.subject_raw == subject && f.relation_raw == relation);
+        const bool same_norm = (!sn.empty() && !rn.empty() && f.subject_norm == sn && f.relation_norm == rn);
+        if (exact_raw || same_norm) {
+            if (!exact_raw) {
+                auto sit = brain->direct_facts.find(f.subject_raw);
+                if (sit != brain->direct_facts.end()) {
+                    sit->second.erase(f.relation_raw);
+                    if (sit->second.empty()) brain->direct_facts.erase(sit);
+                }
+                f.subject_raw = subject;
+                f.relation_raw = relation;
+            }
             f.object = object;
             return;
         }
@@ -8661,8 +9329,8 @@ void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relatio
     f.subject_raw = subject;
     f.relation_raw = relation;
     f.object = object;
-    f.subject_norm = hsaa_assoc::normalize(subject);
-    f.relation_norm = hsaa_assoc::normalize(relation);
+    f.subject_norm = sn;
+    f.relation_norm = rn;
     hsaa_assoc::sketch(f.subject_norm, f.skey);
     hsaa_assoc::sketch(f.relation_norm, f.rkey);
     brain->assoc_facts.push_back(std::move(f));
@@ -8814,6 +9482,7 @@ std::string lz77_decompress_bytes(const std::string& in) {
 }
 
 std::string hex_to_bytes(const std::string& hex) {
+    if (hex.empty() || (hex.size() & 1U) != 0U) return {};
     std::string out;
     out.reserve(hex.size() / 2);
     auto hex_val = [](char c) -> int {
@@ -8825,8 +9494,45 @@ std::string hex_to_bytes(const std::string& hex) {
     for (size_t i = 0; i + 1 < hex.size(); i += 2) {
         int hi = hex_val(hex[i]);
         int lo = hex_val(hex[i + 1]);
-        if (hi < 0 || lo < 0) break;
+        if (hi < 0 || lo < 0) return {};
         out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return out;
+}
+
+std::string escape_tsv_field(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '\\') out += "\\\\";
+        else if (c == '\t') out += "\\t";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (i == 0 && c == '#') out += "\\#";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+std::string unescape_tsv_field(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == '\\') out.push_back('\\');
+            else if (n == 't') out.push_back('\t');
+            else if (n == 'n') out.push_back('\n');
+            else if (n == 'r') out.push_back('\r');
+            else if (n == '#') out.push_back('#');
+            else {
+                out.push_back('\\');
+                out.push_back(n);
+            }
+        } else {
+            out.push_back(s[i]);
+        }
     }
     return out;
 }
@@ -8873,19 +9579,16 @@ int PopCountGenerativeLLM::generate(
     for (int t : prompt_toks) ensure_token_capacity(t);
 
     std::vector<int> ctx;
-    ctx.reserve(prompt_toks.size() + static_cast<size_t>(max_tokens) + 4);
+    ctx.reserve(prompt_toks.size() + static_cast<size_t>(max_tokens) + 16);
     ctx.push_back(CodeProseTokenizer::TOK_BOS);
     for (int t : prompt_toks) ctx.push_back(t);
 
     std::vector<int> reg_to_tok;
     std::unordered_map<int, int> tok_to_reg;
-    tokenizer.extract_scope_registers(prompt_toks, reg_to_tok, tok_to_reg);
+    int prompt_func_tok = -1;
+    tokenizer.extract_scope_registers(prompt_toks, reg_to_tok, tok_to_reg, &prompt_func_tok);
 
-    std::vector<int> reg_ctx(ctx.size());
-    for (size_t i = 0; i < ctx.size(); ++i) {
-        auto it = tok_to_reg.find(ctx[i]);
-        reg_ctx[i] = (it != tok_to_reg.end()) ? it->second : ctx[i];
-    }
+    std::vector<int> reg_ctx = tokenizer.project_and_canonicalize_reg_seq(ctx, tok_to_reg);
 
     std::vector<int> role_ctx(ctx.size());
     for (size_t i = 0; i < ctx.size(); ++i) {
@@ -8896,27 +9599,33 @@ int PopCountGenerativeLLM::generate(
     compute_token_bundle_512(prompt_toks, prompt_topic_vec);
 
     bool has_direct_prefix_match = false;
+    bool has_l2_prefix_match = false;
     if (!prompt_toks.empty()) {
         const int max_L = static_cast<int>(std::min<size_t>(MAX_HORIZON, ctx.size()));
-        for (int L = max_L; L >= 2; --L) {
-            uint64_t k = make_horizon_key(ctx.data(), ctx.size(), L);
-            auto it = horizon_tables[L].find(k);
-            if (it != horizon_tables[L].end()) {
-                for (const auto& e : it->second) {
-                    if (e.tok != CodeProseTokenizer::TOK_EOS) {
-                        has_direct_prefix_match = true;
-                        break;
+        const int max_rL = static_cast<int>(std::min<size_t>(MAX_HORIZON, reg_ctx.size()));
+        for (int L = std::max(max_L, max_rL); L >= 2; --L) {
+            if (L <= max_L) {
+                uint64_t k = make_horizon_key(ctx.data(), ctx.size(), L);
+                auto it = horizon_tables[L].find(k);
+                if (it != horizon_tables[L].end()) {
+                    for (const auto& e : it->second) {
+                        if (e.tok != CodeProseTokenizer::TOK_EOS) {
+                            has_direct_prefix_match = true;
+                            has_l2_prefix_match = true;
+                            break;
+                        }
                     }
                 }
             }
-            if (!reg_to_tok.empty() && !has_direct_prefix_match) {
+            if (!reg_to_tok.empty() && !has_direct_prefix_match && L <= max_rL) {
                 uint64_t rk = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
                 auto rit = reg_horizon_tables[L].find(rk);
                 if (rit != reg_horizon_tables[L].end() && !rit->second.empty()) {
                     has_direct_prefix_match = true;
+                    has_l2_prefix_match = true;
                 }
             }
-            if (!has_direct_prefix_match && L <= MAX_ROLE_HORIZON) {
+            if (!has_direct_prefix_match && L <= MAX_ROLE_HORIZON && L <= static_cast<int>(role_ctx.size())) {
                 const std::string& last_w = tokenizer.id_to_word[ctx.back()];
                 if (last_w != "?" && last_w != "." && last_w != "!" && last_w != ":") {
                     uint64_t role_k = make_horizon_key(role_ctx.data(), role_ctx.size(), L);
@@ -8925,6 +9634,7 @@ int PopCountGenerativeLLM::generate(
                         for (const auto& e : roit->second) {
                             if (e.tok != CodeProseTokenizer::TOK_EOS) {
                                 has_direct_prefix_match = true;
+                                has_l2_prefix_match = true;
                                 break;
                             }
                         }
@@ -8951,14 +9661,14 @@ int PopCountGenerativeLLM::generate(
         for (const auto& ft : live_facts) {
             if (ctx.back() == ft.r_toks.back() || ctx.back() == ft.s_toks.back()) {
                 has_direct_prefix_match = true;
+                has_l2_prefix_match = true;
                 break;
             }
-            const std::string last_norm = hsaa_assoc::normalize(tokenizer.id_to_word[ctx.back()].c_str());
-            uint64_t lsk[hsaa_assoc::kW];
-            hsaa_assoc::sketch(last_norm, lsk);
+            const uint64_t* lsk = vocab_morph_sketch[ctx.back()].data();
             if (hsaa_assoc::dot512(lsk, ft.assoc_ptr->rkey) >= kAssocMinRelationDot ||
                 hsaa_assoc::dot512(lsk, ft.assoc_ptr->skey) >= kAssocMinSubjectDot) {
                 has_direct_prefix_match = true;
+                has_l2_prefix_match = true;
                 break;
             }
         }
@@ -8967,18 +9677,78 @@ int PopCountGenerativeLLM::generate(
     bool topic_launched_from_bos = false;
     int active_target_segment = -1;
     if (!segment_records.empty()) {
-        std::unordered_set<int> prompt_content_set;
+        std::vector<int> prompt_content_ids;
+        std::unordered_set<int> seen_pt;
         for (int pt : prompt_toks) {
-            if (is_content_token(tokenizer.id_to_word[pt])) prompt_content_set.insert(pt);
+            const std::string& rw = tokenizer.id_to_word[pt];
+            if (is_content_token(rw) && seen_pt.insert(pt).second) {
+                prompt_content_ids.push_back(pt);
+            }
         }
+
         int64_t best_seg_score = -1000000000LL;
         for (size_t si = 0; si < segment_records.size(); ++si) {
             int32_t vdot = hsaa_assoc::dot512(prompt_topic_vec, segment_records[si].topic_sketch);
-            int shared = 0;
-            for (int st : segment_records[si].tokens) {
-                if (prompt_content_set.find(st) != prompt_content_set.end()) ++shared;
+            int64_t lex_score = 0;
+
+            // Fast O(|P| * |U_seg|) precomputed 512-bit sketch comparison (zero heap allocations in generate)
+            for (int pt : prompt_content_ids) {
+                bool exact_hit = false;
+                int32_t best_morph_dot = 0;
+                const uint64_t* psk = vocab_morph_sketch[pt].data();
+                const bool pt_long = (tokenizer.id_to_word[pt].size() >= 4);
+                for (int st : segment_records[si].unique_content_tokens) {
+                    if (st == pt) {
+                        exact_hit = true;
+                        break;
+                    }
+                    if (pt_long && st >= 0 && static_cast<size_t>(st) < vocab_morph_sketch.size() &&
+                        tokenizer.id_to_word[st].size() >= 4) {
+                        int32_t d = hsaa_assoc::dot512(psk, vocab_morph_sketch[st].data());
+                        if (d > best_morph_dot) best_morph_dot = d;
+                    }
+                }
+                if (exact_hit) {
+                    lex_score += 512LL;
+                } else if (best_morph_dot >= 240) {
+                    lex_score += static_cast<int64_t>(best_morph_dot);
+                }
             }
-            int64_t sc = static_cast<int64_t>(vdot) * 4LL + static_cast<int64_t>(shared) * 256LL;
+
+            // Function signature, subword identifier & register-body suffix disambiguation for code segments
+            if (!reg_to_tok.empty() && !segment_records[si].scope_reg_to_tok.empty()) {
+                int p_params = 0, s_params = 0;
+                for (size_t r = 0; r < std::min<size_t>(4, reg_to_tok.size()); ++r) {
+                    if (reg_to_tok[r] >= 0) ++p_params;
+                }
+                for (size_t r = 0; r < std::min<size_t>(4, segment_records[si].scope_reg_to_tok.size()); ++r) {
+                    if (segment_records[si].scope_reg_to_tok[r] >= 0) ++s_params;
+                }
+                if (p_params == s_params) lex_score += 1024LL;
+
+                if (prompt_func_tok >= 0 && segment_records[si].func_name_tok >= 0) {
+                    lex_score += identifier_similarity_score(
+                        tokenizer.id_to_word[prompt_func_tok],
+                        tokenizer.id_to_word[segment_records[si].func_name_tok]
+                    );
+                }
+                if (!reg_ctx.empty() && !segment_records[si].reg_tokens.empty()) {
+                    const auto& sreg = segment_records[si].reg_tokens;
+                    int best_reg_tail = 0;
+                    for (size_t pos = 1; pos < sreg.size(); ++pos) {
+                        if (sreg[pos] != reg_ctx.back()) continue;
+                        int m = 1;
+                        while (pos >= static_cast<size_t>(m) && reg_ctx.size() > static_cast<size_t>(m) &&
+                               sreg[pos - m] == reg_ctx[reg_ctx.size() - 1 - m]) {
+                            ++m;
+                        }
+                        if (m > best_reg_tail) best_reg_tail = m;
+                    }
+                    lex_score += static_cast<int64_t>(best_reg_tail) * 512LL;
+                }
+            }
+
+            int64_t sc = static_cast<int64_t>(vdot) * 2LL + lex_score;
             if (sc > best_seg_score) {
                 best_seg_score = sc;
                 active_target_segment = static_cast<int>(si);
@@ -8986,12 +9756,83 @@ int PopCountGenerativeLLM::generate(
         }
     }
 
-    if (!has_direct_prefix_match && active_target_segment >= 0) {
-        topic_launched_from_bos = true;
-        ctx.clear();
-        ctx.push_back(CodeProseTokenizer::TOK_BOS);
-        reg_ctx = ctx;
-        role_ctx = ctx;
+    // Backfill default local-variable register names (<reg_4..7>) from the matched code segment
+    // when the prompt only provided the function signature without local variable declarations.
+    if (!reg_to_tok.empty() && active_target_segment >= 0) {
+        const auto& seg_regs = segment_records[active_target_segment].scope_reg_to_tok;
+        if (reg_to_tok.size() < seg_regs.size()) {
+            reg_to_tok.resize(seg_regs.size(), -1);
+        }
+        for (size_t r = 4; r < seg_regs.size(); ++r) {
+            if (reg_to_tok[r] < 0 && seg_regs[r] >= 0) {
+                reg_to_tok[r] = seg_regs[r];
+                if (tok_to_reg.find(seg_regs[r]) == tok_to_reg.end()) {
+                    tok_to_reg[seg_regs[r]] = CodeProseTokenizer::TOK_REG_0 + static_cast<int>(r);
+                }
+            }
+        }
+    }
+
+    if (!has_l2_prefix_match && active_target_segment >= 0 && reg_to_tok.empty()) {
+        const auto& seg_toks = segment_records[active_target_segment].tokens;
+        bool last_in_active_seg = false;
+        if (!prompt_toks.empty()) {
+            for (int st : seg_toks) {
+                if (st == prompt_toks.back()) {
+                    last_in_active_seg = true;
+                    break;
+                }
+            }
+        }
+        if (!has_direct_prefix_match || !last_in_active_seg) {
+            bool aligned_mid_segment = false;
+            const std::string last_pw = prompt_toks.empty() ? "" : tokenizer.id_to_word[prompt_toks.back()];
+            if (!last_pw.empty() && last_pw != "?" && last_pw != "." && last_pw != "!") {
+                if (last_pw.size() >= 4) {
+                    const uint64_t* last_sk = vocab_morph_sketch[prompt_toks.back()].data();
+                    const uint64_t* prev_sk = (prompt_toks.size() >= 2 && tokenizer.id_to_word[prompt_toks[prompt_toks.size() - 2]].size() >= 4)
+                        ? vocab_morph_sketch[prompt_toks[prompt_toks.size() - 2]].data()
+                        : nullptr;
+                    int best_pos = -1;
+                    int32_t best_d = 260;
+                    for (size_t pos = 1; pos + 2 < seg_toks.size(); ++pos) {
+                        int st = seg_toks[pos];
+                        if (st < 0 || static_cast<size_t>(st) >= vocab_morph_sketch.size()) continue;
+                        if (tokenizer.id_to_word[st].size() < 4) continue;
+                        int32_t d = hsaa_assoc::dot512(last_sk, vocab_morph_sketch[st].data());
+                        if (d >= 260 && prev_sk && pos >= 2) {
+                            int pst = seg_toks[pos - 1];
+                            if (pst >= 0 && static_cast<size_t>(pst) < vocab_morph_sketch.size() &&
+                                tokenizer.id_to_word[pst].size() >= 4) {
+                                int32_t pd = hsaa_assoc::dot512(prev_sk, vocab_morph_sketch[pst].data());
+                                if (pd >= 220) d += pd / 4;
+                            }
+                        }
+                        if (d >= best_d) {
+                            best_d = d;
+                            best_pos = static_cast<int>(pos);
+                        }
+                    }
+                    if (best_pos >= 1) {
+                        aligned_mid_segment = true;
+                        has_direct_prefix_match = true;
+                        ctx.assign(seg_toks.begin(), seg_toks.begin() + best_pos + 1);
+                        reg_ctx = tokenizer.project_and_canonicalize_reg_seq(ctx, tok_to_reg);
+                        role_ctx.resize(ctx.size());
+                        for (size_t i = 0; i < ctx.size(); ++i) {
+                            role_ctx[i] = map_token_to_role(ctx[i]);
+                        }
+                    }
+                }
+            }
+            if (!aligned_mid_segment && !has_direct_prefix_match) {
+                topic_launched_from_bos = true;
+                ctx.clear();
+                ctx.push_back(CodeProseTokenizer::TOK_BOS);
+                reg_ctx = ctx;
+                role_ctx = ctx;
+            }
+        }
     }
 
     const int id_lparen = tokenizer.get_word_id("(");
@@ -9040,14 +9881,15 @@ int PopCountGenerativeLLM::generate(
 
     std::unordered_set<uint64_t> visited_9grams;
     std::vector<int> generated_toks;
-    generated_toks.reserve(static_cast<size_t>(max_tokens));
+    generated_toks.reserve(static_cast<size_t>(max_tokens + 12));
 
     uint64_t rng_state = 0x853C49E6748FEA9BULL;
     for (int pt : prompt_toks) {
         rng_state ^= static_cast<uint64_t>(pt) + 0x9E3779B97F4A7C15ULL + (rng_state << 6) + (rng_state >> 2);
     }
 
-    for (int step = 0; step < max_tokens; ++step) {
+    const int hard_step_limit = max_tokens + ((saw_open_brace && !is_python_func && max_tokens >= 32) ? 12 : 0);
+    for (int step = 0; step < max_tokens || (saw_open_brace && !delim_stack.empty() && step < hard_step_limit); ++step) {
         std::unordered_map<int, int64_t> cand_scores;
         std::unordered_map<int, int> cand_max_L;
 
@@ -9061,6 +9903,7 @@ int PopCountGenerativeLLM::generate(
 
         if (!reg_to_tok.empty()) {
             const int max_rL = static_cast<int>(std::min<size_t>(MAX_HORIZON, reg_ctx.size()));
+            int highest_reg_L = 0;
             for (int L = max_rL; L >= 1; --L) {
                 uint64_t rkey = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
                 auto rit = reg_horizon_tables[L].find(rkey);
@@ -9071,9 +9914,10 @@ int PopCountGenerativeLLM::generate(
                         int actual_tok = e.tok;
                         if (CodeProseTokenizer::is_reg_token(e.tok)) {
                             int r_idx = e.tok - CodeProseTokenizer::TOK_REG_0;
-                            if (r_idx < 0 || r_idx >= static_cast<int>(reg_to_tok.size())) continue;
+                            if (r_idx < 0 || r_idx >= static_cast<int>(reg_to_tok.size()) || reg_to_tok[r_idx] < 0) continue;
                             actual_tok = reg_to_tok[r_idx];
                         }
+                        if (L > highest_reg_L) highest_reg_L = L;
                         int b = count_bucket(e.count);
                         int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, r_sum_c));
                         if (cand_max_L.find(actual_tok) == cand_max_L.end()) {
@@ -9083,6 +9927,30 @@ int PopCountGenerativeLLM::generate(
                             cand_scores[actual_tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
                         }
                     }
+                }
+            }
+            // Disambiguate same-arity functions sharing identical `<reg_0..7>` prefixes by
+            // applying a bounded tie-breaker (`match_L * 1024LL`, strictly < 1 horizon step 65536LL)
+            // only when `active_target_segment.reg_tokens` matches at least `highest_reg_L`:
+            if (active_target_segment >= 0 && !segment_records[active_target_segment].reg_tokens.empty()) {
+                const auto& sreg = segment_records[active_target_segment].reg_tokens;
+                for (size_t pos = 1; pos + 1 < sreg.size(); ++pos) {
+                    if (sreg[pos] != reg_ctx.back()) continue;
+                    int match_L = 1;
+                    while (match_L < max_rL && pos >= static_cast<size_t>(match_L) &&
+                           reg_ctx.size() > static_cast<size_t>(match_L) &&
+                           sreg[pos - match_L] == reg_ctx[reg_ctx.size() - 1 - match_L]) {
+                        ++match_L;
+                    }
+                    if (match_L < highest_reg_L) continue;
+                    int next_rt = sreg[pos + 1];
+                    int actual_tok = next_rt;
+                    if (CodeProseTokenizer::is_reg_token(next_rt)) {
+                        int r_idx = next_rt - CodeProseTokenizer::TOK_REG_0;
+                        if (r_idx < 0 || r_idx >= static_cast<int>(reg_to_tok.size()) || reg_to_tok[r_idx] < 0) continue;
+                        actual_tok = reg_to_tok[r_idx];
+                    }
+                    cand_scores[actual_tok] += static_cast<int64_t>(match_L) * 1024LL;
                 }
             }
         }
@@ -9107,6 +9975,30 @@ int PopCountGenerativeLLM::generate(
                             cand_scores[e.tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
                         }
                     }
+                }
+            }
+            // Contextual window disambiguation inside active_target_segment when only a 1-gram
+            // (such as a preposition "на" or "через" after a skipped word) matched at L=1:
+            if (highest_exact_L == 1 && active_target_segment >= 0 && ctx.size() >= 3) {
+                const auto& seg_toks = segment_records[active_target_segment].tokens;
+                const int last_t = ctx.back();
+                for (size_t pos = 1; pos + 1 < seg_toks.size(); ++pos) {
+                    if (seg_toks[pos] != last_t) continue;
+                    int next_t = seg_toks[pos + 1];
+                    if (next_t == CodeProseTokenizer::TOK_EOS) continue;
+                    int shared_win = 0;
+                    size_t c_start = (ctx.size() > 6) ? (ctx.size() - 6) : 1;
+                    size_t s_start = (pos > 6) ? (pos - 6) : 1;
+                    for (size_t ci = c_start; ci + 1 < ctx.size(); ++ci) {
+                        if (!is_content_token(tokenizer.id_to_word[ctx[ci]])) continue;
+                        for (size_t si = s_start; si < pos; ++si) {
+                            if (seg_toks[si] == ctx[ci]) {
+                                ++shared_win;
+                                break;
+                            }
+                        }
+                    }
+                    cand_scores[next_t] += 16384LL + static_cast<int64_t>(shared_win) * 16384LL;
                 }
             }
             // Compositional role-cluster backoff when exact multi-word horizon misses:
@@ -9155,14 +10047,10 @@ int PopCountGenerativeLLM::generate(
                     subj_in_ctx = true;
                     break;
                 }
-                std::string wn = hsaa_assoc::normalize(tokenizer.id_to_word[ctx[i]].c_str());
-                if (!wn.empty()) {
-                    uint64_t wsk[hsaa_assoc::kW];
-                    hsaa_assoc::sketch(wn, wsk);
-                    if (hsaa_assoc::dot512(wsk, ft.assoc_ptr->skey) >= kAssocMinSubjectDot) {
-                        subj_in_ctx = true;
-                        break;
-                    }
+                const uint64_t* wsk = vocab_morph_sketch[ctx[i]].data();
+                if (hsaa_assoc::dot512(wsk, ft.assoc_ptr->skey) >= kAssocMinSubjectDot) {
+                    subj_in_ctx = true;
+                    break;
                 }
             }
             if (!subj_in_ctx) continue;
@@ -9213,9 +10101,7 @@ int PopCountGenerativeLLM::generate(
                 if (exact_rel) rel_at_tail = true;
             }
             if (!rel_at_tail && ctx.size() >= 2) {
-                std::string tail1 = hsaa_assoc::normalize(tokenizer.id_to_word[ctx.back()].c_str());
-                uint64_t t1sk[hsaa_assoc::kW];
-                hsaa_assoc::sketch(tail1, t1sk);
+                const uint64_t* t1sk = vocab_morph_sketch[ctx.back()].data();
                 if (hsaa_assoc::dot512(t1sk, ft.assoc_ptr->rkey) >= 300) {
                     rel_at_tail = true;
                 } else if (ctx.size() >= 3) {
@@ -9282,10 +10168,38 @@ int PopCountGenerativeLLM::generate(
         }
 
         const int prev_tok = ctx.back();
-        const std::string& prev_w = tokenizer.id_to_word[prev_tok];
+        const std::string& prev_w = (prev_tok >= 0 && static_cast<size_t>(prev_tok) < tokenizer.id_to_word.size())
+            ? tokenizer.id_to_word[prev_tok] : "";
 
         if (saw_open_brace && delim_stack.empty() && prev_tok == id_rbrace) {
             break;
+        }
+        // Clean sentence-boundary stopping near max_tokens limit: measure the length of the
+        // upcoming sentence in active_target_segment (defaulting to 16 tokens) so prose never
+        // starts a new sentence that cannot finish within the remaining max_tokens budget.
+        if (!saw_open_brace && !is_python_func && delim_stack.empty() &&
+            step >= 1 && (prev_w == "." || prev_w == "!" || prev_w == "?")) {
+            int needed_for_next_sent = 16;
+            if (active_target_segment >= 0 && ctx.size() >= 2) {
+                const auto& seg_toks = segment_records[active_target_segment].tokens;
+                int prev2 = ctx[ctx.size() - 2];
+                for (size_t pos = 1; pos + 1 < seg_toks.size(); ++pos) {
+                    if (seg_toks[pos] == prev_tok && seg_toks[pos - 1] == prev2) {
+                        int count_to_end = 0;
+                        for (size_t k = pos + 1; k < seg_toks.size(); ++k) {
+                            if (seg_toks[k] == CodeProseTokenizer::TOK_EOS) break;
+                            ++count_to_end;
+                            const std::string& kw = tokenizer.id_to_word[seg_toks[k]];
+                            if (kw == "." || kw == "!" || kw == "?") break;
+                        }
+                        if (count_to_end > 0) needed_for_next_sent = count_to_end;
+                        break;
+                    }
+                }
+            }
+            if ((max_tokens - step) < needed_for_next_sent) {
+                break;
+            }
         }
 
         for (auto& kv : cand_scores) {
@@ -9298,13 +10212,37 @@ int PopCountGenerativeLLM::generate(
                 continue;
             }
 
+            const std::string& cand_w = (cand >= 0 && static_cast<size_t>(cand) < tokenizer.id_to_word.size())
+                ? tokenizer.id_to_word[cand] : "";
+
+            // Strict C++ vs Python syntax isolation guard
+            if (saw_open_brace && !is_python_func) {
+                if (cand_w == "def" || cand_w == "elif" || cand_w == "None" ||
+                    cand_w == "True" || cand_w == "False" ||
+                    (cand_w == ":" && prev_w != "case" && prev_w != "default" &&
+                     prev_w != "public" && prev_w != "private" && prev_w != "protected")) {
+                    sc = -1000000000LL;
+                    continue;
+                }
+            } else if (is_python_func && !saw_open_brace) {
+                if (cand == id_lbrace || cand == id_rbrace || cand_w == ";" ||
+                    cand_w == "++" || cand_w == "--" || cand_w == "nullptr") {
+                    sc = -1000000000LL;
+                    continue;
+                }
+            }
+
             if (has_ste_out && cand >= 0 && cand < sublinear_net->vocab_size) {
                 int32_t ste_dot = ternary_popcnt_dot_512(
                     &sublinear_net->vocab_pos[static_cast<size_t>(cand) * WORDS_PER_VEC],
                     &sublinear_net->vocab_neg[static_cast<size_t>(cand) * WORDS_PER_VEC],
                     sb, mp
                 );
-                sc += static_cast<int64_t>(ste_dot) / 4LL;
+                auto ml_it = cand_max_L.find(cand);
+                int seen_L = (ml_it != cand_max_L.end()) ? ml_it->second : 0;
+                // Give the 512-bit STE neural bitplanes substantial voting weight on low-order
+                // backoff (L <= 1) so recurrent state drives disambiguation instead of acting as a 0.006% tie-breaker.
+                sc += (seen_L <= 1) ? (static_cast<int64_t>(ste_dot) * 8LL) : (static_cast<int64_t>(ste_dot) / 2LL);
             }
 
             if (cand >= 0 && static_cast<size_t>(cand) < token_topic_sketch.size()) {
@@ -9421,14 +10359,16 @@ int PopCountGenerativeLLM::generate(
         }
     }
 
-    while (!delim_stack.empty()) {
-        char op = delim_stack.back();
-        delim_stack.pop_back();
-        if (op == '(' && id_rparen >= 0) generated_toks.push_back(id_rparen);
-        else if (op == '[' && id_rbrack >= 0) generated_toks.push_back(id_rbrack);
-        else if (op == '{' && id_rbrace >= 0) {
-            generated_toks.push_back(CodeProseTokenizer::TOK_NL);
-            generated_toks.push_back(id_rbrace);
+    if (!generated_toks.empty()) {
+        while (!delim_stack.empty()) {
+            char op = delim_stack.back();
+            delim_stack.pop_back();
+            if (op == '(' && id_rparen >= 0) generated_toks.push_back(id_rparen);
+            else if (op == '[' && id_rbrack >= 0) generated_toks.push_back(id_rbrack);
+            else if (op == '{' && id_rbrace >= 0) {
+                generated_toks.push_back(CodeProseTokenizer::TOK_NL);
+                generated_toks.push_back(id_rbrace);
+            }
         }
     }
 
@@ -9483,13 +10423,13 @@ POPCNT_BRAIN_API void brain_destroy(PopCountBrain* brain) {
 POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
-    brain->direct_facts[subject][relation] = object;
-    brain->active_rules++;
     assoc_upsert(brain, subject, relation, object);
+    brain->direct_facts[subject][relation] = object;
+    brain->active_rules = brain->assoc_facts.size();
 
     if (brain->engine) {
         std::string stmt = std::string(subject) + " " + relation + " " + object + " .";
-        brain->engine->chat_and_reason_native(stmt);
+        brain->engine->store_declarative_statement_fast(stmt);
     }
     return 1;
 }
@@ -9562,18 +10502,26 @@ POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, wpath.data(), L"w") != 0 || !fp) return 0;
 #else
+    std::filesystem::path fpath = std::filesystem::u8path(filepath);
+    if (fpath.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(fpath.parent_path(), ec);
+    }
     FILE* fp = fopen(filepath, "w");
     if (!fp) return 0;
 #endif
     for (const auto& sit : brain->direct_facts) {
+        std::string esc_sub = escape_tsv_field(sit.first);
         for (const auto& rit : sit.second) {
-            fprintf(fp, "%s\t%s\t%s\n", sit.first.c_str(), rit.first.c_str(), rit.second.c_str());
+            std::string esc_rel = escape_tsv_field(rit.first);
+            std::string esc_obj = escape_tsv_field(rit.second);
+            fprintf(fp, "%s\t%s\t%s\n", esc_sub.c_str(), esc_rel.c_str(), esc_obj.c_str());
         }
     }
-    if (brain->llm_engine && brain->llm_engine->is_trained && !brain->llm_engine->last_trained_corpus.empty()) {
-        std::string compressed = lz77_compress_bytes(brain->llm_engine->last_trained_corpus);
-        std::string hex_corpus = bytes_to_hex(compressed);
-        fprintf(fp, "#__POPCNT_LLM_LZ1__ %d %s\n", brain->llm_engine->last_trained_epochs, hex_corpus.c_str());
+    if (brain->llm_engine && brain->llm_engine->is_trained) {
+        std::string compiled_blob = brain->llm_engine->serialize_compiled_model();
+        std::string hex_blob = bytes_to_hex(compiled_blob);
+        fprintf(fp, "#__POPCNT_LLM_BIN2__ %s\n", hex_blob.c_str());
     }
     fclose(fp);
     return 1;
@@ -9593,29 +10541,42 @@ POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath
 #endif
     if (!ifs) return 0;
 
+    brain->direct_facts.clear();
+    brain->assoc_facts.clear();
+    brain->active_rules = 0;
+
     std::string line;
     while (std::getline(ifs, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("#__POPCNT_LLM_BIN2__ ", 0) == 0) {
+            std::string blob = hex_to_bytes(line.substr(21));
+            if (blob.empty()) return 0;
+            if (!brain->llm_engine) {
+                brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+            }
+            if (!brain->llm_engine->deserialize_compiled_model(brain->bank_path, blob)) {
+                return 0;
+            }
+            continue;
+        }
         if (line.rfind("#__POPCNT_LLM_LZ1__ ", 0) == 0) {
             size_t sp1 = line.find(' ', 20);
-            if (sp1 != std::string::npos) {
-                int ep = std::atoi(line.substr(20, sp1 - 20).c_str());
-                std::string raw_lz = hex_to_bytes(line.substr(sp1 + 1));
-                std::string corpus = lz77_decompress_bytes(raw_lz);
-                if (!corpus.empty()) {
-                    brain_train_corpus(brain, corpus.c_str(), ep, nullptr);
-                }
+            if (sp1 == std::string::npos) return 0;
+            int ep = std::atoi(line.substr(20, sp1 - 20).c_str());
+            std::string raw_lz = hex_to_bytes(line.substr(sp1 + 1));
+            std::string corpus = lz77_decompress_bytes(raw_lz);
+            if (corpus.empty() || !brain_train_corpus(brain, corpus.c_str(), ep, nullptr)) {
+                return 0;
             }
             continue;
         }
         if (line.rfind("#__POPCNT_LLM_V1__ ", 0) == 0) {
             size_t sp1 = line.find(' ', 19);
-            if (sp1 != std::string::npos) {
-                int ep = std::atoi(line.substr(19, sp1 - 19).c_str());
-                std::string corpus = hex_to_bytes(line.substr(sp1 + 1));
-                if (!corpus.empty()) {
-                    brain_train_corpus(brain, corpus.c_str(), ep, nullptr);
-                }
+            if (sp1 == std::string::npos) return 0;
+            int ep = std::atoi(line.substr(19, sp1 - 19).c_str());
+            std::string corpus = hex_to_bytes(line.substr(19 + (sp1 - 19) + 1));
+            if (corpus.empty() || !brain_train_corpus(brain, corpus.c_str(), ep, nullptr)) {
+                return 0;
             }
             continue;
         }
@@ -9623,9 +10584,9 @@ POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath
         if (t1 == std::string::npos) continue;
         size_t t2 = line.find('\t', t1 + 1);
         if (t2 == std::string::npos) continue;
-        std::string sub = line.substr(0, t1);
-        std::string rel = line.substr(t1 + 1, t2 - (t1 + 1));
-        std::string obj = line.substr(t2 + 1);
+        std::string sub = unescape_tsv_field(line.substr(0, t1));
+        std::string rel = unescape_tsv_field(line.substr(t1 + 1, t2 - (t1 + 1)));
+        std::string obj = unescape_tsv_field(line.substr(t2 + 1));
         brain_store_fact(brain, sub.c_str(), rel.c_str(), obj.c_str());
     }
     return ifs.bad() ? 0 : 1;
