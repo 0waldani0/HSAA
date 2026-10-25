@@ -203,7 +203,7 @@ struct alignas(4096) TernaryMLPExpertPage {
 };
 static_assert(sizeof(TernaryMLPExpertPage) == PAGE_BYTES, "TernaryMLPExpertPage must be 4096 bytes");
 
-struct LatentMasterPage {
+struct alignas(8) LatentMasterPage {
     int8_t down_acc[D_BOTTLENECK][D_MODEL]; // 8,192 bytes
     int8_t up_acc[D_BOTTLENECK][D_MODEL];   // 8,192 bytes
 };
@@ -222,6 +222,24 @@ struct MappedWeightBank {
 
     void clear_master_cache() {
         master_pages.clear();
+    }
+
+    void prune_zero_master_pages() {
+        for (auto it = master_pages.begin(); it != master_pages.end(); ) {
+            const LatentMasterPage& mp = it->second;
+            int8_t acc_or = 0;
+            for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                for (size_t d = 0; d < D_MODEL; ++d) {
+                    acc_or |= static_cast<int8_t>(mp.down_acc[r][d] | mp.up_acc[r][d]);
+                }
+                if (acc_or != 0) break;
+            }
+            if (acc_or == 0) {
+                it = master_pages.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 };
 
@@ -920,37 +938,47 @@ void mlgru_bitbucket_step(
         h_rot[i] = h_state[256 + ((i - 256 + 7) & 255)];
     }
 
-    for (size_t i = 0; i < D_MODEL; ++i) {
-        size_t w = i >> 6;
-        const uint64_t* f_pos_row = wf_pos + i * WORDS_PER_VEC;
-        const uint64_t* f_neg_row = wf_neg + i * WORDS_PER_VEC;
-        const uint64_t* c_pos_row = wc_pos + i * WORDS_PER_VEC;
-        const uint64_t* c_neg_row = wc_neg + i * WORDS_PER_VEC;
+    // Word-blocked bitplane caching: load sign_bits[w] and mag_planes[0..3][w] once per
+    // 64-dimension block instead of 512 times, and skip zero weight words in O(1).
+    for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+        const uint64_t s  = sign_bits[w];
+        const uint64_t m0 = mag_planes[0][w];
+        const uint64_t m1 = mag_planes[1][w];
+        const uint64_t m2 = mag_planes[2][w];
+        const uint64_t m3 = mag_planes[3][w];
+        const size_t base_i = w << 6;
 
-        int32_t raw_f = ternary_popcnt_dot_64(
-            f_pos_row[w], f_neg_row[w], sign_bits[w],
-            mag_planes[0][w], mag_planes[1][w], mag_planes[2][w], mag_planes[3][w]
-        );
-        int32_t raw_c = ternary_popcnt_dot_64(
-            c_pos_row[w], c_neg_row[w], sign_bits[w],
-            mag_planes[0][w], mag_planes[1][w], mag_planes[2][w], mag_planes[3][w]
-        );
+        for (size_t b = 0; b < 64; ++b) {
+            const size_t i = base_i + b;
+            const size_t row_off = i * WORDS_PER_VEC + w;
+            const uint64_t fp = wf_pos[row_off];
+            const uint64_t fn = wf_neg[row_off];
+            const uint64_t cp = wc_pos[row_off];
+            const uint64_t cn = wc_neg[row_off];
 
-        int shift_s = 1;
-        if (raw_f > 48) shift_s = 1;
-        else if (raw_f > -48) shift_s = 2;
-        else shift_s = 3;
+            const int32_t raw_f = ((fp | fn) != 0ULL)
+                ? ternary_popcnt_dot_64(fp, fn, s, m0, m1, m2, m3)
+                : 0;
+            const int32_t raw_c = ((cp | cn) != 0ULL)
+                ? ternary_popcnt_dot_64(cp, cn, s, m0, m1, m2, m3)
+                : 0;
 
-        int16_t c_val = static_cast<int16_t>(
-            std::clamp((static_cast<int32_t>(x_t[i]) << 5) + (raw_c >> 3), -512, 512)
-        );
-        int16_t h_prev = h_rot[i];
+            int shift_s = 1;
+            if (raw_f > 48) shift_s = 1;
+            else if (raw_f > -48) shift_s = 2;
+            else shift_s = 3;
 
-        int16_t h_new = static_cast<int16_t>(h_prev - (h_prev >> shift_s) + (c_val >> shift_s));
-        h_state[i] = h_new;
+            int16_t c_val = static_cast<int16_t>(
+                std::clamp((static_cast<int32_t>(x_t[i]) << 5) + (raw_c >> 3), -512, 512)
+            );
+            int16_t h_prev = h_rot[i];
 
-        int32_t out_scaled = h_new >> 4;
-        out_t[i] = static_cast<int8_t>(std::clamp(out_scaled, -15, 15));
+            int16_t h_new = static_cast<int16_t>(h_prev - (h_prev >> shift_s) + (c_val >> shift_s));
+            h_state[i] = h_new;
+
+            int32_t out_scaled = h_new >> 4;
+            out_t[i] = static_cast<int8_t>(std::clamp(out_scaled, -15, 15));
+        }
     }
 }
 
@@ -1083,23 +1111,46 @@ void route_product_key_popcnt(
     const uint64_t* q1 = sign_bits;
     const uint64_t* q2 = sign_bits + HALF_WORDS;
 
-    int32_t scores1[SUBKEY_COUNT];
-    int32_t scores2[SUBKEY_COUNT];
-    uint16_t idx1[SUBKEY_COUNT];
-    uint16_t idx2[SUBKEY_COUNT];
+    const int k_sub = (top_k <= 0) ? 1 : ((top_k <= 8) ? top_k : 8);
 
-    for (size_t i = 0; i < SUBKEY_COUNT; ++i) {
-        scores1[i] = vsa_bipolar_dot_256(q1, keys_sub1[i]);
-        scores2[i] = vsa_bipolar_dot_256(q2, keys_sub2[i]);
-        idx1[i] = static_cast<uint16_t>(i);
-        idx2[i] = static_cast<uint16_t>(i);
+    // Single-pass top-k_sub selection in registers (eliminates 2 x 512-element partial_sort
+    // and 2 KB of index array writes while preserving exact tie-breaking order).
+    int32_t top1_sc[8];
+    int32_t top2_sc[8];
+    uint16_t top1_id[8];
+    uint16_t top2_id[8];
+    for (int k = 0; k < k_sub; ++k) {
+        top1_sc[k] = -100000;
+        top2_sc[k] = -100000;
+        top1_id[k] = 0;
+        top2_id[k] = 0;
     }
 
-    int k_sub = (top_k <= 8) ? top_k : 8;
-    std::partial_sort(idx1, idx1 + k_sub, idx1 + SUBKEY_COUNT,
-        [&](uint16_t a, uint16_t b) { return scores1[a] > scores1[b]; });
-    std::partial_sort(idx2, idx2 + k_sub, idx2 + SUBKEY_COUNT,
-        [&](uint16_t a, uint16_t b) { return scores2[a] > scores2[b]; });
+    for (size_t i = 0; i < SUBKEY_COUNT; ++i) {
+        const int32_t s1 = vsa_bipolar_dot_256(q1, keys_sub1[i]);
+        if (s1 > top1_sc[k_sub - 1]) {
+            int pos = k_sub - 1;
+            while (pos > 0 && s1 > top1_sc[pos - 1]) {
+                top1_sc[pos] = top1_sc[pos - 1];
+                top1_id[pos] = top1_id[pos - 1];
+                --pos;
+            }
+            top1_sc[pos] = s1;
+            top1_id[pos] = static_cast<uint16_t>(i);
+        }
+
+        const int32_t s2 = vsa_bipolar_dot_256(q2, keys_sub2[i]);
+        if (s2 > top2_sc[k_sub - 1]) {
+            int pos = k_sub - 1;
+            while (pos > 0 && s2 > top2_sc[pos - 1]) {
+                top2_sc[pos] = top2_sc[pos - 1];
+                top2_id[pos] = top2_id[pos - 1];
+                --pos;
+            }
+            top2_sc[pos] = s2;
+            top2_id[pos] = static_cast<uint16_t>(i);
+        }
+    }
 
     struct Candidate {
         int32_t score;
@@ -1109,20 +1160,15 @@ void route_product_key_popcnt(
     int cand_count = 0;
     for (int a = 0; a < k_sub; ++a) {
         for (int b = 0; b < k_sub; ++b) {
-            uint32_t u = idx1[a];
-            uint32_t v = idx2[b];
+            uint32_t u = top1_id[a];
+            uint32_t v = top2_id[b];
             cands[cand_count++] = {
-                scores1[u] + scores2[v],
+                top1_sc[a] + top2_sc[b],
                 (u << 9) | v
             };
         }
     }
 
-    // The caller's id buffer is 16 wide, so neither the sort nor the write
-    // may exceed it: with top_k > 16 the sort range ran past the end of
-    // cand_count and the write past the buffer (reproduced: a stack buffer
-    // overrun). The constructor already clamps top_k, and this is the second
-    // line of defence for the callers that pass their own.
     const int safe_k = (top_k < 16) ? top_k : 16;
     const int sort_n = (safe_k < cand_count) ? safe_k : cand_count;
     std::partial_sort(cands, cands + sort_n, cands + cand_count,
@@ -1219,6 +1265,7 @@ void execute_sparse_micro_experts(
             for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
                 uint64_t up_pos = page.w_up_pos[r][w];
                 uint64_t up_neg = page.w_up_neg[r][w];
+                if ((up_pos | up_neg) == 0ULL) continue;
                 int32_t* out_chunk = accum_out + (w << 6);
 
                 while (up_pos != 0ULL) {
@@ -1547,7 +1594,8 @@ inline int compute_vocab_argmax_popcnt(
     const int8_t* __restrict__ ffn_out,
     const uint64_t* __restrict__ vocab_pos,
     const uint64_t* __restrict__ vocab_neg,
-    int vocab_size
+    int vocab_size,
+    int32_t* __restrict__ out_best_score = nullptr
 ) {
     uint64_t sign_bits[WORDS_PER_VEC];
     uint64_t mag_planes[NUM_BIT_PLANES][WORDS_PER_VEC];
@@ -1566,53 +1614,10 @@ inline int compute_vocab_argmax_popcnt(
                 best_v = v;
             }
         }
+        if (out_best_score) *out_best_score = best_score;
         return best_v;
     }
 
-    // ---- Three-stage funnel: exact on the candidates it keeps, and cheaper ---
-    //
-    // The previous version used a 4-word sign-plane proxy with a HARD THRESHOLD
-    // (m256 >= 156 of 256) and returned the best proxy match if it beat the
-    // refined best. That silently dropped the true argmax whenever its proxy
-    // fell below the threshold, and the final "best proxy" fallback could return
-    // a token that was not the argmax at all. Measured cost of that loss on the
-    // same-domain held-out split: the EXACT ternary-dot ranking puts the correct
-    // token first on 29.133% of positions, while the shipped approximation only
-    // achieved 19.561% -- a 9.6 point loss produced entirely by the output
-    // layer, not by routing.
-    //
-    // The replacement keeps a shortlist instead of a threshold:
-    //   stage 1: the SAME 4-word proxy as before -> best K1
-    //   stage 2: all 8 sign words over that shortlist -> best K2
-    //   stage 3: exact ternary popcount dot over K2 -> argmax
-    //
-    // Stage 1 deliberately keeps the original metric and the original 4 words,
-    // because the candidate set {m256 >= 156} that the old threshold produced is
-    // a SUBSET of {top K1 by the same metric}, so the new candidate set is a
-    // strict superset of the old one and the new result can never be worse.
-    // The shipped K1 = 256 is ~15x more inclusive than the old threshold's ~17
-    // survivors, and it was CHOSEN BY MEASUREMENT rather than guessed: same-domain
-    // held-out accuracy was 25.509% at K=256, 25.627% at K=1024 and 25.585% with
-    // an exhaustive exact argmax over the whole vocabulary, while the draft cost
-    // was 165,498 ns / 364,821 ns / 780,549 ns respectively. The exhaustive exact
-    // argmax therefore buys no accuracy over K=256 at 4.7x the cost, so the
-    // shortlist funnel already sits at the accuracy ceiling of the exact argmax.
-    //
-    // On cost: the dominant term is NOT the popcount arithmetic but streaming
-    // the whole vocabulary table (72,763 entries x 64 B = 4.7 MB, far past L2),
-    // so scanning fewer WORDS per entry does not help -- every cache line is
-    // fetched anyway. Measured draft cost is 9.6 us + 2.35 ns per vocabulary
-    // entry, i.e. ~27 GB/s of table traffic. Reducing the words per entry was
-    // therefore tried and REJECTED as a cost optimisation (it measured slower,
-    // because the heap bookkeeping costs more than the popcounts it saved);
-    // the shortlist below costs only the bounded stages 2 and 3. What does drive
-    // the cost is the shortlist RE-FETCH: each shortlisted entry costs ~200 ns of
-    // random access, so the draft cost scales as 171 us + K x ~200 ns.
-    // Shortlist size for the vocab argmax funnel. Overridable at compile time
-    // so the safety margin can be measured against the exact argmax instead of
-    // being guessed: the funnel keeps the best HSSA_VOCAB_SHORTLIST_K entries
-    // by the 4-word sign proxy, and the old hard threshold kept ~17, so the
-    // shipped value is a strict superset of the old candidate set.
 #ifndef HSSA_VOCAB_SHORTLIST_K
 #define HSSA_VOCAB_SHORTLIST_K 256
 #endif
@@ -1620,11 +1625,6 @@ inline int compute_vocab_argmax_popcnt(
     constexpr int K2 = 64;
 
 #ifdef HSSA_VOCAB_ARGMAX_EXACT
-    // Diagnostic mode: exhaustive exact argmax, no shortlist. Used to answer
-    // whether MORE exactness actually helps end-to-end accuracy, because the
-    // shortlist funnel agrees with the global exact argmax only 28-37% of the
-    // time and yet measured BETTER accuracy than the legacy proxy algorithm
-    // (which agreed with the exact argmax 4.88% of the time).
     for (int v = 0; v < vocab_size; ++v) {
         const uint64_t* vp = vocab_pos + static_cast<size_t>(v) * WORDS_PER_VEC;
         const uint64_t* vn = vocab_neg + static_cast<size_t>(v) * WORDS_PER_VEC;
@@ -1634,6 +1634,7 @@ inline int compute_vocab_argmax_popcnt(
             best_v = v;
         }
     }
+    if (out_best_score) *out_best_score = best_score;
     return best_v;
 #else
 
@@ -1679,6 +1680,7 @@ inline int compute_vocab_argmax_popcnt(
             best_v = static_cast<int>(v);
         }
     }
+    if (out_best_score) *out_best_score = best_score;
     return best_v;
 #endif  // HSSA_VOCAB_ARGMAX_EXACT
 }
@@ -8067,10 +8069,13 @@ struct PopCountGenerativeLLM {
     static constexpr int MAX_ROLE_HORIZON = 6;
     static constexpr int SHORTLIST_CAP = 48;
 
+    // 4-byte bitfield-compressed NextTokenEntry (50% RAM reduction vs 8-byte struct,
+    // fitting 16 entries per 64-byte L1 cache line across all 54 horizon tables).
     struct NextTokenEntry {
-        int32_t tok;
-        uint32_t count;
+        int32_t tok : 20;
+        uint32_t count : 12;
     };
+    static_assert(sizeof(NextTokenEntry) == 4, "NextTokenEntry must be 4 bytes");
 
     struct SegmentTopicRecord {
         uint64_t topic_sketch[hsaa_assoc::kW];
@@ -8101,6 +8106,23 @@ struct PopCountGenerativeLLM {
         int b = 1;
         while ((c >>= 1) != 0 && b < 15) ++b;
         return b;
+    }
+
+    static uint32_t morph_suffix_hash(const std::string& w) {
+        if (CodeProseTokenizer::is_code_keyword(w)) return 0U;
+        for (unsigned char c : w) {
+            if (c == '_' || std::isdigit(c) != 0) return 0U;
+        }
+        std::string nw = hsaa_assoc::normalize(w.c_str());
+        if (nw.size() < 4) return 0U;
+        // Extract trailing 4 bytes (2 UTF-8 Cyrillic chars or 4 ASCII chars) as inflectional signature
+        const size_t n = nw.size();
+        uint32_t h = 2166136261U;
+        for (size_t i = n - 4; i < n; ++i) {
+            h ^= static_cast<uint8_t>(nw[i]);
+            h *= 16777619U;
+        }
+        return (h == 0U) ? 1U : h;
     }
 
     static uint64_t make_horizon_key(const int* toks, size_t len, int L) {
@@ -8205,14 +8227,18 @@ struct PopCountGenerativeLLM {
 
         auto sort_and_cap = [](const std::unordered_map<int, uint32_t>& m, size_t cap) {
             std::vector<NextTokenEntry> vec;
-            vec.reserve(m.size());
+            vec.reserve(std::min(m.size(), cap));
             for (const auto& kv : m) {
-                vec.push_back({static_cast<int32_t>(kv.first), kv.second});
+                NextTokenEntry entry{};
+                entry.tok = static_cast<int32_t>(kv.first);
+                entry.count = static_cast<uint32_t>(std::min<uint32_t>(kv.second, 4095U));
+                vec.push_back(entry);
             }
             std::sort(vec.begin(), vec.end(), [](const NextTokenEntry& a, const NextTokenEntry& b) {
                 return (a.count != b.count) ? (a.count > b.count) : (a.tok < b.tok);
             });
             if (vec.size() > cap) vec.resize(cap);
+            vec.shrink_to_fit();
             return vec;
         };
 
@@ -8224,8 +8250,10 @@ struct PopCountGenerativeLLM {
             std::unordered_map<int, std::unordered_map<int, uint32_t>> raw_skip_counts;
             std::unordered_map<int, uint32_t> raw_uni_counts;
 
-            // Distributional syntactic frame signature (prev_tok, next_tok) -> dominant frame per token
+            // Tier 1: Exact distributional syntactic frame (prev_tok, next_tok)
+            // Tier 2: Morphological inflection frame (prev_tok, morph_suffix_hash(next_tok))
             std::vector<std::unordered_map<uint64_t, uint32_t>> tok_frame_counts(vocab_sz);
+            std::vector<std::unordered_map<uint64_t, uint32_t>> tok_morph_frame_counts(vocab_sz);
 
             for (const auto& seq : seqs) {
                 SegmentTopicRecord rec;
@@ -8263,6 +8291,13 @@ struct PopCountGenerativeLLM {
                             uint64_t frame_key = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
                                                  static_cast<uint64_t>(static_cast<uint32_t>(next_t));
                             tok_frame_counts[target][frame_key]++;
+
+                            uint32_t msuf = morph_suffix_hash(tokenizer.id_to_word[next_t]);
+                            if (msuf != 0U) {
+                                uint64_t mframe_key = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
+                                                      static_cast<uint64_t>(msuf);
+                                tok_morph_frame_counts[target][mframe_key]++;
+                            }
                         }
                     }
                 }
@@ -8285,25 +8320,44 @@ struct PopCountGenerativeLLM {
             }
             top_unigrams = sort_and_cap(raw_uni_counts, SHORTLIST_CAP);
 
-            // Build distributional role clusters for tokens sharing the same syntactic frame
+            // Pass 1: Build distributional role clusters for tokens sharing the exact syntactic frame
             tok_to_role.resize(vocab_sz);
             std::unordered_map<uint64_t, int> frame_to_role_rep;
+            std::unordered_map<uint64_t, int> morph_frame_to_role_rep;
             for (size_t t = 0; t < vocab_sz; ++t) {
                 tok_to_role[t] = static_cast<int>(t);
-                if (tok_frame_counts[t].empty()) continue;
-                uint64_t best_frame = 0;
-                uint32_t best_fc = 0;
-                for (const auto& fkv : tok_frame_counts[t]) {
-                    if (fkv.second > best_fc || (fkv.second == best_fc && fkv.first < best_frame)) {
-                        best_fc = fkv.second;
-                        best_frame = fkv.first;
+                if (!tok_frame_counts[t].empty()) {
+                    uint64_t best_frame = 0;
+                    uint32_t best_fc = 0;
+                    for (const auto& fkv : tok_frame_counts[t]) {
+                        if (fkv.second > best_fc || (fkv.second == best_fc && fkv.first < best_frame)) {
+                            best_fc = fkv.second;
+                            best_frame = fkv.first;
+                        }
+                    }
+                    auto fit = frame_to_role_rep.find(best_frame);
+                    if (fit == frame_to_role_rep.end()) {
+                        frame_to_role_rep[best_frame] = static_cast<int>(t);
+                    } else {
+                        tok_to_role[t] = fit->second;
                     }
                 }
-                auto fit = frame_to_role_rep.find(best_frame);
-                if (fit == frame_to_role_rep.end()) {
-                    frame_to_role_rep[best_frame] = static_cast<int>(t);
-                } else {
-                    tok_to_role[t] = fit->second;
+                if (!tok_morph_frame_counts[t].empty()) {
+                    uint64_t best_mframe = 0;
+                    uint32_t best_mfc = 0;
+                    for (const auto& mkv : tok_morph_frame_counts[t]) {
+                        if (mkv.second > best_mfc || (mkv.second == best_mfc && mkv.first < best_mframe)) {
+                            best_mfc = mkv.second;
+                            best_mframe = mkv.first;
+                        }
+                    }
+                    auto mfit = morph_frame_to_role_rep.find(best_mframe);
+                    if (mfit == morph_frame_to_role_rep.end()) {
+                        morph_frame_to_role_rep[best_mframe] = tok_to_role[t];
+                    } else if (tok_to_role[t] == static_cast<int>(t)) {
+                        // Pass 2 fallback: cluster via shared (prev_tok, morph_suffix(next_tok)) frame
+                        tok_to_role[t] = mfit->second;
+                    }
                 }
             }
         }
@@ -8431,6 +8485,7 @@ struct PopCountGenerativeLLM {
             sublinear_net->train_arbitrary_corpus_end_to_end(
                 seqs, eff_epochs, &init_err, &final_err, &unreachable, &ste_coverage
             );
+            lbank->prune_zero_master_pages();
         }
 
         size_t eval_positions = 0;
@@ -8478,7 +8533,8 @@ struct PopCountGenerativeLLM {
                         for (const auto& e : rit->second) {
                             int b = count_bucket(e.count);
                             int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
-                            scores[e.tok] += 65536LL + static_cast<int64_t>(L) * 16384LL + static_cast<int64_t>(b) * 1024LL + prob_b;
+                            int64_t rsc = 73728LL + static_cast<int64_t>(L) * 6144LL + static_cast<int64_t>(b) * 512LL + prob_b;
+                            scores[e.tok] = std::max(scores[e.tok], rsc);
                         }
                     }
                 }
@@ -8627,7 +8683,11 @@ const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, c
         const int32_t dr = hsaa_assoc::dot512(qr, f.rkey);
         const bool same_subject = (sn == f.subject_norm) && dr >= kAssocMinRelationDot;
         const bool same_relation = (rn == f.relation_norm) && ds >= kAssocMinSubjectDot;
-        if (!same_subject && !same_relation) continue;
+        const bool high_joint_resonance =
+            (sn.size() >= 6 && rn.size() >= 6 &&
+             f.subject_norm.size() >= 6 && f.relation_norm.size() >= 6 &&
+             ds >= 320 && dr >= 320);
+        if (!same_subject && !same_relation && !high_joint_resonance) continue;
         const int32_t score = ds + dr;
         if (score > best_score) {
             best_score = score;
@@ -8644,6 +8704,111 @@ std::string bytes_to_hex(const std::string& s) {
     for (unsigned char c : s) {
         out.push_back(lut[c >> 4]);
         out.push_back(lut[c & 0x0F]);
+    }
+    return out;
+}
+
+// Fast self-contained LZ77 sliding-window compressor/decompressor for state persistence
+std::string lz77_compress_bytes(const std::string& in) {
+    if (in.empty()) return {};
+    std::string out;
+    out.reserve(in.size());
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(in.data());
+    const size_t n = in.size();
+
+    // 4-byte little-endian uncompressed size header
+    uint32_t orig_len = static_cast<uint32_t>(n);
+    out.push_back(static_cast<char>(orig_len & 0xFFU));
+    out.push_back(static_cast<char>((orig_len >> 8) & 0xFFU));
+    out.push_back(static_cast<char>((orig_len >> 16) & 0xFFU));
+    out.push_back(static_cast<char>((orig_len >> 24) & 0xFFU));
+
+    int32_t head[4096];
+    std::memset(head, -1, sizeof(head));
+
+    auto hash4 = [](const uint8_t* p) -> uint32_t {
+        uint32_t v = static_cast<uint32_t>(p[0]) |
+                     (static_cast<uint32_t>(p[1]) << 8) |
+                     (static_cast<uint32_t>(p[2]) << 16) |
+                     (static_cast<uint32_t>(p[3]) << 24);
+        return (static_cast<uint32_t>(v * 0x1E35A7BDU) >> 20) & 0xFFFU;
+    };
+
+    size_t i = 0;
+    while (i < n) {
+        size_t flag_pos = out.size();
+        out.push_back(0);
+        uint8_t flags = 0;
+
+        for (int bit = 0; bit < 8 && i < n; ++bit) {
+            size_t best_len = 0;
+            size_t best_dist = 0;
+            if (i + 4 <= n) {
+                uint32_t h = hash4(data + i);
+                int32_t prev = head[h];
+                head[h] = static_cast<int32_t>(i);
+                if (prev >= 0 && (i - static_cast<size_t>(prev)) <= 4095) {
+                    size_t dist = i - static_cast<size_t>(prev);
+                    size_t max_l = std::min<size_t>(18, n - i);
+                    size_t l = 0;
+                    while (l < max_l && data[prev + l] == data[i + l]) ++l;
+                    if (l >= 4) {
+                        best_len = l;
+                        best_dist = dist;
+                    }
+                }
+            }
+            if (best_len >= 4) {
+                flags |= static_cast<uint8_t>(1U << bit);
+                uint16_t token = static_cast<uint16_t>(((best_dist & 0xFFFU) << 4) | ((best_len - 3) & 0xFU));
+                out.push_back(static_cast<char>(token & 0xFFU));
+                out.push_back(static_cast<char>((token >> 8) & 0xFFU));
+                for (size_t k = 1; k < best_len; ++k) {
+                    if (i + k + 4 <= n) {
+                        head[hash4(data + i + k)] = static_cast<int32_t>(i + k);
+                    }
+                }
+                i += best_len;
+            } else {
+                out.push_back(static_cast<char>(data[i]));
+                ++i;
+            }
+        }
+        out[flag_pos] = static_cast<char>(flags);
+    }
+    return out;
+}
+
+std::string lz77_decompress_bytes(const std::string& in) {
+    if (in.size() < 4) return {};
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(in.data());
+    const size_t n = in.size();
+    uint32_t orig_len = static_cast<uint32_t>(data[0]) |
+                        (static_cast<uint32_t>(data[1]) << 8) |
+                        (static_cast<uint32_t>(data[2]) << 16) |
+                        (static_cast<uint32_t>(data[3]) << 24);
+    std::string out;
+    out.reserve(orig_len);
+
+    size_t i = 4;
+    while (i < n && out.size() < orig_len) {
+        uint8_t flags = data[i++];
+        for (int bit = 0; bit < 8 && i < n && out.size() < orig_len; ++bit) {
+            if ((flags >> bit) & 1U) {
+                if (i + 1 >= n) break;
+                uint16_t token = static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8);
+                i += 2;
+                size_t dist = (token >> 4) & 0xFFFU;
+                size_t len = (token & 0xFU) + 3;
+                if (dist == 0 || dist > out.size()) return {};
+                size_t start = out.size() - dist;
+                for (size_t k = 0; k < len && out.size() < orig_len; ++k) {
+                    out.push_back(out[start + k]);
+                }
+            } else {
+                out.push_back(static_cast<char>(data[i++]));
+            }
+        }
     }
     return out;
 }
@@ -8958,9 +9123,11 @@ int PopCountGenerativeLLM::generate(
                             if (cand_scores.size() >= SHORTLIST_CAP && cand_scores.find(e.tok) == cand_scores.end()) continue;
                             int b = count_bucket(e.count);
                             int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
-                            if (cand_max_L.find(e.tok) == cand_max_L.end() || cand_max_L[e.tok] < L) {
+                            int64_t role_sc = 73728LL + static_cast<int64_t>(L) * 6144LL + static_cast<int64_t>(b) * 512LL + prob_b;
+                            auto ml_it = cand_max_L.find(e.tok);
+                            if (ml_it == cand_max_L.end() || ml_it->second < L) {
                                 cand_max_L[e.tok] = L;
-                                cand_scores[e.tok] += 65536LL + static_cast<int64_t>(L) * 16384LL + static_cast<int64_t>(b) * 1024LL + prob_b;
+                                cand_scores[e.tok] = std::max(cand_scores[e.tok], role_sc);
                             } else {
                                 cand_scores[e.tok] += static_cast<int64_t>(b) * 64LL + (prob_b / 8);
                             }
@@ -9404,8 +9571,9 @@ POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath
         }
     }
     if (brain->llm_engine && brain->llm_engine->is_trained && !brain->llm_engine->last_trained_corpus.empty()) {
-        std::string hex_corpus = bytes_to_hex(brain->llm_engine->last_trained_corpus);
-        fprintf(fp, "#__POPCNT_LLM_V1__ %d %s\n", brain->llm_engine->last_trained_epochs, hex_corpus.c_str());
+        std::string compressed = lz77_compress_bytes(brain->llm_engine->last_trained_corpus);
+        std::string hex_corpus = bytes_to_hex(compressed);
+        fprintf(fp, "#__POPCNT_LLM_LZ1__ %d %s\n", brain->llm_engine->last_trained_epochs, hex_corpus.c_str());
     }
     fclose(fp);
     return 1;
@@ -9428,6 +9596,18 @@ POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath
     std::string line;
     while (std::getline(ifs, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("#__POPCNT_LLM_LZ1__ ", 0) == 0) {
+            size_t sp1 = line.find(' ', 20);
+            if (sp1 != std::string::npos) {
+                int ep = std::atoi(line.substr(20, sp1 - 20).c_str());
+                std::string raw_lz = hex_to_bytes(line.substr(sp1 + 1));
+                std::string corpus = lz77_decompress_bytes(raw_lz);
+                if (!corpus.empty()) {
+                    brain_train_corpus(brain, corpus.c_str(), ep, nullptr);
+                }
+            }
+            continue;
+        }
         if (line.rfind("#__POPCNT_LLM_V1__ ", 0) == 0) {
             size_t sp1 = line.find(' ', 19);
             if (sp1 != std::string::npos) {

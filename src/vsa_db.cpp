@@ -1065,27 +1065,52 @@ int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* ou
     if (db->vec_dense.empty()) return 0;
 
     int best_matches = -1;
+    int best_idx = -1;
     const uint64_t* best_vec = nullptr;
 
+    // VSA_MIN_RESONANCE = 0.40f requires (2 * m - 512) / 512 >= 0.40, i.e., m >= 359.
+    // Branch-and-Bound 256-bit Early-Exit: since the upper 4 words (256 bits) can contribute
+    // at most +256 matches, any candidate whose lower 4 words score m_lo <= cutoff - 256
+    // cannot mathematically exceed cutoff and is skipped after 4 POPCNTs instead of 8.
     #pragma omp parallel
     {
         int local_best_matches = -1;
+        int local_best_idx = -1;
         const uint64_t* local_best_vec = nullptr;
 
         #pragma omp for nowait
         for (int i = 0; i < static_cast<int>(db->vec_dense.size()); ++i) {
             const VectorEntry& e = db->vec_dense[i];
-            const int m = vsa_hamming_matches_512(query_512, e.vec);
+            const int cutoff = (local_best_matches >= 358) ? local_best_matches : 358;
+            const int m_lo = static_cast<int>(
+                _mm_popcnt_u64(~(query_512[0] ^ e.vec[0])) +
+                _mm_popcnt_u64(~(query_512[1] ^ e.vec[1])) +
+                _mm_popcnt_u64(~(query_512[2] ^ e.vec[2])) +
+                _mm_popcnt_u64(~(query_512[3] ^ e.vec[3]))
+            );
+            if (m_lo + 256 <= cutoff) continue;
+
+            const int m_hi = static_cast<int>(
+                _mm_popcnt_u64(~(query_512[4] ^ e.vec[4])) +
+                _mm_popcnt_u64(~(query_512[5] ^ e.vec[5])) +
+                _mm_popcnt_u64(~(query_512[6] ^ e.vec[6])) +
+                _mm_popcnt_u64(~(query_512[7] ^ e.vec[7]))
+            );
+            const int m = m_lo + m_hi;
             if (m > local_best_matches) {
                 local_best_matches = m;
+                local_best_idx = i;
                 local_best_vec = e.vec;
             }
         }
 
         #pragma omp critical
         {
-            if (local_best_matches > best_matches) {
+            if (local_best_matches > best_matches ||
+                (local_best_matches == best_matches && local_best_idx >= 0 &&
+                 (best_idx < 0 || local_best_idx < best_idx))) {
                 best_matches = local_best_matches;
+                best_idx = local_best_idx;
                 best_vec = local_best_vec;
             }
         }

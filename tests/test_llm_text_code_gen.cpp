@@ -233,19 +233,35 @@ int main() {
     // -------------------------------------------------------------------------
     PopCountBrain* brain3 = brain_create(1024, "build/test_llm_role_gen.bin");
     const char* role_corpus =
-        "Модуль альфа обрабатывает поток данных в ядре.\n\n"
-        "Модуль бета обрабатывает поток данных в кластере.\n\n"
+        "Модуль альфа кодирует поток данных в ядре.\n\n"
+        "Модуль бета кодирует поток данных в кластере.\n\n"
+        "Модуль гамма фильтрует поток данных в буфере.\n\n"
         "Инженер тестирует альфа перед запуском протокола синхронизации.\n";
     BrainTrainStats role_stats{};
     int role_tr_ok = brain_train_corpus(brain3, role_corpus, 4, &role_stats);
     std::memset(buf, 0, sizeof(buf));
     // Strictly unseen combination "Инженер тестирует бета":
-    // "бета" was never seen after "Инженер тестирует", but shares the dominant syntactic frame
-    // (Модуль, обрабатывает) with "альфа", so role_horizon_tables generalizes to "перед запуском протокола синхронизации".
+    // "бета" was never seen after "Инженер тестирует", but shares the exact syntactic frame
+    // (Модуль, кодирует) with "альфа", so role_horizon_tables generalizes to "перед запуском протокола синхронизации".
     int n_role = brain_generate(brain3, "Инженер тестирует бета", buf, sizeof(buf), 16, 0.0f);
     std::string s_role(buf);
     check(role_tr_ok == 1 && n_role >= 3 && s_role.find("перед запуском протокола") != std::string::npos,
           "T8.1: unseen compositional prose phrase ('Инженер тестирует бета') generalized via role_horizon_tables");
+
+    // Morphological frame clustering: "гамма" is followed by a different verb ("фильтрует" vs "кодирует")
+    // that shares the morphological suffix ("ует"), clustering into the same role as "альфа".
+    std::memset(buf, 0, sizeof(buf));
+    int n_morph_role = brain_generate(brain3, "Инженер тестирует гамма", buf, sizeof(buf), 16, 0.0f);
+    std::string s_morph_role(buf);
+    check(n_morph_role >= 3 && s_morph_role.find("перед запуском протокола") != std::string::npos,
+          "T8.2: morphological suffix frame clustering ('кодирует'/'фильтрует') generalizes 'Инженер тестирует гамма'");
+
+    // Joint VSA morphological inflection tolerance in brain_query_relation
+    brain_store_fact(brain3, "сервер_нейрон", "использует_шину", "оптический_канал");
+    char q_morph[256] = {0};
+    int q_morph_ok = brain_query_relation(brain3, "сервер_нейрона", "использует_шины", q_morph, sizeof(q_morph));
+    check(q_morph_ok == 1 && std::strcmp(q_morph, "оптический_канал") == 0,
+          "T8.3: joint subject+relation morphological inflection resolved via VSA similarity in brain_query_relation");
     brain_destroy(brain3);
 
     std::printf("================================================================\n");
