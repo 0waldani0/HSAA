@@ -168,7 +168,11 @@ static int forward_vsa_block(ModelLayerConfig* layer, const ModelContext* ctx, c
     }
 
     // 2. Query associative database
-    VsaDbHandle* target_db = layer->vsa_handle ? layer->vsa_handle : (ctx ? ctx->global_vsa_db : nullptr);
+    VsaDbHandle* layer_db = std::atomic_ref<VsaDbHandle*>(layer->vsa_handle).load(std::memory_order_acquire);
+    VsaDbHandle* global_db = ctx ? std::atomic_ref<VsaDbHandle*>(const_cast<VsaDbHandle*&>(ctx->global_vsa_db)).load(std::memory_order_acquire) : nullptr;
+    VsaDbHandle* target_db = (layer_db && vsa_db_get_vector_count(layer_db) > 0)
+        ? layer_db
+        : (global_db ? global_db : layer_db);
     uint64_t best_vec[8];
     // Zero resonance until the scan says otherwise. 1.0f here claimed a perfect
     // match on paths that never queried, and echoing the query back as best_vec
@@ -246,18 +250,21 @@ ModelContext* model_create_context(uint32_t num_layers) {
         lyr->N = MODEL_DEFAULT_DIM_N;
         lyr->R = MODEL_DEFAULT_RANK_R;
 
-        // Allocate 64-byte aligned buffers
+        // Allocate 64-byte aligned buffers and abort cleanly if any allocation fails
         lyr->tt_u = (float*)_aligned_malloc(MODEL_TT16_CORE_SIZE * sizeof(float), 64);
         lyr->tt_v = (float*)_aligned_malloc(MODEL_TT16_CORE_SIZE * sizeof(float), 64);
         lyr->deltanet_state = (float*)_aligned_malloc(
             MODEL_DELTANET_HEADS * MODEL_DELTANET_HEAD_DIM * MODEL_DELTANET_HEAD_DIM * sizeof(float), 64);
 
-        if (lyr->tt_u) std::memset(lyr->tt_u, 0, MODEL_TT16_CORE_SIZE * sizeof(float));
-        if (lyr->tt_v) std::memset(lyr->tt_v, 0, MODEL_TT16_CORE_SIZE * sizeof(float));
-        if (lyr->deltanet_state) {
-            std::memset(lyr->deltanet_state, 0,
-                MODEL_DELTANET_HEADS * MODEL_DELTANET_HEAD_DIM * MODEL_DELTANET_HEAD_DIM * sizeof(float));
+        if (!lyr->tt_u || !lyr->tt_v || !lyr->deltanet_state) {
+            model_destroy_context(ctx);
+            return nullptr;
         }
+
+        std::memset(lyr->tt_u, 0, MODEL_TT16_CORE_SIZE * sizeof(float));
+        std::memset(lyr->tt_v, 0, MODEL_TT16_CORE_SIZE * sizeof(float));
+        std::memset(lyr->deltanet_state, 0,
+            MODEL_DELTANET_HEADS * MODEL_DELTANET_HEAD_DIM * MODEL_DELTANET_HEAD_DIM * sizeof(float));
 
         lyr->vsa_handle = nullptr;
         lyr->gpu_matrix = nullptr;
@@ -490,25 +497,35 @@ int model_forward_layer(void* ctx, uint32_t layer_idx, const float* in_vec, floa
     LayerType current_type =
         std::atomic_ref<LayerType>(lyr->layer_type).load(std::memory_order_acquire);
 
+    // Stage input into a 64B-aligned local buffer only when in_vec == out_vec (in-place execution)
+    // so GQA keys/values and TT16 residual input are never clobbered mid-layer, while keeping
+    // zero copy overhead on the standard non-aliased path.
+    alignas(64) float staged_in[MODEL_DEFAULT_DIM_N];
+    const float* src_vec = in_vec;
+    if (in_vec == out_vec) {
+        std::memcpy(staged_in, in_vec, MODEL_DEFAULT_DIM_N * sizeof(float));
+        src_vec = staged_in;
+    }
+
     // Note: CPU layer operators execute FP32 reference pathways; lyr->precision
     // is preserved atomically across runtime modulation for hardware GPU dispatch.
     // 1. Dispatch base layer operator
     switch (current_type) {
         case LAYER_GQA_ATTENTION:
-            forward_gqa_block(lyr, in_vec, out_vec);
+            forward_gqa_block(lyr, src_vec, out_vec);
             break;
         case LAYER_GATED_DELTANET:
-            forward_deltanet_block(lyr, in_vec, out_vec);
+            forward_deltanet_block(lyr, src_vec, out_vec);
             break;
         case LAYER_AVX512_VSA_ASSOCIATIVE:
-            forward_vsa_block(lyr, m, in_vec, out_vec);
+            forward_vsa_block(lyr, m, src_vec, out_vec);
             break;
         default:
             return -3;
     }
 
     // 2. Continuous Online Low-Rank Plasticity (TT16 Residual)
-    model_apply_tt16_residual(ctx, layer_idx, in_vec, out_vec);
+    model_apply_tt16_residual(ctx, layer_idx, src_vec, out_vec);
 
     return 0;
 }
@@ -549,7 +566,8 @@ int model_set_layer_vsa_db(void* ctx, uint32_t layer_idx, VsaDbHandle* db) {
     if (!ctx) return -1;
     ModelContext* m = (ModelContext*)ctx;
     if (layer_idx >= m->num_layers) return -2;
-    m->layers[layer_idx].vsa_handle = db;
+    std::atomic_ref<VsaDbHandle*>(m->layers[layer_idx].vsa_handle)
+        .store(db, std::memory_order_release);
     return 0;
 }
 
@@ -557,16 +575,21 @@ void* model_get_layer_vsa_db(const void* ctx, uint32_t layer_idx) {
     if (!ctx) return nullptr;
     const ModelContext* m = (const ModelContext*)ctx;
     if (layer_idx >= m->num_layers) return nullptr;
-    return m->layers[layer_idx].vsa_handle;
+    return std::atomic_ref<VsaDbHandle*>(
+               const_cast<VsaDbHandle*&>(m->layers[layer_idx].vsa_handle))
+        .load(std::memory_order_acquire);
 }
 
 int model_set_global_vsa_db(void* ctx, VsaDbHandle* db) {
     if (!ctx) return -1;
-    ((ModelContext*)ctx)->global_vsa_db = db;
+    std::atomic_ref<VsaDbHandle*>(((ModelContext*)ctx)->global_vsa_db)
+        .store(db, std::memory_order_release);
     return 0;
 }
 
 void* model_get_global_vsa_db(const void* ctx) {
     if (!ctx) return nullptr;
-    return ((const ModelContext*)ctx)->global_vsa_db;
+    return std::atomic_ref<VsaDbHandle*>(
+               const_cast<VsaDbHandle*&>(((const ModelContext*)ctx)->global_vsa_db))
+        .load(std::memory_order_acquire);
 }

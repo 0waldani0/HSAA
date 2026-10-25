@@ -212,6 +212,24 @@ static void test_model_mod(void) {
 
     E2E_CHECK(model_forward_layer(m, 0, in, out) == 0, "layer 0 forward (GQA)");
     E2E_CHECK(all_finite(out, MODEL_DEFAULT_DIM_M), "GQA output is finite");
+
+    // Verify in-place aliasing (in_vec == out_vec) matches out-of-place execution
+    // even when TT16 residual cores are active.
+    alignas(64) float u_delta[MODEL_TT16_CORE_SIZE];
+    alignas(64) float v_delta[MODEL_TT16_CORE_SIZE];
+    for (size_t i = 0; i < MODEL_TT16_CORE_SIZE; ++i) {
+        u_delta[i] = 0.01f * (float)std::sin((double)i * 0.07);
+        v_delta[i] = 0.01f * (float)std::cos((double)i * 0.05);
+    }
+    E2E_CHECK(model_update_tt16_residual(m, 0, u_delta, v_delta) == 0, "update TT16 on layer 0");
+    alignas(64) float out_ref[MODEL_DEFAULT_DIM_M];
+    alignas(64) float inplace_buf[MODEL_DEFAULT_DIM_M];
+    std::memcpy(inplace_buf, in, sizeof(in));
+    E2E_CHECK(model_forward_layer(m, 0, in, out_ref) == 0, "GQA + TT16 out-of-place forward");
+    E2E_CHECK(model_forward_layer(m, 0, inplace_buf, inplace_buf) == 0, "GQA + TT16 in-place forward");
+    E2E_CHECK(std::memcmp(out_ref, inplace_buf, sizeof(out_ref)) == 0,
+              "in-place model_forward_layer matches out-of-place bitwise");
+
     E2E_CHECK(model_set_layer_precision(m, 0, QUANT_3BIT) == 0 &&
                   model_get_layer_precision(m, 0) == QUANT_3BIT,
               "precision store/load is visible");

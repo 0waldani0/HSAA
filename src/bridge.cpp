@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <mutex>
 
 #define CUDAAPI __stdcall
 typedef int CUresult;
@@ -47,17 +49,14 @@ static pfn_cuMemcpyHtoD              s_cuMemcpyHtoD                  = NULL;
 static pfn_cuMemcpyDtoH              s_cuMemcpyDtoH                  = NULL;
 static pfn_cuCtxSynchronize          s_cuCtxSynchronize              = NULL;
 
-static int                           s_cuda_initialized              = 0;
+static std::once_flag                s_cuda_init_once;
 static int                           s_cuda_available                = 0;
 static CUcontext                     s_cuda_ctx                      = NULL;
 
-static double                        g_last_transfer_latency_us      = 0.0;
+static std::atomic<double>           g_last_transfer_latency_us{0.0};
 static LARGE_INTEGER                 s_perf_freq                     = {0};
 
-static void init_cuda_driver(void) {
-    if (s_cuda_initialized) return;
-    s_cuda_initialized = 1;
-
+static void init_cuda_driver_impl(void) {
     QueryPerformanceFrequency(&s_perf_freq);
 
     s_cuda_lib = LoadLibraryA("nvcuda.dll");
@@ -113,13 +112,17 @@ static void init_cuda_driver(void) {
     s_cuda_available = 1;
 }
 
+static void init_cuda_driver(void) {
+    std::call_once(s_cuda_init_once, init_cuda_driver_impl);
+}
+
 int bridge_is_cuda_available(void) {
     init_cuda_driver();
     return s_cuda_available;
 }
 
 double bridge_last_transfer_latency_us(void) {
-    return g_last_transfer_latency_us;
+    return g_last_transfer_latency_us.load(std::memory_order_relaxed);
 }
 
 HybridBuffer* bridge_alloc_buffer(size_t hidden_dim) {
@@ -236,7 +239,8 @@ int bridge_sync_vsa_to_gpu(HybridBuffer* buf, const uint64_t* vsa_vec, float sca
 
     QueryPerformanceCounter(&t1);
     if (s_perf_freq.QuadPart > 0) {
-        g_last_transfer_latency_us = (double)(t1.QuadPart - t0.QuadPart) * 1000000.0 / (double)s_perf_freq.QuadPart;
+        double lat = (double)(t1.QuadPart - t0.QuadPart) * 1000000.0 / (double)s_perf_freq.QuadPart;
+        g_last_transfer_latency_us.store(lat, std::memory_order_relaxed);
     }
 
     return 0;
@@ -291,7 +295,8 @@ int bridge_sync_gpu_to_vsa(HybridBuffer* buf, uint64_t* out_vsa_vec) {
 
     QueryPerformanceCounter(&t1);
     if (s_perf_freq.QuadPart > 0) {
-        g_last_transfer_latency_us = (double)(t1.QuadPart - t0.QuadPart) * 1000000.0 / (double)s_perf_freq.QuadPart;
+        double lat = (double)(t1.QuadPart - t0.QuadPart) * 1000000.0 / (double)s_perf_freq.QuadPart;
+        g_last_transfer_latency_us.store(lat, std::memory_order_relaxed);
     }
 
     return 0;

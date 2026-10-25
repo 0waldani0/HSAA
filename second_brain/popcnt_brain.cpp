@@ -8372,6 +8372,7 @@ struct PopCountBrain {
     size_t active_rules;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> direct_facts;
     std::vector<AssocFact> assoc_facts;
+    mutable std::recursive_mutex brain_mutex;
 };
 
 namespace {
@@ -9033,6 +9034,7 @@ POPCNT_BRAIN_API void brain_destroy(PopCountBrain* brain) {
 
 POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     brain->direct_facts[subject][relation] = object;
     brain->active_rules++;
     assoc_upsert(brain, subject, relation, object);
@@ -9046,6 +9048,7 @@ POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject,
 
 POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len) {
     if (!brain || !subject || !relation || !out_object || max_len == 0) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     auto sit = brain->direct_facts.find(subject);
     if (sit != brain->direct_facts.end()) {
         auto rit = sit->second.find(relation);
@@ -9063,6 +9066,7 @@ POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subj
 
 POPCNT_BRAIN_API int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     auto sit = brain->direct_facts.find(subject);
     if (sit != brain->direct_facts.end()) {
         auto rit = sit->second.find(relation);
@@ -9080,16 +9084,23 @@ POPCNT_BRAIN_API int brain_check_conflict(PopCountBrain* brain, const char* subj
 }
 
 POPCNT_BRAIN_API void brain_get_stats(PopCountBrain* brain, size_t* out_active_pages, size_t* out_active_rules) {
+    if (!brain) {
+        if (out_active_pages) *out_active_pages = 0;
+        if (out_active_rules) *out_active_rules = 0;
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     if (out_active_pages) {
-        *out_active_pages = (brain && brain->engine)
+        *out_active_pages = brain->engine
             ? brain->engine->relay_chain.initialized_relay_pages.size()
             : 0;
     }
-    if (out_active_rules) *out_active_rules = brain ? brain->active_rules : 0;
+    if (out_active_rules) *out_active_rules = brain->active_rules;
 }
 
 POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath) {
     if (!brain || !filepath) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
 #if defined(_WIN32)
     int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
     if (wlen <= 0) return 0;
@@ -9121,6 +9132,7 @@ POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath
 
 POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath) {
     if (!brain || !filepath) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
 #if defined(_WIN32)
     int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
     if (wlen <= 0) return 0;
@@ -9165,6 +9177,7 @@ POPCNT_BRAIN_API int brain_train_corpus(
     BrainTrainStats* out_stats
 ) {
     if (!brain || !corpus_text || corpus_text[0] == '\0') return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     if (!brain->llm_engine) {
         brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
     }
@@ -9178,6 +9191,7 @@ POPCNT_BRAIN_API int brain_train_file(
     BrainTrainStats* out_stats
 ) {
     if (!brain || !filepath || filepath[0] == '\0') return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
 #if defined(_WIN32)
     int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
     if (wlen <= 0) return 0;
@@ -9205,6 +9219,7 @@ POPCNT_BRAIN_API int brain_generate(
         if (out_text && max_len > 0) out_text[0] = '\0';
         return 0;
     }
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     if (!brain->llm_engine) {
         brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
     }

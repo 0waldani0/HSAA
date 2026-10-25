@@ -472,9 +472,24 @@ VsaDbHandle* vsa_db_create(VsaDbCapacity cap, const char* persist_path) {
         db->persist_path = "";
     } else {
         DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
-        if (hdr->magic == VSA_DB_MAGIC && hdr->version == VSA_DB_VERSION) {
+        uint32_t expected_slots = (cap == VSA_CAP_MICRO) ? 4096u : ((cap == VSA_CAP_MEDIUM) ? 65536u : 1048576u);
+        uint32_t expected_vec_off = 4096u + expected_slots * static_cast<uint32_t>(sizeof(VsaFactSlot));
+        uint32_t expected_str_off = expected_vec_off + expected_slots * static_cast<uint32_t>(sizeof(VsaVectorSlot));
+        if (hdr->magic == VSA_DB_MAGIC &&
+            hdr->version == VSA_DB_VERSION &&
+            hdr->capacity_pages == static_cast<uint32_t>(cap) &&
+            hdr->total_bytes == total_bytes &&
+            hdr->fact_table_offset == 4096u &&
+            hdr->fact_table_capacity == expected_slots &&
+            hdr->vector_table_offset == expected_vec_off &&
+            hdr->vector_table_capacity == expected_slots &&
+            hdr->string_heap_offset == expected_str_off &&
+            static_cast<size_t>(hdr->string_heap_offset) + hdr->string_heap_capacity == total_bytes &&
+            hdr->string_heap_used <= hdr->string_heap_capacity &&
+            hdr->fact_count <= hdr->fact_table_capacity &&
+            hdr->vector_count <= hdr->vector_table_capacity) {
             vector_index_rebuild(db);
-            return db; // Successfully reopened existing DB
+            return db; // Successfully reopened verified existing DB
         }
     }
 
@@ -744,7 +759,15 @@ int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const
         incoming.inline_obj[0] = '\0';
     }
 
-    // 7. Robin Hood insertion
+    // 7. Upsert the unified vector binding before any Robin Hood slot displacement
+    //    so a failure rolls back string_heap_used cleanly without leaving partially
+    //    swapped fact slots behind.
+    if (vector_table_upsert_locked(db, kh, fact_v) != 0) {
+        hdr->string_heap_used = heap_before;
+        return -1;
+    }
+
+    // 8. Robin Hood insertion (capacity was verified upfront in step 5)
     idx = static_cast<uint32_t>(kh & mask);
     cur_psl = 0;
     for (uint32_t probe = 0; probe < hdr->fact_table_capacity; ++probe) {
@@ -753,9 +776,6 @@ int vsa_db_insert_fact(VsaDbHandle* db, const char* subj, const char* rel, const
             incoming.psl = cur_psl;
             *slot = incoming;
             hdr->fact_count++;
-            // The capacity pre-check above makes this infallible unless the
-            // in-RAM index and the mmap table disagree; never skip it silently.
-            if (vector_table_upsert_locked(db, kh, fact_v) != 0) return -1;
             update_active_pages(db);
             return 0;
         }

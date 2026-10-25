@@ -18,6 +18,7 @@
 #include <limits>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -65,11 +66,10 @@ size_t bench_get_gpu_vram_mb(void) {
 
     static HMODULE hCuda = NULL;
     static PFN_cuMemGetInfo_v2 pfnMemGetInfo = NULL;
-    static bool attempted = false;
+    static std::once_flag s_vram_init_once;
     static bool supported = false;
 
-    if (!attempted) {
-        attempted = true;
+    std::call_once(s_vram_init_once, []() {
         hCuda = LoadLibraryA("nvcuda.dll");
         if (hCuda) {
             PFN_cuInit pfnInit = (PFN_cuInit)GetProcAddress(hCuda, "cuInit");
@@ -100,7 +100,7 @@ size_t bench_get_gpu_vram_mb(void) {
                 }
             }
         }
-    }
+    });
 
     if (supported && pfnMemGetInfo) {
         size_t free_bytes = 0, total_bytes = 0;
@@ -277,7 +277,8 @@ int bench_run_adversarial_matrix(void) {
     if (host_ram == 0 || host_ram > MAX_WORKSTATION_RAM_MB) errs++;
 
     size_t gpu_vram = bench_get_gpu_vram_mb();
-    if (gpu_vram == 0 || gpu_vram > MAX_WORKSTATION_VRAM_MB) errs++;
+    if (gpu_vram > MAX_WORKSTATION_VRAM_MB) errs++;
+    if (bridge_is_cuda_available() && gpu_vram == 0) errs++;
 
     if (bench_assert_hardware_bounds(MAX_WORKSTATION_RAM_MB, MAX_WORKSTATION_VRAM_MB) != 0) errs++;
 

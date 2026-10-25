@@ -357,10 +357,10 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
         float* S_h = &layer->deltanet_state[h * D_H * D_H];
         float* out_h = &out_vec[h * D_H];
 
-        // Preload x_vec [8 * 16 = 128 floats] with aligned loads
+        // Preload x_vec [8 * 16 = 128 floats]
         __m512 x_vec[8];
         for (size_t i = 0; i < 8; ++i) {
-            x_vec[i] = _mm512_load_ps(x_h + i * 16);
+            x_vec[i] = _mm512_loadu_ps(x_h + i * 16);
         }
 
         // 1. Key normalization: k_bar = x_h / max(||x_h||_2, 1e-6)
@@ -486,8 +486,8 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
     __m512 sq_acc0 = _mm512_setzero_ps();
     __m512 sq_acc1 = _mm512_setzero_ps();
     for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 32) {
-        __m512 v0 = _mm512_load_ps(out_vec + i);
-        __m512 v1 = _mm512_load_ps(out_vec + i + 16);
+        __m512 v0 = _mm512_loadu_ps(out_vec + i);
+        __m512 v1 = _mm512_loadu_ps(out_vec + i + 16);
         sq_acc0 = _mm512_fmadd_ps(v0, v0, sq_acc0);
         sq_acc1 = _mm512_fmadd_ps(v1, v1, sq_acc1);
     }
@@ -496,8 +496,8 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
     float inv_rms = 1.0f / rms;
     __m512 v_inv = _mm512_set1_ps(inv_rms);
     for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
-        __m512 v = _mm512_load_ps(out_vec + i);
-        _mm512_store_ps(out_vec + i, _mm512_mul_ps(v, v_inv));
+        __m512 v = _mm512_loadu_ps(out_vec + i);
+        _mm512_storeu_ps(out_vec + i, _mm512_mul_ps(v, v_inv));
     }
 }
 
@@ -724,6 +724,18 @@ int hssa_forward_token(HssaContext* ctx, const float* in_vec, float* out_vec, Hs
     float similarity = 0.0f;
 
     VsaDbHandle* target_db = ctx->global_vsa_db;
+    if (!target_db || vsa_db_get_vector_count(target_db) == 0) {
+        for (uint32_t l = ctx->config.num_layers; l > 0; --l) {
+            VsaDbHandle* lyr_db = ctx->layers[l - 1].vsa_handle;
+            if (lyr_db) {
+                if (!target_db) target_db = lyr_db;
+                if (vsa_db_get_vector_count(lyr_db) > 0) {
+                    target_db = lyr_db;
+                    break;
+                }
+            }
+        }
+    }
     if (target_db && vsa_db_get_vector_count(target_db) > 0) {
         int found = vsa_db_query_vector(target_db, ctx->scratch_vsa, best_vec, &similarity);
         if (!found) {
@@ -869,13 +881,12 @@ int hssa_project_simplex(HssaContext* ctx, float* logits, size_t vocab_size) {
     if (!ctx || !logits || vocab_size == 0) return -1;
     std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
-    // 1. Collect contradicted candidates into a local veto list. A list (rather than a
-    //    sentinel value written into logits) keeps the veto exact: a caller's legitimate
-    //    logit of -1e9 cannot be mistaken for a contradiction, and no mask arithmetic
-    //    is needed afterwards.
+    // 1. Collect contradicted candidates into a local stack veto list (zero heap allocation
+    //    on the decode hot path). A list (rather than a sentinel value written into logits)
+    //    keeps the veto exact: a caller's legitimate logit of -1e9 cannot be mistaken for a
+    //    contradiction, and no mask arithmetic is needed afterwards.
     alignas(64) uint32_t vetoed[HSSA_MAX_ASSERTIONS];
     uint32_t veto_count = 0;
-
     if (ctx->global_vsa_db && ctx->assertions && ctx->assertion_count > 0) {
         for (uint32_t a = 0; a < ctx->assertion_count; ++a) {
             const HssaTokenAssertion* asst = &ctx->assertions[a];
@@ -950,7 +961,13 @@ int hssa_project_simplex(HssaContext* ctx, float* logits, size_t vocab_size) {
 
 int hssa_init_cuda(HssaContext* ctx) {
     if (!ctx) return -1;
-    if (ctx->cuda_active) return 0; // Already initialized
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+    if (ctx->cuda_active) return 0; // Already active
+    if (ctx->cuda_drv && ctx->cuda_ctx && ctx->cuda_kernels && ctx->gpu_matrix &&
+        ctx->gpu_partials && ctx->gpu_tile_cnt && ctx->gpu_out_buf && ctx->hybrid_bridge) {
+        ctx->cuda_active = true; // Re-enable previously initialized CUDA resources without leaking
+        return 0;
+    }
 
     // Check hardware & driver presence via hybrid bridge
     if (!bridge_is_cuda_available()) {
@@ -1047,6 +1064,9 @@ int hssa_init_cuda(HssaContext* ctx) {
     if (drv->cuMemAlloc(&d_partials, 8 * M * sizeof(float)) != 0 ||
         drv->cuMemAlloc(&d_tile_cnt, (M / 32) * sizeof(uint32_t)) != 0 ||
         drv->cuMemAlloc(&d_out_buf, M * sizeof(float)) != 0) {
+        if (d_partials) drv->cuMemFree(d_partials);
+        if (d_tile_cnt) drv->cuMemFree(d_tile_cnt);
+        if (d_out_buf)  drv->cuMemFree(d_out_buf);
         ptq_matrix_free(drv, mat);
         std::free(mat);
         ptq_kernels_unload(drv, kernels);
@@ -1070,6 +1090,7 @@ int hssa_init_cuda(HssaContext* ctx) {
 
 int hssa_enable_cuda(HssaContext* ctx, bool enable) {
     if (!ctx) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
     if (enable) {
         if (!ctx->cuda_active) {
             return hssa_init_cuda(ctx);
@@ -1108,6 +1129,18 @@ int hssa_mutate_knowledge(HssaContext* ctx, const char* subj, const char* rel, c
 static int hssa_register_assertion_impl(HssaContext* ctx, uint32_t token_id, const char* subj, const char* rel, const char* obj) {
     if (!ctx || !subj || !rel || !obj) return -1;
     std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
+    // Deduplicate in-place if the exact (token_id, subject, relation, object) assertion already exists
+    for (uint32_t i = 0; i < ctx->assertion_count; ++i) {
+        HssaTokenAssertion* existing = &ctx->assertions[i];
+        if (existing->token_id == token_id &&
+            std::strcmp(existing->subject, subj) == 0 &&
+            std::strcmp(existing->relation, rel) == 0 &&
+            std::strcmp(existing->object, obj) == 0) {
+            existing->active = true;
+            return 0;
+        }
+    }
 
     // Grow the registry on demand so an idle context carries no assertion footprint.
     if (ctx->assertion_count >= ctx->assertion_capacity) {
@@ -1202,10 +1235,10 @@ static void hssa_compute_logits(const HssaContext* ctx, const float* hidden) {
         __m512 acc2 = _mm512_setzero_ps();
         __m512 acc3 = _mm512_setzero_ps();
         for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 64) {
-            acc0 = _mm512_fmadd_ps(_mm512_load_ps(row + j),      _mm512_load_ps(hidden + j),      acc0);
-            acc1 = _mm512_fmadd_ps(_mm512_load_ps(row + j + 16), _mm512_load_ps(hidden + j + 16), acc1);
-            acc2 = _mm512_fmadd_ps(_mm512_load_ps(row + j + 32), _mm512_load_ps(hidden + j + 32), acc2);
-            acc3 = _mm512_fmadd_ps(_mm512_load_ps(row + j + 48), _mm512_load_ps(hidden + j + 48), acc3);
+            acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(row + j),      _mm512_loadu_ps(hidden + j),      acc0);
+            acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(row + j + 16), _mm512_loadu_ps(hidden + j + 16), acc1);
+            acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(row + j + 32), _mm512_loadu_ps(hidden + j + 32), acc2);
+            acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(row + j + 48), _mm512_loadu_ps(hidden + j + 48), acc3);
         }
         ctx->logits_buf[v] = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(acc0, acc1),
                                                                _mm512_add_ps(acc2, acc3)));
@@ -1320,6 +1353,7 @@ int hssa_clear_assertions(HssaContext* ctx) {
 
 int hssa_set_global_vsa_db(HssaContext* ctx, VsaDbHandle* db) {
     if (!ctx) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
     if (ctx->owns_global_vsa_db && ctx->global_vsa_db && ctx->global_vsa_db != db) {
         vsa_db_destroy(ctx->global_vsa_db);
     }
@@ -1330,6 +1364,7 @@ int hssa_set_global_vsa_db(HssaContext* ctx, VsaDbHandle* db) {
 
 int hssa_set_layer_vsa_db(HssaContext* ctx, uint32_t layer_idx, VsaDbHandle* db) {
     if (!ctx || layer_idx >= ctx->config.num_layers) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
     ctx->layers[layer_idx].vsa_handle = db;
     return 0;
 }
