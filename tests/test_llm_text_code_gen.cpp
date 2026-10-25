@@ -228,6 +228,26 @@ int main() {
     std::error_code ec;
     std::filesystem::remove(std::filesystem::u8path(state_file), ec);
 
+    // -------------------------------------------------------------------------
+    // TEST 8: Compositional Prose Generalization via Distributional Role Clusters
+    // -------------------------------------------------------------------------
+    PopCountBrain* brain3 = brain_create(1024, "build/test_llm_role_gen.bin");
+    const char* role_corpus =
+        "Модуль альфа обрабатывает поток данных в ядре.\n\n"
+        "Модуль бета обрабатывает поток данных в кластере.\n\n"
+        "Инженер тестирует альфа перед запуском протокола синхронизации.\n";
+    BrainTrainStats role_stats{};
+    int role_tr_ok = brain_train_corpus(brain3, role_corpus, 4, &role_stats);
+    std::memset(buf, 0, sizeof(buf));
+    // Strictly unseen combination "Инженер тестирует бета":
+    // "бета" was never seen after "Инженер тестирует", but shares the dominant syntactic frame
+    // (Модуль, обрабатывает) with "альфа", so role_horizon_tables generalizes to "перед запуском протокола синхронизации".
+    int n_role = brain_generate(brain3, "Инженер тестирует бета", buf, sizeof(buf), 16, 0.0f);
+    std::string s_role(buf);
+    check(role_tr_ok == 1 && n_role >= 3 && s_role.find("перед запуском протокола") != std::string::npos,
+          "T8.1: unseen compositional prose phrase ('Инженер тестирует бета') generalized via role_horizon_tables");
+    brain_destroy(brain3);
+
     std::printf("================================================================\n");
     std::printf("  SUMMARY: %d Passed, %d Failed\n", g_passed, g_failed);
     std::printf("================================================================\n");
