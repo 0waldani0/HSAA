@@ -1,13 +1,25 @@
 #include "vsa_db.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+typedef int HANDLE;
+#define INVALID_HANDLE_VALUE (-1)
+#endif
 #include <immintrin.h>
 #include <nmmintrin.h>
 #include <omp.h>
+#ifndef _MSC_VER
+#define __popcnt64 _mm_popcnt_u64
+#endif
 
 #include <cstring>
 #include <cstdlib>
@@ -389,10 +401,11 @@ VsaDbHandle* vsa_db_create(VsaDbCapacity cap, const char* persist_path) {
     db->base_ptr = nullptr;
     db->is_mapped_file = false;
     db->file_handle = INVALID_HANDLE_VALUE;
-    db->mapping_handle = NULL;
+    db->mapping_handle = (HANDLE)0;
 
     bool use_file = (persist_path != nullptr && persist_path[0] != '\0');
     if (use_file) {
+#if defined(_WIN32)
         // MB_ERR_INVALID_CHARS makes the conversion FAIL on malformed UTF-8 instead of
         // silently substituting U+FFFD, which would otherwise create a file named with
         // replacement characters and lose the caller's intended persist location.
@@ -458,15 +471,51 @@ VsaDbHandle* vsa_db_create(VsaDbCapacity cap, const char* persist_path) {
                 }
             }
         }
+#else
+        int fd = open(persist_path, O_RDWR | O_CREAT, 0644);
+        if (fd < 0) {
+            use_file = false;
+        } else {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && static_cast<size_t>(st.st_size) < total_bytes) {
+                if (ftruncate(fd, static_cast<off_t>(total_bytes)) != 0) {
+                    close(fd);
+                    fd = -1;
+                    use_file = false;
+                }
+            }
+            if (fd >= 0) {
+                void* mapped = mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (mapped == MAP_FAILED || mapped == nullptr) {
+                    close(fd);
+                    use_file = false;
+                } else {
+                    db->base_ptr = mapped;
+                    db->is_mapped_file = true;
+                    db->file_handle = fd;
+                    db->mapping_handle = 0;
+                    db->persist_path = persist_path;
+                }
+            }
+        }
+#endif
     }
 
     if (!use_file) {
         // Pure in-memory allocation when no persist path was requested or it was unusable
+#if defined(_WIN32)
         void* ptr = VirtualAlloc(NULL, total_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!ptr) {
             delete db;
             return nullptr;
         }
+#else
+        void* ptr = mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED || !ptr) {
+            delete db;
+            return nullptr;
+        }
+#endif
         db->base_ptr = ptr;
         db->is_mapped_file = false;
         db->persist_path = "";
@@ -533,6 +582,7 @@ void vsa_db_destroy(VsaDbHandle* db) {
     if (!db) return;
     {
         std::lock_guard<std::mutex> lock(db->db_mutex);
+#if defined(_WIN32)
         if (db->is_mapped_file) {
             if (db->base_ptr) {
                 FlushViewOfFile(db->base_ptr, db->total_bytes);
@@ -555,6 +605,25 @@ void vsa_db_destroy(VsaDbHandle* db) {
                 db->base_ptr = nullptr;
             }
         }
+#else
+        if (db->is_mapped_file) {
+            if (db->base_ptr) {
+                msync(db->base_ptr, db->total_bytes, MS_SYNC);
+                munmap(db->base_ptr, db->total_bytes);
+                db->base_ptr = nullptr;
+            }
+            if (db->file_handle != INVALID_HANDLE_VALUE) {
+                fsync(db->file_handle);
+                close(db->file_handle);
+                db->file_handle = INVALID_HANDLE_VALUE;
+            }
+        } else {
+            if (db->base_ptr) {
+                munmap(db->base_ptr, db->total_bytes);
+                db->base_ptr = nullptr;
+            }
+        }
+#endif
     }
     delete db;
 }
@@ -563,9 +632,15 @@ int vsa_db_flush(VsaDbHandle* db) {
     if (!db) return -1;
     std::lock_guard<std::mutex> lock(db->db_mutex);
     if (db->is_mapped_file && db->base_ptr && db->file_handle != INVALID_HANDLE_VALUE) {
+#if defined(_WIN32)
         BOOL fv = FlushViewOfFile(db->base_ptr, db->total_bytes);
         BOOL fb = FlushFileBuffers(db->file_handle);
         return (fv && fb) ? 0 : -1;
+#else
+        int mv = msync(db->base_ptr, db->total_bytes, MS_SYNC);
+        int fb = fsync(db->file_handle);
+        return (mv == 0 && fb == 0) ? 0 : -1;
+#endif
     }
     return 0;
 }
@@ -582,8 +657,13 @@ int vsa_db_clone(const VsaDbHandle* src, VsaDbHandle** dst, const char* new_pers
     vector_index_rebuild(clone);
 
     if (clone->is_mapped_file) {
+#if defined(_WIN32)
         FlushViewOfFile(clone->base_ptr, clone->total_bytes);
         FlushFileBuffers(clone->file_handle);
+#else
+        msync(clone->base_ptr, clone->total_bytes, MS_SYNC);
+        fsync(clone->file_handle);
+#endif
     }
     *dst = clone;
     return 0;

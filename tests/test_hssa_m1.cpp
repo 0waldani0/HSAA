@@ -1,9 +1,27 @@
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#else
+#include <unistd.h>
+#include <time.h>
+#include <stdint.h>
+typedef union {
+    int64_t QuadPart;
+} LARGE_INTEGER;
+static inline void QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) {
+    lpFrequency->QuadPart = 1000000000LL;
+}
+static inline void QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    lpPerformanceCount->QuadPart = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+#endif
 #include <immintrin.h>
 
 #include <cstdint>
@@ -22,8 +40,7 @@
 #include <chrono>
 #include <cassert>
 #include <limits>
-
-#pragma comment(lib, "psapi.lib")
+#include <fstream>
 
 #include "hssa.h"
 #include "vsa_db.h"
@@ -47,6 +64,7 @@
     } while (0)
 
 static inline double get_qpc_us() {
+#if defined(_WIN32)
     static LARGE_INTEGER freq = {0};
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);
@@ -54,14 +72,28 @@ static inline double get_qpc_us() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return (static_cast<double>(now.QuadPart) * 1000000.0) / static_cast<double>(freq.QuadPart);
+#else
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration<double, std::micro>(now).count();
+#endif
 }
 
 static inline size_t get_working_set_bytes() {
+#if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS_EX pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
         return pmc.WorkingSetSize;
     }
     return 0;
+#else
+    std::ifstream statm("/proc/self/statm");
+    size_t size_pages = 0, resident_pages = 0;
+    if (statm >> size_pages >> resident_pages) {
+        long page_sz = sysconf(_SC_PAGESIZE);
+        return resident_pages * static_cast<size_t>(page_sz > 0 ? page_sz : 4096);
+    }
+    return 0;
+#endif
 }
 
 /* Psi is the engine's own dual_rail_binarize from include/hssa.h -- measured and
@@ -723,6 +755,85 @@ static bool test_5_mutation_flip_sensitivity() {
 
 /*
  * =============================================================================
+ * Test 6: Continuous Representation Manifold & Deep Geodesic Interpolation
+ * =============================================================================
+ */
+static bool test_6_continuous_manifold_and_deep_interpolation() {
+    std::cout << "\n--------------------------------------------------------------------------------\n";
+    std::cout << "[TEST 6] Continuous Representation Spaces & Deep Geodesic Interpolation\n";
+    std::cout << "--------------------------------------------------------------------------------\n";
+
+    HssaContext* ctx = hssa_create(4);
+    TEST_ASSERT(ctx != nullptr, "Failed to create 4-layer HssaContext");
+
+    const int32_t tokens_a[4] = {11, 23, 47, 89};
+    const int32_t tokens_b[4] = {103, 151, 197, 241};
+
+    alignas(64) float manifold_a[HSSA_HIDDEN_DIM];
+    alignas(64) float manifold_b[HSSA_HIDDEN_DIM];
+    alignas(64) float interp_0[HSSA_HIDDEN_DIM];
+    alignas(64) float interp_mid[HSSA_HIDDEN_DIM];
+    alignas(64) float interp_1[HSSA_HIDDEN_DIM];
+    alignas(64) float deep_out[HSSA_HIDDEN_DIM];
+
+    TEST_ASSERT(hssa_encode_continuous_manifold(ctx, tokens_a, 4, manifold_a) == 0,
+                "hssa_encode_continuous_manifold for tokens_a failed");
+    TEST_ASSERT(hssa_encode_continuous_manifold(ctx, tokens_b, 4, manifold_b) == 0,
+                "hssa_encode_continuous_manifold for tokens_b failed");
+
+    double norm_ma = 0.0, norm_mb = 0.0;
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        norm_ma += static_cast<double>(manifold_a[i]) * static_cast<double>(manifold_a[i]);
+        norm_mb += static_cast<double>(manifold_b[i]) * static_cast<double>(manifold_b[i]);
+    }
+    norm_ma = std::sqrt(norm_ma);
+    norm_mb = std::sqrt(norm_mb);
+    TEST_ASSERT(std::abs(norm_ma - 1.0) < 1e-4 && std::abs(norm_mb - 1.0) < 1e-4,
+                "Continuous manifold coordinates must lie on unit hypersphere S^{1023}");
+
+    TEST_ASSERT(hssa_interpolate_continuous_states(ctx, manifold_a, manifold_b, 0.0f, interp_0) == 0,
+                "hssa_interpolate_continuous_states at alpha=0.0 failed");
+    TEST_ASSERT(hssa_interpolate_continuous_states(ctx, manifold_a, manifold_b, 0.5f, interp_mid) == 0,
+                "hssa_interpolate_continuous_states at alpha=0.5 failed");
+    TEST_ASSERT(hssa_interpolate_continuous_states(ctx, manifold_a, manifold_b, 1.0f, interp_1) == 0,
+                "hssa_interpolate_continuous_states at alpha=1.0 failed");
+
+    double dot_ab = 0.0, dot_am = 0.0, dot_bm = 0.0, norm_mid = 0.0;
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        TEST_ASSERT(std::abs(interp_0[i] - manifold_a[i]) < 1e-5f, "Endpoint alpha=0.0 invariance violated");
+        TEST_ASSERT(std::abs(interp_1[i] - manifold_b[i]) < 1e-5f, "Endpoint alpha=1.0 invariance violated");
+        dot_ab += static_cast<double>(manifold_a[i]) * static_cast<double>(manifold_b[i]);
+        dot_am += static_cast<double>(manifold_a[i]) * static_cast<double>(interp_mid[i]);
+        dot_bm += static_cast<double>(manifold_b[i]) * static_cast<double>(interp_mid[i]);
+        norm_mid += static_cast<double>(interp_mid[i]) * static_cast<double>(interp_mid[i]);
+    }
+    norm_mid = std::sqrt(norm_mid);
+    const double cos_ab = dot_ab / (norm_ma * norm_mb);
+    const double cos_am = dot_am / (norm_ma * norm_mid);
+    const double cos_bm = dot_bm / (norm_mb * norm_mid);
+    std::cout << "  [+] Geodesic SLERP + Hopfield Cosine Trajectory: cos(A,mid)=" << cos_am
+              << ", cos(B,mid)=" << cos_bm << ", cos(A,B)=" << cos_ab << "\n";
+    TEST_ASSERT(cos_am > cos_ab && cos_bm > cos_ab,
+                "Geodesic midpoint state must have strictly higher cosine similarity to both endpoints than cos(A,B)");
+
+    HssaTelemetry telem{};
+    TEST_ASSERT(hssa_forward_deep_interpolated(ctx, interp_mid, deep_out, &telem) == 0,
+                "hssa_forward_deep_interpolated failed");
+    double deep_norm = 0.0;
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        TEST_ASSERT(!std::isnan(deep_out[i]) && !std::isinf(deep_out[i]), "Deep interpolated output contains NaN/Inf");
+        deep_norm += static_cast<double>(deep_out[i]) * static_cast<double>(deep_out[i]);
+    }
+    TEST_ASSERT(deep_norm > 0.0 && telem.total_forward_us > 0.0,
+                "Deep interpolated forward pass output and telemetry must be non-zero");
+
+    hssa_destroy(ctx);
+    std::cout << "[PASS] Test 6: Continuous Representation Manifold & Deep Geodesic Interpolation\n";
+    return true;
+}
+
+/*
+ * =============================================================================
  * Main Test Runner
  * =============================================================================
  */
@@ -738,7 +849,7 @@ int main(int argc, char** argv) {
     double suite_start = get_qpc_us();
 
     int passed = 0;
-    int total = 5;
+    int total = 6;
 
     if (test_1_state_memory_invariance()) passed++;
     else std::cerr << "[FAIL] Test 1 Failed\n";
@@ -754,6 +865,9 @@ int main(int argc, char** argv) {
 
     if (test_5_mutation_flip_sensitivity()) passed++;
     else std::cerr << "[FAIL] Test 5 Failed\n";
+
+    if (test_6_continuous_manifold_and_deep_interpolation()) passed++;
+    else std::cerr << "[FAIL] Test 6 Failed\n";
 
     double suite_end = get_qpc_us();
     double total_ms = (suite_end - suite_start) / 1000.0;

@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -531,6 +532,121 @@ int main() {
     brain_destroy(brain_inj);
     std::filesystem::remove(tsv_inj_file, ec);
     std::filesystem::remove(corrupt_file, ec);
+
+    // -------------------------------------------------------------------------
+    // TEST 11: Adapted Continuous Representation Spaces & Deep Interpolation (T11.1 - T11.6)
+    // -------------------------------------------------------------------------
+    // T11.1: Unit hypersphere normalization S^511 & determinism of brain_embed_continuous
+    float vec_arch1[512] = {0.0f};
+    float vec_arch2[512] = {0.0f};
+    int emb_ok1 = brain_embed_continuous(brain2, "Архитектура PopCount использует битовые операции XNOR и POPCNT", vec_arch1);
+    int emb_ok2 = brain_embed_continuous(brain2, "Архитектура PopCount использует битовые операции XNOR и POPCNT", vec_arch2);
+    double norm_arch = 0.0;
+    double max_diff_arch = 0.0;
+    for (int d = 0; d < 512; ++d) {
+        norm_arch += static_cast<double>(vec_arch1[d]) * static_cast<double>(vec_arch1[d]);
+        max_diff_arch = std::max(max_diff_arch, std::abs(static_cast<double>(vec_arch1[d] - vec_arch2[d])));
+    }
+    norm_arch = std::sqrt(norm_arch);
+    check(emb_ok1 == 1 && emb_ok2 == 1 && std::abs(norm_arch - 1.0) < 1e-4 && max_diff_arch == 0.0,
+          "T11.1: brain_embed_continuous projects text onto unit hypersphere S^511 (||v||_2 = 1.0) deterministically");
+
+    // T11.2: Continuous representation manifold preserves morphological & semantic clustering
+    float sim_identical = brain_continuous_similarity(
+        brain2,
+        "быстрые битовые операции процессора",
+        "быстрые битовые операции процессора");
+    float sim_morph = brain_continuous_similarity(
+        brain2,
+        "быстрые битовые операции процессора",
+        "быстрыми битовыми операциями процессоров");
+    float sim_unrelated = brain_continuous_similarity(
+        brain2,
+        "быстрые битовые операции процессора",
+        "def accumulate_values(items):");
+    std::printf("[T11.2 Continuous Manifold Similarity]:\n  identical=%.4f  morph_variant=%.4f  unrelated_code=%.4f\n\n",
+                sim_identical, sim_morph, sim_unrelated);
+    check(sim_identical > 0.999f && sim_morph > 0.60f && sim_morph > sim_unrelated + 0.25f,
+          "T11.2: continuous representation space ranks identical > morphological inflection > unrelated domain");
+
+    // T11.3: Geodesic SLERP + Hopfield attractor interpolation endpoint fidelity (alpha=0.0 and alpha=1.0)
+    float vec_end_a[512] = {0.0f};
+    float vec_end_b[512] = {0.0f};
+    float vec_interp_0[512] = {0.0f};
+    float vec_interp_1[512] = {0.0f};
+    char near_tok_0[128] = {0};
+    char near_tok_1[128] = {0};
+    const char* concept_a = "Архитектура PopCount использует битовые операции XNOR и POPCNT";
+    const char* concept_b = "int sum_array(const int* arr, int n) { return total; }";
+    brain_embed_continuous(brain2, concept_a, vec_end_a);
+    brain_embed_continuous(brain2, concept_b, vec_end_b);
+    int i0_ok = brain_interpolate_continuous(brain2, concept_a, concept_b, 0.0f, vec_interp_0, near_tok_0, sizeof(near_tok_0));
+    int i1_ok = brain_interpolate_continuous(brain2, concept_a, concept_b, 1.0f, vec_interp_1, near_tok_1, sizeof(near_tok_1));
+    double dot_0a = 0.0, dot_1b = 0.0;
+    for (int d = 0; d < 512; ++d) {
+        dot_0a += static_cast<double>(vec_interp_0[d]) * static_cast<double>(vec_end_a[d]);
+        dot_1b += static_cast<double>(vec_interp_1[d]) * static_cast<double>(vec_end_b[d]);
+    }
+    check(i0_ok > 0 && i1_ok > 0 && dot_0a > 0.999 && dot_1b > 0.999 && near_tok_0[0] != '\0' && near_tok_1[0] != '\0',
+          "T11.3: brain_interpolate_continuous preserves exact endpoints at alpha=0.0 and alpha=1.0 and resolves nearest tokens");
+
+    // T11.4: Monotonic geodesic trajectory & midpoint alignment across alpha in {0.0, 0.25, 0.50, 0.75, 1.0}
+    float alphas[5] = {0.0f, 0.25f, 0.50f, 0.75f, 1.0f};
+    double cos_to_a[5] = {0.0};
+    double cos_to_b[5] = {0.0};
+    char mid_tok[128] = {0};
+    bool norms_unit = true;
+    for (int k = 0; k < 5; ++k) {
+        float vk[512] = {0.0f};
+        char tk[128] = {0};
+        brain_interpolate_continuous(brain2, concept_a, concept_b, alphas[k], vk, tk, sizeof(tk));
+        if (k == 2) std::strncpy(mid_tok, tk, sizeof(mid_tok) - 1);
+        double nsq = 0.0, da = 0.0, db = 0.0;
+        for (int d = 0; d < 512; ++d) {
+            nsq += static_cast<double>(vk[d]) * static_cast<double>(vk[d]);
+            da  += static_cast<double>(vk[d]) * static_cast<double>(vec_end_a[d]);
+            db  += static_cast<double>(vk[d]) * static_cast<double>(vec_end_b[d]);
+        }
+        if (std::abs( std::sqrt(nsq) - 1.0 ) > 1e-3) norms_unit = false;
+        cos_to_a[k] = da;
+        cos_to_b[k] = db;
+    }
+    std::printf("[T11.4 Geodesic Trajectory Cosines to A / B]:\n"
+                "  alpha=0.00: (%.3f, %.3f)  alpha=0.25: (%.3f, %.3f)  alpha=0.50: (%.3f, %.3f) [tok='%s']  alpha=0.75: (%.3f, %.3f)  alpha=1.00: (%.3f, %.3f)\n\n",
+                cos_to_a[0], cos_to_b[0], cos_to_a[1], cos_to_b[1], cos_to_a[2], cos_to_b[2], mid_tok, cos_to_a[3], cos_to_b[3], cos_to_a[4], cos_to_b[4]);
+    check(norms_unit &&
+          cos_to_a[0] > cos_to_a[1] && cos_to_a[1] > cos_to_a[2] && cos_to_a[2] > cos_to_a[3] && cos_to_a[3] > cos_to_a[4] &&
+          cos_to_b[0] < cos_to_b[1] && cos_to_b[1] < cos_to_b[2] && cos_to_b[2] < cos_to_b[3] && cos_to_b[3] < cos_to_b[4] &&
+          cos_to_a[2] > 0.45 && cos_to_b[2] > 0.45,
+          "T11.4: deep geodesic interpolation maintains unit norm and strictly monotonic cosine progression from A to B");
+
+    // T11.5: Continuous space invariance across brain_save_state / brain_load_state (brain vs brain2)
+    float vec_b1[512] = {0.0f};
+    float vec_b2[512] = {0.0f};
+    brain_embed_continuous(brain,  "Семантический резонанс и голографическая память", vec_b1);
+    brain_embed_continuous(brain2, "Семантический резонанс и голографическая память", vec_b2);
+    double dot_b1_b2 = 0.0;
+    for (int d = 0; d < 512; ++d) {
+        dot_b1_b2 += static_cast<double>(vec_b1[d]) * static_cast<double>(vec_b2[d]);
+    }
+    check(dot_b1_b2 > 0.9999,
+          "T11.5: continuous representation manifold is deterministically reconstructed on brain_load_state (cosine > 0.9999)");
+
+    // T11.6: High-speed AVX-512 continuous embedding & interpolation throughput benchmark
+    auto t_cont0 = std::chrono::steady_clock::now();
+    float bench_vec[512];
+    char bench_tok[64];
+    const int kContIters = 200;
+    for (int it = 0; it < kContIters; ++it) {
+        brain_interpolate_continuous(brain2, concept_a, concept_b, 0.5f, bench_vec, bench_tok, sizeof(bench_tok));
+    }
+    double cont_us_per_call = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t_cont0
+    ).count() / static_cast<double>(kContIters);
+    std::printf("[T11.6 Continuous Interpolation Latency]: %.2f us/call (%d iterations)\n\n",
+                cont_us_per_call, kContIters);
+    check(cont_us_per_call < 2500.0 && bench_tok[0] != '\0',
+          "T11.6: AVX-512 continuous manifold interpolation executes in < 2.5 ms/call");
 
     brain_destroy(brain2);
 

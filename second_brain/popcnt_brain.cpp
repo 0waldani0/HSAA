@@ -8343,10 +8343,307 @@ struct PopCountGenerativeLLM {
     std::vector<std::array<uint64_t, hsaa_assoc::kW>> vocab_morph_sketch;
     std::vector<SegmentTopicRecord> segment_records;
 
+    // Hardware-coupled 512-D continuous representation space (int8 in [-15, +15]):
+    // directly compatible with 4-bitplane + sign POPCNT units and AVX-512BW int8 MADD kernels.
+    mutable std::vector<std::array<int8_t, D_MODEL>> tok_cont_emb;
+    mutable std::vector<std::array<int8_t, D_MODEL>> tok_next_cont_centroid;
+    mutable std::vector<std::array<int8_t, D_MODEL>> seg_cont_centroid;
+    mutable std::vector<int32_t> tok_cont_norm_sq;
+    mutable bool cont_space_ready = false;
+    mutable bool cont_emb_synced = false;
+
     std::string last_trained_corpus;
     int last_trained_epochs = 0;
     BrainTrainStats last_stats{};
     bool is_trained = false;
+
+    // AVX-512BW / AVX2 accelerated 512-D continuous int8 inner product
+    static inline int32_t continuous_dot_int8_512(const int8_t* a, const int8_t* b) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        __m512i acc = _mm512_setzero_si512();
+        for (int i = 0; i < D_MODEL; i += 32) {
+            __m256i va8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+            __m256i vb8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+            __m512i va16 = _mm512_cvtepi8_epi16(va8);
+            __m512i vb16 = _mm512_cvtepi8_epi16(vb8);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(va16, vb16));
+        }
+        return _mm512_reduce_add_epi32(acc);
+#elif defined(__AVX2__)
+        __m256i acc = _mm256_setzero_si256();
+        for (int i = 0; i < D_MODEL; i += 16) {
+            __m128i va8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+            __m128i vb8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+            __m256i va16 = _mm256_cvtepi8_epi16(va8);
+            __m256i vb16 = _mm256_cvtepi8_epi16(vb8);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va16, vb16));
+        }
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s = _mm_add_epi32(lo, hi);
+        s = _mm_hadd_epi32(s, s);
+        s = _mm_hadd_epi32(s, s);
+        return _mm_cvtsi128_si32(s);
+#else
+        int32_t sum = 0;
+        for (int i = 0; i < D_MODEL; ++i) {
+            sum += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
+        }
+        return sum;
+#endif
+    }
+
+    // Cosine similarity in Q10 fixed-point [-1024, +1024] between two 512-D int8 vectors
+    static inline int32_t continuous_cosine_q10_512(
+        const int8_t* a, int32_t norm_sq_a,
+        const int8_t* b, int32_t norm_sq_b
+    ) {
+        if (norm_sq_a <= 0 || norm_sq_b <= 0) return 0;
+        int32_t dot = continuous_dot_int8_512(a, b);
+        double denom = std::sqrt(static_cast<double>(norm_sq_a) * static_cast<double>(norm_sq_b));
+        if (denom < 1e-9) return 0;
+        int32_t q10 = static_cast<int32_t>(std::llround((static_cast<double>(dot) * 1024.0) / denom));
+        return std::max(-1024, std::min(1024, q10));
+    }
+
+    // Deep 3-layer continuous state interpolation in [-15, +15]^512 (weights in Q8, w_fast + w_mid + w_deep = 256)
+    static inline void deep_interpolate_int8_512(
+        const int8_t* state_fast,
+        const int8_t* state_mid,
+        const int8_t* state_deep,
+        int32_t w_fast_q8,
+        int32_t w_mid_q8,
+        int32_t w_deep_q8,
+        int8_t* out_state
+    ) {
+        for (int d = 0; d < D_MODEL; ++d) {
+            int32_t acc = static_cast<int32_t>(state_fast[d]) * w_fast_q8
+                        + static_cast<int32_t>(state_mid[d])  * w_mid_q8
+                        + static_cast<int32_t>(state_deep[d]) * w_deep_q8;
+            int32_t rounded = (acc >= 0) ? ((acc + 128) >> 8) : -((-acc + 128) >> 8);
+            out_state[d] = static_cast<int8_t>(std::max(-15, std::min(15, rounded)));
+        }
+    }
+
+    // Deterministic construction of the adapted 512-D continuous representation manifold
+    // from lexical-morphological sketches, distributional segment contexts, and role clusters.
+    void rebuild_continuous_representation_space() const {
+        const size_t V = tokenizer.id_to_word.size();
+        tok_cont_emb.assign(V, std::array<int8_t, D_MODEL>{});
+        tok_next_cont_centroid.assign(V, std::array<int8_t, D_MODEL>{});
+        tok_cont_norm_sq.assign(V, 0);
+        seg_cont_centroid.assign(segment_records.size(), std::array<int8_t, D_MODEL>{});
+        cont_space_ready = true;
+        if (V == 0) return;
+
+        // 1. Accumulate continuous distributional context per token from segment_records
+        std::vector<std::array<int32_t, D_MODEL>> dist_acc(V);
+        std::vector<uint32_t> dist_cnt(V, 0);
+        for (size_t t = 0; t < V; ++t) dist_acc[t].fill(0);
+
+        for (const auto& seg : segment_records) {
+            int8_t seg_topic_int8[D_MODEL];
+            for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                uint64_t bits = seg.topic_sketch[w];
+                for (int b = 0; b < 64; ++b) {
+                    seg_topic_int8[w * 64 + b] = ((bits >> b) & 1ULL) ? 4 : -4;
+                }
+            }
+            for (size_t pos = 1; pos + 1 < seg.tokens.size(); ++pos) {
+                int tid = seg.tokens[pos];
+                if (tid < 0 || static_cast<size_t>(tid) >= V) continue;
+                int prev_t = seg.tokens[pos - 1];
+                int next_t = seg.tokens[pos + 1];
+                const uint64_t* p_sk = (prev_t >= 0 && static_cast<size_t>(prev_t) < vocab_morph_sketch.size())
+                    ? vocab_morph_sketch[prev_t].data() : nullptr;
+                const uint64_t* n_sk = (next_t >= 0 && static_cast<size_t>(next_t) < vocab_morph_sketch.size())
+                    ? vocab_morph_sketch[next_t].data() : nullptr;
+
+                auto& acc = dist_acc[tid];
+                for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                    uint64_t pb = p_sk ? p_sk[w] : 0ULL;
+                    uint64_t nb = n_sk ? n_sk[w] : 0ULL;
+                    for (int b = 0; b < 64; ++b) {
+                        int d = w * 64 + b;
+                        int32_t v = seg_topic_int8[d];
+                        if (p_sk) v += ((pb >> b) & 1ULL) ? 3 : -3;
+                        if (n_sk) v += ((nb >> b) & 1ULL) ? 3 : -3;
+                        acc[d] += v;
+                    }
+                }
+                dist_cnt[tid]++;
+            }
+        }
+
+        // 2. Build multi-scale lexical + morphological + distributional continuous vector per token
+        std::vector<std::array<float, D_MODEL>> raw_cont(V);
+        for (size_t t = 0; t < V; ++t) {
+            raw_cont[t].fill(0.0f);
+            const std::string& w_str = tokenizer.id_to_word[t];
+            std::string nw = hsaa_assoc::normalize(w_str.c_str());
+            if (nw.empty()) nw = w_str;
+
+            const uint64_t* full_sk = (t < vocab_morph_sketch.size())
+                ? vocab_morph_sketch[t].data() : nullptr;
+            uint64_t fallback_sk[hsaa_assoc::kW];
+            if (!full_sk) {
+                hsaa_assoc::sketch(nw, fallback_sk);
+                full_sk = fallback_sk;
+            }
+
+            // 65% stem prefix sketch so inflected forms share continuous stem coordinates
+            uint64_t stem_sk[hsaa_assoc::kW];
+            size_t stem_len = (nw.size() >= 5) ? std::max<size_t>(3, (nw.size() * 65) / 100) : nw.size();
+            if (stem_len == nw.size()) {
+                for (int w = 0; w < WORDS_PER_VEC; ++w) stem_sk[w] = full_sk[w];
+            } else {
+                hsaa_assoc::sketch(nw.substr(0, stem_len), stem_sk);
+            }
+
+            uint64_t m_suf = static_cast<uint64_t>(morph_suffix_hash(w_str));
+            for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                uint64_t suf_bits = hsaa_assoc::mix64(m_suf ^ (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(w + 1)));
+                for (int b = 0; b < 64; ++b) {
+                    int d = w * 64 + b;
+                    float val = (((full_sk[w] >> b) & 1ULL) ? 6.0f : -6.0f)
+                              + (((stem_sk[w] >> b) & 1ULL) ? 4.5f : -4.5f)
+                              + (((suf_bits >> b) & 1ULL)   ? 1.5f : -1.5f);
+                    raw_cont[t][d] = val;
+                }
+            }
+
+            auto subwords = split_identifier_subwords(w_str);
+            if (subwords.size() > 1) {
+                for (const auto& sw : subwords) {
+                    std::string nsw = hsaa_assoc::normalize(sw.c_str());
+                    if (nsw.empty()) continue;
+                    uint64_t sw_sk[hsaa_assoc::kW];
+                    hsaa_assoc::sketch(nsw, sw_sk);
+                    for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                        for (int b = 0; b < 64; ++b) {
+                            raw_cont[t][w * 64 + b] += ((sw_sk[w] >> b) & 1ULL) ? 2.5f : -2.5f;
+                        }
+                    }
+                }
+            }
+
+            if (dist_cnt[t] > 0) {
+                float inv_c = 1.0f / static_cast<float>(dist_cnt[t]);
+                for (int d = 0; d < D_MODEL; ++d) {
+                    raw_cont[t][d] += std::max(-6.0f, std::min(6.0f, static_cast<float>(dist_acc[t][d]) * inv_c));
+                }
+            } else if (t < token_topic_sketch.size()) {
+                const uint64_t* tsk = token_topic_sketch[t].data();
+                for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                    for (int b = 0; b < 64; ++b) {
+                        raw_cont[t][w * 64 + b] += ((tsk[w] >> b) & 1ULL) ? 2.5f : -2.5f;
+                    }
+                }
+            }
+        }
+
+        // 3. Smooth continuous manifold across shared syntactic/morphological role clusters
+        std::unordered_map<int, std::array<float, D_MODEL>> role_sum;
+        std::unordered_map<int, int> role_cnt;
+        for (size_t t = 0; t < V && t < tok_to_role.size(); ++t) {
+            int r = tok_to_role[t];
+            if (r < 0 || r == static_cast<int>(t)) continue;
+            if (role_cnt[r] == 0) {
+                role_sum[r] = raw_cont[r];
+                role_cnt[r] = 1;
+            }
+            for (int d = 0; d < D_MODEL; ++d) {
+                role_sum[r][d] += raw_cont[t][d];
+            }
+            role_cnt[r]++;
+        }
+
+        for (size_t t = 0; t < V; ++t) {
+            if (t < tok_to_role.size()) {
+                int r = tok_to_role[t];
+                auto it = role_cnt.find(r);
+                if (it != role_cnt.end() && it->second > 1) {
+                    float inv_rc = 1.0f / static_cast<float>(it->second);
+                    const auto& rvec = role_sum[r];
+                    for (int d = 0; d < D_MODEL; ++d) {
+                        raw_cont[t][d] = 0.78f * raw_cont[t][d] + 0.22f * (rvec[d] * inv_rc);
+                    }
+                }
+            }
+
+            double sq_sum = 0.0;
+            for (int d = 0; d < D_MODEL; ++d) {
+                sq_sum += static_cast<double>(raw_cont[t][d]) * static_cast<double>(raw_cont[t][d]);
+            }
+            double rms = std::sqrt(sq_sum / static_cast<double>(D_MODEL));
+            float scale = (rms > 1e-5) ? static_cast<float>(9.5 / rms) : 1.0f;
+
+            int32_t nsq = 0;
+            for (int d = 0; d < D_MODEL; ++d) {
+                int32_t q = static_cast<int32_t>(std::lround(raw_cont[t][d] * scale));
+                q = std::max(-15, std::min(15, q));
+                if (q == 0) {
+                    const uint64_t* msk = vocab_morph_sketch[t].data();
+                    q = ((msk[d >> 6] >> (d & 63)) & 1ULL) ? 1 : -1;
+                }
+                tok_cont_emb[t][d] = static_cast<int8_t>(q);
+                nsq += q * q;
+            }
+            tok_cont_norm_sq[t] = nsq;
+        }
+
+        // 4. Build predictive next-token continuous centroids from 1-gram horizon transitions
+        auto h1_it = horizon_tables[1].begin();
+        for (; h1_it != horizon_tables[1].end(); ++h1_it) {
+            int prev_tok = static_cast<int>(h1_it->first);
+            if (prev_tok < 0 || static_cast<size_t>(prev_tok) >= V) continue;
+            const auto& entries = h1_it->second;
+            if (entries.empty()) continue;
+            int32_t acc[D_MODEL] = {0};
+            int32_t w_sum = 0;
+            for (const auto& e : entries) {
+                if (e.tok < 0 || static_cast<size_t>(e.tok) >= V) continue;
+                int32_t w = std::max<int32_t>(1, count_bucket(e.count));
+                const auto& cemb = tok_cont_emb[e.tok];
+                for (int d = 0; d < D_MODEL; ++d) {
+                    acc[d] += static_cast<int32_t>(cemb[d]) * w;
+                }
+                w_sum += w;
+            }
+            if (w_sum > 0) {
+                for (int d = 0; d < D_MODEL; ++d) {
+                    int32_t v = (acc[d] >= 0) ? ((acc[d] + w_sum / 2) / w_sum) : -((-acc[d] + w_sum / 2) / w_sum);
+                    tok_next_cont_centroid[prev_tok][d] = static_cast<int8_t>(std::max(-15, std::min(15, v)));
+                }
+            }
+        }
+
+        // 5. Build continuous segment centroids
+        for (size_t s = 0; s < segment_records.size(); ++s) {
+            const auto& seg = segment_records[s];
+            int32_t acc[D_MODEL] = {0};
+            int32_t cnt = 0;
+            for (int ut : seg.unique_content_tokens) {
+                if (ut >= 0 && static_cast<size_t>(ut) < V) {
+                    const auto& cemb = tok_cont_emb[ut];
+                    for (int d = 0; d < D_MODEL; ++d) acc[d] += cemb[d];
+                    ++cnt;
+                }
+            }
+            if (cnt > 0) {
+                for (int d = 0; d < D_MODEL; ++d) {
+                    int32_t v = acc[d] / cnt;
+                    seg_cont_centroid[s][d] = static_cast<int8_t>(std::max(-15, std::min(15, v)));
+                }
+            }
+        }
+    }
+
+    inline void ensure_continuous_representation_space() const {
+        if (!cont_space_ready || tok_cont_emb.size() != tokenizer.id_to_word.size()) {
+            rebuild_continuous_representation_space();
+        }
+    }
 
     static std::vector<std::string> split_identifier_subwords(const std::string& ident) {
         std::vector<std::string> parts;
@@ -8537,6 +8834,12 @@ struct PopCountGenerativeLLM {
         skip_table.clear();
         top_unigrams.clear();
         segment_records.clear();
+        tok_cont_emb.clear();
+        tok_next_cont_centroid.clear();
+        seg_cont_centroid.clear();
+        tok_cont_norm_sq.clear();
+        cont_space_ready = false;
+        cont_emb_synced = false;
 
         auto sort_and_cap = [](const std::unordered_map<int, uint32_t>& m, size_t cap) {
             std::vector<NextTokenEntry> vec;
@@ -9274,9 +9577,27 @@ struct PopCountGenerativeLLM {
         }
         if (r.at != r.n) return false;
 
+        cont_space_ready = false;
+        cont_emb_synced = false;
         is_trained = true;
         return true;
     }
+
+    bool embed_continuous_text(
+        const PopCountBrain* brain,
+        const char* text,
+        float* out_vec512
+    ) const;
+
+    int interpolate_continuous_manifold(
+        const PopCountBrain* brain,
+        const char* text_a,
+        const char* text_b,
+        float alpha,
+        float* out_vec512,
+        char* out_nearest_token,
+        size_t max_len
+    ) const;
 
     int generate(
         const PopCountBrain* brain,
@@ -9481,23 +9802,39 @@ std::string lz77_decompress_bytes(const std::string& in) {
     return out;
 }
 
-std::string hex_to_bytes(const std::string& hex) {
-    if (hex.empty() || (hex.size() & 1U) != 0U) return {};
-    std::string out;
-    out.reserve(hex.size() / 2);
-    auto hex_val = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        return -1;
+std::string hex_to_bytes(const char* hex, size_t n) {
+    if (!hex || n == 0 || (n & 1U) != 0U) return {};
+    static constexpr int8_t kHexLut[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+         0, 1, 2, 3, 4, 5, 6, 7, 8, 9,-1,-1,-1,-1,-1,-1,
+        -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
     };
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-        int hi = hex_val(hex[i]);
-        int lo = hex_val(hex[i + 1]);
-        if (hi < 0 || lo < 0) return {};
-        out.push_back(static_cast<char>((hi << 4) | lo));
+    std::string out(n >> 1, '\0');
+    char* dst = out.data();
+    for (size_t i = 0; i < n; i += 2) {
+        int8_t hi = kHexLut[static_cast<uint8_t>(hex[i])];
+        int8_t lo = kHexLut[static_cast<uint8_t>(hex[i + 1])];
+        if ((hi | lo) < 0) return {};
+        dst[i >> 1] = static_cast<char>((hi << 4) | lo);
     }
     return out;
+}
+
+std::string hex_to_bytes(const std::string& hex) {
+    return hex_to_bytes(hex.data(), hex.size());
 }
 
 std::string escape_tsv_field(const std::string& s) {
@@ -9869,6 +10206,7 @@ int PopCountGenerativeLLM::generate(
     }
 
     if (sublinear_net) {
+        ensure_continuous_representation_space();
         sublinear_net->reset_state();
         for (size_t i = 0; i + 1 < ctx.size(); ++i) {
             if (ctx[i] >= 0 && ctx[i] < sublinear_net->vocab_size) {
@@ -9972,7 +10310,9 @@ int PopCountGenerativeLLM::generate(
                             cand_max_L[e.tok] = L;
                             cand_scores[e.tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
                         } else {
-                            cand_scores[e.tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
+                            // Deep multi-horizon interpolation: lower-order confirmations reinforce
+                            // proportionally to their horizon depth L without overriding primary horizon priority.
+                            cand_scores[e.tok] += static_cast<int64_t>(L) * (static_cast<int64_t>(b) * 64LL + (prob_b / 8));
                         }
                     }
                 }
@@ -10022,6 +10362,36 @@ int PopCountGenerativeLLM::generate(
                                 cand_scores[e.tok] = std::max(cand_scores[e.tok], role_sc);
                             } else {
                                 cand_scores[e.tok] += static_cast<int64_t>(b) * 64LL + (prob_b / 8);
+                            }
+                        }
+                    }
+                }
+                // Continuous Manifold Analogical Backoff: when exact multi-word & role horizons miss on
+                // unseen/inflected tail tokens, interpolate transitions from nearest neighbors in tok_cont_emb.
+                if (cand_scores.empty() && !ctx.empty()) {
+                    const int last_t = ctx.back();
+                    if (last_t >= 0 && static_cast<size_t>(last_t) < tok_cont_emb.size()) {
+                        const int8_t* q_vec = tok_cont_emb[last_t].data();
+                        const int32_t q_nsq = tok_cont_norm_sq[last_t];
+                        int best_nn = -1;
+                        int32_t best_cos = 680; // >= 0.664 cosine threshold in Q10
+                        const size_t first_dyn = static_cast<size_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS);
+                        for (size_t tid = first_dyn; tid < tok_cont_emb.size(); ++tid) {
+                            if (static_cast<int>(tid) == last_t) continue;
+                            int32_t cos_q10 = continuous_cosine_q10_512(q_vec, q_nsq, tok_cont_emb[tid].data(), tok_cont_norm_sq[tid]);
+                            if (cos_q10 > best_cos) {
+                                best_cos = cos_q10;
+                                best_nn = static_cast<int>(tid);
+                            }
+                        }
+                        if (best_nn >= 0) {
+                            auto nn_it = horizon_tables[1].find(static_cast<uint64_t>(best_nn));
+                            if (nn_it != horizon_tables[1].end()) {
+                                for (const auto& e : nn_it->second) {
+                                    if (cand_scores.size() >= SHORTLIST_CAP) break;
+                                    int64_t interp_sc = (static_cast<int64_t>(best_cos) * 64LL) + static_cast<int64_t>(count_bucket(e.count)) * 512LL;
+                                    cand_scores[e.tok] = std::max(cand_scores[e.tok], interp_sc);
+                                }
                             }
                         }
                     }
@@ -10134,6 +10504,7 @@ int PopCountGenerativeLLM::generate(
 
         uint64_t sb[WORDS_PER_VEC] = {0};
         uint64_t mp[NUM_BIT_PLANES][WORDS_PER_VEC] = {{0}};
+        int8_t deep_interp_state[D_MODEL] = {0};
         bool has_ste_out = false;
         if (sublinear_net && !ctx.empty() && ctx.back() >= 0 && ctx.back() < sublinear_net->vocab_size) {
             uint32_t eids[16];
@@ -10146,16 +10517,37 @@ int PopCountGenerativeLLM::generate(
                 sublinear_net->top_k,
                 sublinear_net->ffn_out
             );
-            pack_activation_bitplanes(sublinear_net->ffn_out, sb, mp);
+            // Deep 3-layer state interpolation across fast context manifold, mid-depth mLGGRU
+            // recurrent state, and deep 4KB ternary micro-expert output (Q8 weights: 48 + 64 + 144 = 256).
+            int8_t fast_ctx_state[D_MODEL] = {0};
+            if (static_cast<size_t>(ctx.back()) < tok_cont_emb.size()) {
+                const auto& cur_c = tok_cont_emb[ctx.back()];
+                if (ctx.size() >= 2 && static_cast<size_t>(ctx[ctx.size() - 2]) < tok_cont_emb.size()) {
+                    const auto& prev_c = tok_cont_emb[ctx[ctx.size() - 2]];
+                    for (int d = 0; d < D_MODEL; ++d) {
+                        fast_ctx_state[d] = static_cast<int8_t>((static_cast<int>(cur_c[d]) * 3 + static_cast<int>(prev_c[d])) >> 2);
+                    }
+                } else {
+                    std::memcpy(fast_ctx_state, cur_c.data(), D_MODEL);
+                }
+            }
+            deep_interpolate_int8_512(
+                fast_ctx_state,
+                sublinear_net->mlgru_out,
+                sublinear_net->ffn_out,
+                48, 64, 144,
+                deep_interp_state
+            );
+            pack_activation_bitplanes(deep_interp_state, sb, mp);
             has_ste_out = true;
 
             // Break the unseen-context shortlist ceiling: when all n-gram/role/fact tables
-            // missed and we fell back to top_unigrams, allow the neural STE path to inject
-            // its top-scoring vocabulary candidate with the standard unigram base score.
+            // missed and we fell back to top_unigrams, allow the deep-interpolated STE path
+            // to inject its top-scoring vocabulary candidate with the standard unigram base score.
             if (used_unigram_fallback) {
                 int32_t ste_top_score = 0;
                 int ste_top_tok = compute_vocab_argmax_popcnt(
-                    sublinear_net->ffn_out,
+                    deep_interp_state,
                     sublinear_net->vocab_pos.data(),
                     sublinear_net->vocab_neg.data(),
                     static_cast<int>(std::min<size_t>(tokenizer.id_to_word.size(), static_cast<size_t>(sublinear_net->vocab_size))),
@@ -10243,6 +10635,15 @@ int PopCountGenerativeLLM::generate(
                 // Give the 512-bit STE neural bitplanes substantial voting weight on low-order
                 // backoff (L <= 1) so recurrent state drives disambiguation instead of acting as a 0.006% tie-breaker.
                 sc += (seen_L <= 1) ? (static_cast<int64_t>(ste_dot) * 8LL) : (static_cast<int64_t>(ste_dot) / 2LL);
+
+                if (seen_L <= 1 && static_cast<size_t>(cand) < tok_cont_emb.size() &&
+                    prev_tok >= 0 && static_cast<size_t>(prev_tok) < tok_next_cont_centroid.size()) {
+                    int32_t cont_dot = continuous_dot_int8_512(
+                        tok_cont_emb[cand].data(),
+                        tok_next_cont_centroid[prev_tok].data()
+                    );
+                    sc += static_cast<int64_t>(cont_dot) / 16LL;
+                }
             }
 
             if (cand >= 0 && static_cast<size_t>(cand) < token_topic_sketch.size()) {
@@ -10549,7 +10950,7 @@ POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath
     while (std::getline(ifs, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("#__POPCNT_LLM_BIN2__ ", 0) == 0) {
-            std::string blob = hex_to_bytes(line.substr(21));
+            std::string blob = hex_to_bytes(line.data() + 21, line.size() - 21);
             if (blob.empty()) return 0;
             if (!brain->llm_engine) {
                 brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
@@ -10646,6 +11047,331 @@ POPCNT_BRAIN_API int brain_generate(
         brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
     }
     return brain->llm_engine->generate(brain, prompt, out_text, max_len, max_tokens, temperature);
+}
+
+bool PopCountGenerativeLLM::embed_continuous_text(
+    const PopCountBrain* brain,
+    const char* text,
+    float* out_vec512
+) const {
+    if (!text || !out_vec512) return false;
+    for (int d = 0; d < D_MODEL; ++d) out_vec512[d] = 0.0f;
+
+    std::string raw(text);
+    if (raw.empty()) return false;
+
+    ensure_continuous_representation_space();
+    auto toks = const_cast<CodeProseTokenizer&>(tokenizer).tokenize_segment(raw, false, false);
+    float accum[D_MODEL] = {0.0f};
+    int32_t fast_state[D_MODEL] = {0};
+    int32_t slow_state[D_MODEL] = {0};
+    int valid_toks = 0;
+
+    for (size_t i = 0; i < toks.size(); ++i) {
+        int tid = toks[i];
+        float pos_w = 1.0f + 0.35f * (static_cast<float>(i + 1) / static_cast<float>(std::max<size_t>(1, toks.size())));
+        if (tid >= 0 && static_cast<size_t>(tid) < tok_cont_emb.size()) {
+            const std::string& w_str = tokenizer.id_to_word[tid];
+            float content_w = is_content_token(w_str) ? 1.6f : 0.45f;
+            float w = pos_w * content_w;
+            const auto& cemb = tok_cont_emb[tid];
+            const auto& ncent = tok_next_cont_centroid[tid];
+            for (int d = 0; d < D_MODEL; ++d) {
+                int32_t v = cemb[d];
+                fast_state[d] = (fast_state[d] * 3 + v * 5) >> 3;
+                slow_state[d] = (slow_state[d] * 7 + v * 1) >> 3;
+                accum[d] += w * (0.75f * static_cast<float>(v) + 0.25f * static_cast<float>(ncent[d]));
+            }
+            ++valid_toks;
+        }
+    }
+
+    // Blend multi-scale lexical-morphological continuous features directly from raw text
+    // so unseen/inflected words and OOV identifiers project smoothly onto the same manifold.
+    std::string norm_all = hsaa_assoc::normalize(raw.c_str());
+    if (!norm_all.empty()) {
+        uint64_t full_sk[hsaa_assoc::kW];
+        hsaa_assoc::sketch(norm_all, full_sk);
+        float lex_w = (valid_toks > 0) ? 3.5f : 9.0f;
+        for (int w = 0; w < WORDS_PER_VEC; ++w) {
+            for (int b = 0; b < 64; ++b) {
+                accum[w * 64 + b] += (((full_sk[w] >> b) & 1ULL) ? lex_w : -lex_w);
+            }
+        }
+        std::string cur;
+        for (size_t i = 0; i <= norm_all.size(); ++i) {
+            char c = (i < norm_all.size()) ? norm_all[i] : ' ';
+            if (c == ' ') {
+                if (cur.size() >= 3) {
+                    size_t slen = (cur.size() >= 5) ? std::max<size_t>(3, (cur.size() * 65) / 100) : cur.size();
+                    uint64_t st_sk[hsaa_assoc::kW];
+                    hsaa_assoc::sketch(cur.substr(0, slen), st_sk);
+                    for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                        for (int b = 0; b < 64; ++b) {
+                            accum[w * 64 + b] += (((st_sk[w] >> b) & 1ULL) ? 3.0f : -3.0f);
+                        }
+                    }
+                }
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+    }
+
+    // Deep interpolation of fast syntactic EMA and slow semantic EMA states
+    if (valid_toks > 0) {
+        for (int d = 0; d < D_MODEL; ++d) {
+            float deep_ema = 0.6f * static_cast<float>(fast_state[d]) + 0.4f * static_cast<float>(slow_state[d]);
+            accum[d] += 0.5f * deep_ema;
+        }
+    }
+
+    // Reinforce with associative fact manifold if brain has matching subject/object facts
+    if (brain && !brain->assoc_facts.empty() && !norm_all.empty()) {
+        uint64_t q_sk[hsaa_assoc::kW];
+        hsaa_assoc::sketch(norm_all, q_sk);
+        for (const auto& f : brain->assoc_facts) {
+            int32_t s_dot = hsaa_assoc::dot512(q_sk, f.skey);
+            if (s_dot >= kAssocMinSubjectDot) {
+                uint64_t o_sk[hsaa_assoc::kW];
+                hsaa_assoc::sketch(hsaa_assoc::normalize(f.object.c_str()), o_sk);
+                float fw = static_cast<float>(s_dot) / 256.0f;
+                for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                    for (int b = 0; b < 64; ++b) {
+                        accum[w * 64 + b] += fw * (((o_sk[w] >> b) & 1ULL) ? 2.5f : -2.5f);
+                    }
+                }
+            }
+        }
+    }
+
+    // L2 normalize to unit hypersphere S^511
+    double norm_sq = 0.0;
+    for (int d = 0; d < D_MODEL; ++d) {
+        norm_sq += static_cast<double>(accum[d]) * static_cast<double>(accum[d]);
+    }
+    if (norm_sq < 1e-12) return false;
+    float inv_norm = static_cast<float>(1.0 / std::sqrt(norm_sq));
+    for (int d = 0; d < D_MODEL; ++d) {
+        out_vec512[d] = accum[d] * inv_norm;
+    }
+    return true;
+}
+
+int PopCountGenerativeLLM::interpolate_continuous_manifold(
+    const PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b,
+    float alpha,
+    float* out_vec512,
+    char* out_nearest_token,
+    size_t max_len
+) const {
+    if (out_nearest_token && max_len > 0) out_nearest_token[0] = '\0';
+    if (!text_a || !text_b || !out_vec512) return 0;
+
+    float clamped_a = std::max(0.0f, std::min(1.0f, alpha));
+    float va[D_MODEL];
+    float vb[D_MODEL];
+    if (!embed_continuous_text(brain, text_a, va)) return 0;
+    if (!embed_continuous_text(brain, text_b, vb)) return 0;
+
+    // Geodesic Spherical Linear Interpolation (SLERP) on S^511
+    double dot = 0.0;
+    for (int d = 0; d < D_MODEL; ++d) {
+        dot += static_cast<double>(va[d]) * static_cast<double>(vb[d]);
+    }
+    dot = std::max(-1.0, std::min(1.0, dot));
+
+    float w_a = 1.0f - clamped_a;
+    float w_b = clamped_a;
+    bool use_antipodal_arc = false;
+    if (dot < 0.9995 && dot > -0.9995) {
+        double omega = std::acos(dot);
+        double sin_omega = std::sin(omega);
+        if (sin_omega > 1e-6) {
+            w_a = static_cast<float>(std::sin((1.0 - static_cast<double>(clamped_a)) * omega) / sin_omega);
+            w_b = static_cast<float>(std::sin(static_cast<double>(clamped_a) * omega) / sin_omega);
+        }
+    } else if (dot <= -0.9995) {
+        use_antipodal_arc = true;
+    }
+
+    float interp[D_MODEL];
+    if (use_antipodal_arc) {
+        // Construct deterministic orthogonal unit tangent vector u_orth on S^511 via Gram-Schmidt
+        int min_idx = 0;
+        float min_abs = std::fabs(va[0]);
+        for (int d = 1; d < D_MODEL; ++d) {
+            float a_abs = std::fabs(va[d]);
+            if (a_abs < min_abs) {
+                min_abs = a_abs;
+                min_idx = d;
+            }
+        }
+        float u_orth[D_MODEL];
+        double proj = static_cast<double>(va[min_idx]);
+        double orth_nsq = 0.0;
+        for (int d = 0; d < D_MODEL; ++d) {
+            double comp = (d == min_idx ? 1.0 : 0.0) - proj * static_cast<double>(va[d]);
+            u_orth[d] = static_cast<float>(comp);
+            orth_nsq += comp * comp;
+        }
+        float inv_orth = (orth_nsq > 1e-12) ? static_cast<float>(1.0 / std::sqrt(orth_nsq)) : 1.0f;
+        const float theta = clamped_a * 3.14159265358979323846f;
+        const float ca = std::cos(theta);
+        const float sa = std::sin(theta);
+        for (int d = 0; d < D_MODEL; ++d) {
+            interp[d] = ca * va[d] + sa * (u_orth[d] * inv_orth);
+        }
+    } else {
+        for (int d = 0; d < D_MODEL; ++d) {
+            interp[d] = w_a * va[d] + w_b * vb[d];
+        }
+    }
+    double nsq = 0.0;
+    for (int d = 0; d < D_MODEL; ++d) {
+        nsq += static_cast<double>(interp[d]) * static_cast<double>(interp[d]);
+    }
+    float inv_n = (nsq > 1e-12) ? static_cast<float>(1.0 / std::sqrt(nsq)) : 1.0f;
+    for (int d = 0; d < D_MODEL; ++d) {
+        interp[d] *= inv_n;
+    }
+
+    // Continuous Hopfield Attractor Refinement + Nearest Concept Resolution over tok_cont_emb
+    int8_t q_int8[D_MODEL];
+    int32_t q_nsq = 0;
+    for (int d = 0; d < D_MODEL; ++d) {
+        int32_t q = static_cast<int32_t>(std::lround(interp[d] * 220.0f));
+        q = std::max(-15, std::min(15, q));
+        q_int8[d] = static_cast<int8_t>(q);
+        q_nsq += q * q;
+    }
+
+    int best_tid = -1;
+    int32_t best_cos_q10 = -2048;
+    float attractor[D_MODEL] = {0.0f};
+    float attractor_w_sum = 0.0f;
+
+    const size_t first_dyn = static_cast<size_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS);
+    for (size_t tid = first_dyn; tid < tok_cont_emb.size(); ++tid) {
+        const std::string& w_str = tokenizer.id_to_word[tid];
+        if (!is_content_token(w_str)) continue;
+        int32_t cos_q10 = continuous_cosine_q10_512(
+            q_int8, q_nsq,
+            tok_cont_emb[tid].data(), tok_cont_norm_sq[tid]
+        );
+        if (cos_q10 > best_cos_q10) {
+            best_cos_q10 = cos_q10;
+            best_tid = static_cast<int>(tid);
+        }
+        if (cos_q10 > 512) {
+            float aw = static_cast<float>(cos_q10 - 512) / 512.0f;
+            aw = aw * aw;
+            float inv_t = (tok_cont_norm_sq[tid] > 0)
+                ? (1.0f / std::sqrt(static_cast<float>(tok_cont_norm_sq[tid]))) : 0.0f;
+            for (int d = 0; d < D_MODEL; ++d) {
+                attractor[d] += aw * static_cast<float>(tok_cont_emb[tid][d]) * inv_t;
+            }
+            attractor_w_sum += aw;
+        }
+    }
+
+    // Blend geodesic SLERP vector with continuous manifold attractor (preserving strict endpoint fidelity at alpha=0 and alpha=1)
+    float manifold_pull = 0.18f * (4.0f * clamped_a * (1.0f - clamped_a));
+    if (attractor_w_sum > 1e-5f && manifold_pull > 1e-4f) {
+        double ansq = 0.0;
+        for (int d = 0; d < D_MODEL; ++d) {
+            ansq += static_cast<double>(attractor[d]) * static_cast<double>(attractor[d]);
+        }
+        if (ansq > 1e-12) {
+            float inv_a = static_cast<float>(1.0 / std::sqrt(ansq));
+            double final_nsq = 0.0;
+            for (int d = 0; d < D_MODEL; ++d) {
+                interp[d] = (1.0f - manifold_pull) * interp[d] + manifold_pull * (attractor[d] * inv_a);
+                final_nsq += static_cast<double>(interp[d]) * static_cast<double>(interp[d]);
+            }
+            float inv_f = (final_nsq > 1e-12) ? static_cast<float>(1.0 / std::sqrt(final_nsq)) : 1.0f;
+            for (int d = 0; d < D_MODEL; ++d) {
+                interp[d] *= inv_f;
+            }
+        }
+    }
+
+    for (int d = 0; d < D_MODEL; ++d) {
+        out_vec512[d] = interp[d];
+    }
+
+    if (out_nearest_token && max_len > 0 && best_tid >= 0 &&
+        static_cast<size_t>(best_tid) < tokenizer.id_to_word.size()) {
+        const std::string& w_str = tokenizer.id_to_word[best_tid];
+        size_t copy_len = std::min(w_str.size(), max_len - 1);
+        std::memcpy(out_nearest_token, w_str.data(), copy_len);
+        out_nearest_token[copy_len] = '\0';
+        return static_cast<int>(copy_len);
+    }
+    return 1;
+}
+
+POPCNT_BRAIN_API int brain_embed_continuous(
+    PopCountBrain* brain,
+    const char* text,
+    float* out_vec512
+) {
+    if (!brain || !text || !out_vec512) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    return brain->llm_engine->embed_continuous_text(brain, text, out_vec512) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API float brain_continuous_similarity(
+    PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b
+) {
+    if (!brain || !text_a || !text_b) return 0.0f;
+    float va[D_MODEL];
+    float vb[D_MODEL];
+    if (!brain_embed_continuous(brain, text_a, va)) return 0.0f;
+    if (!brain_embed_continuous(brain, text_b, vb)) return 0.0f;
+#if defined(__AVX512F__)
+    __m512 acc = _mm512_setzero_ps();
+    for (int d = 0; d < D_MODEL; d += 16) {
+        __m512 a = _mm512_loadu_ps(va + d);
+        __m512 b = _mm512_loadu_ps(vb + d);
+        acc = _mm512_fmadd_ps(a, b, acc);
+    }
+    float dot = _mm512_reduce_add_ps(acc);
+#else
+    float dot = 0.0f;
+    for (int d = 0; d < D_MODEL; ++d) dot += va[d] * vb[d];
+#endif
+    return std::max(-1.0f, std::min(1.0f, dot));
+}
+
+POPCNT_BRAIN_API int brain_interpolate_continuous(
+    PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b,
+    float alpha,
+    float* out_vec512,
+    char* out_nearest_token,
+    size_t max_len
+) {
+    if (!brain || !text_a || !text_b || !out_vec512) {
+        if (out_nearest_token && max_len > 0) out_nearest_token[0] = '\0';
+        return 0;
+    }
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    return brain->llm_engine->interpolate_continuous_manifold(
+        brain, text_a, text_b, alpha, out_vec512, out_nearest_token, max_len
+    );
 }
 
 } // extern "C"

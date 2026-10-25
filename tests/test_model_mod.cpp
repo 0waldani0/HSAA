@@ -1,12 +1,15 @@
 #include "model_mod.h"
 #include "vsa_db.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 
 #include <cstdint>
 #include <cstddef>
@@ -14,11 +17,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 #include <vector>
 #include <iostream>
 #include <iomanip>
-
-#pragma comment(lib, "psapi.lib")
 
 // =============================================================================
 // Test Framework Harness
@@ -50,6 +52,7 @@ static int g_tests_failed = 0;
     } while (0)
 
 static double qpc_time_us() {
+#if defined(_WIN32)
     static LARGE_INTEGER freq;
     static bool init = false;
     if (!init) {
@@ -59,6 +62,10 @@ static double qpc_time_us() {
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     return (static_cast<double>(counter.QuadPart) * 1000000.0) / static_cast<double>(freq.QuadPart);
+#else
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration<double, std::micro>(now).count();
+#endif
 }
 
 // =============================================================================
@@ -391,6 +398,56 @@ static bool test_interleaved_swapping_and_plasticity() {
     return true;
 }
 
+// 11. Continuous Representation Geodesic Interpolation & Deep Multi-Layer Trajectory Blending
+static bool test_continuous_representation_and_deep_interpolation() {
+    ModelContext* ctx = model_create_context(28);
+    TEST_ASSERT(ctx != nullptr, "Context creation failed");
+
+    std::vector<float> rep_a(MODEL_DEFAULT_DIM_N);
+    std::vector<float> rep_b(MODEL_DEFAULT_DIM_N);
+    std::vector<float> out_0(MODEL_DEFAULT_DIM_N, 0.0f);
+    std::vector<float> out_mid(MODEL_DEFAULT_DIM_N, 0.0f);
+    std::vector<float> out_1(MODEL_DEFAULT_DIM_N, 0.0f);
+    std::vector<float> deep_out(MODEL_DEFAULT_DIM_N, 0.0f);
+
+    for (size_t i = 0; i < MODEL_DEFAULT_DIM_N; ++i) {
+        rep_a[i] = std::sin(static_cast<float>(i) * 0.03f);
+        rep_b[i] = std::cos(static_cast<float>(i) * 0.05f);
+    }
+
+    TEST_ASSERT(model_interpolate_representations(rep_a.data(), rep_b.data(), MODEL_DEFAULT_DIM_N, 0.0f, out_0.data()) == 0,
+                "Geodesic SLERP at alpha=0.0 must succeed");
+    TEST_ASSERT(model_interpolate_representations(rep_a.data(), rep_b.data(), MODEL_DEFAULT_DIM_N, 0.5f, out_mid.data()) == 0,
+                "Geodesic SLERP at alpha=0.5 must succeed");
+    TEST_ASSERT(model_interpolate_representations(rep_a.data(), rep_b.data(), MODEL_DEFAULT_DIM_N, 1.0f, out_1.data()) == 0,
+                "Geodesic SLERP at alpha=1.0 must succeed");
+
+    double dot_m_a = 0.0, dot_m_b = 0.0, norm_m = 0.0, norm_a = 0.0, norm_b = 0.0;
+    for (size_t i = 0; i < MODEL_DEFAULT_DIM_N; ++i) {
+        dot_m_a += static_cast<double>(out_mid[i]) * static_cast<double>(out_0[i]);
+        dot_m_b += static_cast<double>(out_mid[i]) * static_cast<double>(out_1[i]);
+        norm_m += static_cast<double>(out_mid[i]) * static_cast<double>(out_mid[i]);
+        norm_a += static_cast<double>(out_0[i]) * static_cast<double>(out_0[i]);
+        norm_b += static_cast<double>(out_1[i]) * static_cast<double>(out_1[i]);
+    }
+    double cos_ma = dot_m_a / std::sqrt(norm_m * norm_a);
+    double cos_mb = dot_m_b / std::sqrt(norm_m * norm_b);
+    TEST_ASSERT(cos_ma > 0.65 && cos_mb > 0.65 && std::abs(cos_ma - cos_mb) < 0.02,
+                "Geodesic midpoint must bisect endpoints on hypersphere");
+
+    TEST_ASSERT(model_forward_deep_interpolated(ctx, out_mid.data(), deep_out.data()) == 0,
+                "Deep 28-layer interpolated forward pass must succeed");
+    double deep_energy = 0.0;
+    for (size_t i = 0; i < MODEL_DEFAULT_DIM_N; ++i) {
+        TEST_ASSERT(!std::isnan(deep_out[i]) && !std::isinf(deep_out[i]), "Deep interpolated output must be finite");
+        deep_energy += static_cast<double>(deep_out[i]) * static_cast<double>(deep_out[i]);
+    }
+    TEST_ASSERT(deep_energy > 0.0, "Deep interpolated output must carry non-zero energy");
+
+    model_destroy_context(ctx);
+    return true;
+}
+
 // =============================================================================
 // Main Test Runner
 // =============================================================================
@@ -410,6 +467,7 @@ int main() {
     RUN_TEST(test_forward_vsa_associative);
     RUN_TEST(test_adversarial_boundaries);
     RUN_TEST(test_interleaved_swapping_and_plasticity);
+    RUN_TEST(test_continuous_representation_and_deep_interpolation);
 
     std::printf("=================================================================\n");
     std::printf("Test Summary: %d Run, %d Passed, %d Failed\n", g_tests_run, g_tests_passed, g_tests_failed);

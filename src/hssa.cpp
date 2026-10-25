@@ -1,11 +1,47 @@
 #include "hssa.h"
 #include "ptq_cuda.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+typedef union {
+    int64_t QuadPart;
+} LARGE_INTEGER;
+static inline void QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) {
+    lpFrequency->QuadPart = 1000000000LL;
+}
+static inline void QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    lpPerformanceCount->QuadPart = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+static inline void* _aligned_malloc(size_t size, size_t alignment) {
+    void* ptr = nullptr;
+    size_t aligned_sz = (size + alignment - 1) & ~(alignment - 1);
+    if (posix_memalign(&ptr, alignment, aligned_sz) != 0) return nullptr;
+    return ptr;
+}
+static inline void _aligned_free(void* ptr) {
+    free(ptr);
+}
+#ifndef _TRUNCATE
+#define _TRUNCATE ((size_t)-1)
+#endif
+static inline void strncpy_s(char* dest, size_t dest_sz, const char* src, size_t count) {
+    if (!dest || dest_sz == 0) return;
+    if (!src) { dest[0] = '\0'; return; }
+    size_t n = (count == _TRUNCATE || count >= dest_sz) ? (dest_sz - 1) : count;
+    strncpy(dest, src, n);
+    dest[n] = '\0';
+}
+#endif
 #include <immintrin.h>
 
 #include <cstdint>
@@ -176,6 +212,12 @@ HssaContext* hssa_create(uint32_t num_layers) {
     }
     build_deterministic_unembedding(ctx->unembed_weights, HSSA_DEFAULT_VOCAB);
 
+    // Preallocate 64-byte aligned multi-depth continuous interpolation scratchpad (3 * 1024 floats) in reserved[0]
+    ctx->reserved[0] = _aligned_malloc(3 * HSSA_HIDDEN_DIM * sizeof(float), HSSA_ALIGNMENT);
+    if (ctx->reserved[0]) {
+        std::memset(ctx->reserved[0], 0, 3 * HSSA_HIDDEN_DIM * sizeof(float));
+    }
+
     return ctx;
 }
 
@@ -238,6 +280,10 @@ void hssa_destroy(HssaContext* ctx) {
     if (ctx->scratch_state) _aligned_free(ctx->scratch_state);
     if (ctx->scratch_vsa) _aligned_free(ctx->scratch_vsa);
     if (ctx->attractor_patterns) _aligned_free(ctx->attractor_patterns);
+    if (ctx->reserved[0]) {
+        _aligned_free(ctx->reserved[0]);
+        ctx->reserved[0] = nullptr;
+    }
 
     // Milestone M3: candidate assertion registry, unembedding matrix, logit buffer
     if (ctx->assertions) {
@@ -1377,11 +1423,11 @@ int hssa_update_tt16(HssaContext* ctx, uint32_t layer_idx, const float* u_delta,
 
     HssaLayer* lyr = &ctx->layers[layer_idx];
     lyr->reserved[0] = (void*)(uintptr_t)1;
-    size_t sz = HSSA_TT16_CORE_SIZE;
+    static_assert((HSSA_TT16_CORE_SIZE % 64) == 0, "HSSA_TT16_CORE_SIZE must be a multiple of 64");
+    const size_t sz = HSSA_TT16_CORE_SIZE;
 
     // 4-way AVX-512 unrolled vector addition
-    size_t i = 0;
-    for (; i + 64 <= sz; i += 64) {
+    for (size_t i = 0; i < sz; i += 64) {
         __m512 u0 = _mm512_loadu_ps(lyr->tt_u + i);
         __m512 u1 = _mm512_loadu_ps(lyr->tt_u + i + 16);
         __m512 u2 = _mm512_loadu_ps(lyr->tt_u + i + 32);
@@ -1411,10 +1457,6 @@ int hssa_update_tt16(HssaContext* ctx, uint32_t layer_idx, const float* u_delta,
         _mm512_storeu_ps(lyr->tt_v + i + 16, _mm512_add_ps(v1, dv1));
         _mm512_storeu_ps(lyr->tt_v + i + 32, _mm512_add_ps(v2, dv2));
         _mm512_storeu_ps(lyr->tt_v + i + 48, _mm512_add_ps(v3, dv3));
-    }
-    for (; i < sz; ++i) {
-        lyr->tt_u[i] += u_delta[i];
-        lyr->tt_v[i] += v_delta[i];
     }
 
     // The GPU bridge owns ONE synthetic 1024x1024 matrix for the whole context and
@@ -1452,4 +1494,303 @@ HssaLayer* hssa_get_layer(HssaContext* ctx, uint32_t layer_idx) {
 size_t hssa_get_state_memory_bytes(const HssaContext* ctx) {
     if (!ctx) return 0;
     return (size_t)ctx->config.num_layers * HSSA_DELTANET_STATE_SIZE * sizeof(float);
+}
+
+/*
+ * =============================================================================
+ * Adapted Continuous Representation Spaces & Deep Interpolation (AVX-512)
+ * =============================================================================
+ */
+
+int hssa_interpolate_continuous_states(
+    const HssaContext* ctx,
+    const float* state_a,
+    const float* state_b,
+    float alpha,
+    float* out_state
+) {
+    if (!state_a || !state_b || !out_state) return -1;
+    const float t = std::max(0.0f, std::min(1.0f, alpha));
+
+    __m512 acc_aa = _mm512_setzero_ps();
+    __m512 acc_bb = _mm512_setzero_ps();
+    __m512 acc_ab = _mm512_setzero_ps();
+
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+        __m512 va = _mm512_loadu_ps(state_a + i);
+        __m512 vb = _mm512_loadu_ps(state_b + i);
+        acc_aa = _mm512_fmadd_ps(va, va, acc_aa);
+        acc_bb = _mm512_fmadd_ps(vb, vb, acc_bb);
+        acc_ab = _mm512_fmadd_ps(va, vb, acc_ab);
+    }
+
+    const float norm_a = std::sqrt(_mm512_reduce_add_ps(acc_aa));
+    const float norm_b = std::sqrt(_mm512_reduce_add_ps(acc_bb));
+    const float dot_ab = _mm512_reduce_add_ps(acc_ab);
+
+    float w_a = 1.0f - t;
+    float w_b = t;
+    const float target_norm = (1.0f - t) * norm_a + t * norm_b;
+    bool use_antipodal = false;
+    bool rescale_to_target = false;
+
+    if (norm_a > 1e-6f && norm_b > 1e-6f) {
+        float cos_theta = dot_ab / (norm_a * norm_b);
+        cos_theta = std::max(-1.0f, std::min(1.0f, cos_theta));
+        if (cos_theta < 0.9995f && cos_theta > -0.9995f) {
+            float omega = std::acos(cos_theta);
+            float sin_omega = std::sin(omega);
+            if (sin_omega > 1e-6f) {
+                w_a = (std::sin((1.0f - t) * omega) / sin_omega) * (target_norm / norm_a);
+                w_b = (std::sin(t * omega) / sin_omega) * (target_norm / norm_b);
+            }
+        } else if (cos_theta <= -0.9995f) {
+            use_antipodal = true;
+        } else {
+            rescale_to_target = true;
+        }
+    }
+
+    if (use_antipodal) {
+        size_t min_idx = 0;
+        float min_abs = std::fabs(state_a[0]);
+        for (size_t i = 1; i < HSSA_HIDDEN_DIM; ++i) {
+            float a_abs = std::fabs(state_a[i]);
+            if (a_abs < min_abs) {
+                min_abs = a_abs;
+                min_idx = i;
+            }
+        }
+        const float inv_na = 1.0f / norm_a;
+        const float proj = state_a[min_idx] * inv_na;
+        alignas(64) float u_orth[HSSA_HIDDEN_DIM];
+        float orth_nsq = 0.0f;
+        for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+            float ua = state_a[i] * inv_na;
+            float comp = ((i == min_idx) ? 1.0f : 0.0f) - proj * ua;
+            u_orth[i] = comp;
+            orth_nsq += comp * comp;
+        }
+        const float inv_orth = (orth_nsq > 1e-12f) ? (1.0f / std::sqrt(orth_nsq)) : 1.0f;
+        const float theta = t * 3.14159265358979323846f;
+        const float scale_a = std::cos(theta) * (target_norm * inv_na);
+        const float scale_o = std::sin(theta) * (target_norm * inv_orth);
+        __m512 vs_a = _mm512_set1_ps(scale_a);
+        __m512 vs_o = _mm512_set1_ps(scale_o);
+        for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+            __m512 va = _mm512_loadu_ps(state_a + i);
+            __m512 vo = _mm512_load_ps(u_orth + i);
+            _mm512_storeu_ps(out_state + i, _mm512_fmadd_ps(va, vs_a, _mm512_mul_ps(vo, vs_o)));
+        }
+    } else {
+        __m512 vw_a = _mm512_set1_ps(w_a);
+        __m512 vw_b = _mm512_set1_ps(w_b);
+        __m512 acc_out = _mm512_setzero_ps();
+        for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+            __m512 va = _mm512_loadu_ps(state_a + i);
+            __m512 vb = _mm512_loadu_ps(state_b + i);
+            __m512 vi = _mm512_fmadd_ps(va, vw_a, _mm512_mul_ps(vb, vw_b));
+            _mm512_storeu_ps(out_state + i, vi);
+            acc_out = _mm512_fmadd_ps(vi, vi, acc_out);
+        }
+        if (rescale_to_target) {
+            float out_norm = std::sqrt(_mm512_reduce_add_ps(acc_out));
+            if (out_norm > 1e-6f) {
+                __m512 v_scale = _mm512_set1_ps(target_norm / out_norm);
+                for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+                    _mm512_storeu_ps(out_state + i, _mm512_mul_ps(_mm512_loadu_ps(out_state + i), v_scale));
+                }
+            }
+        }
+    }
+
+    // At interior points on the geodesic (0 < t < 1), gently project toward the Hopfield attractor manifold
+    if (ctx && ctx->attractor_patterns && ctx->num_attractor_patterns > 0 && t > 1e-4f && t < 0.9999f) {
+        alignas(64) float hop_vec[HSSA_HIDDEN_DIM];
+        std::memcpy(hop_vec, out_state, HSSA_HIDDEN_DIM * sizeof(float));
+        relax_hopfield_attractor(ctx, hop_vec, 2);
+        const float pull = 0.15f * (4.0f * t * (1.0f - t));
+        __m512 v_keep = _mm512_set1_ps(1.0f - pull);
+        __m512 v_pull = _mm512_set1_ps(pull);
+        for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+            __m512 v_cur = _mm512_loadu_ps(out_state + i);
+            __m512 v_hop = _mm512_loadu_ps(hop_vec + i);
+            _mm512_storeu_ps(out_state + i, _mm512_fmadd_ps(v_cur, v_keep, _mm512_mul_ps(v_hop, v_pull)));
+        }
+    }
+
+    return 0;
+}
+
+int hssa_encode_continuous_manifold(
+    HssaContext* ctx,
+    const int32_t* tokens,
+    size_t num_tokens,
+    float* out_manifold_vec
+) {
+    if (!ctx || !tokens || num_tokens == 0 || !out_manifold_vec) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
+    alignas(64) float tok_vec[HSSA_HIDDEN_DIM];
+    alignas(64) float step_out[HSSA_HIDDEN_DIM];
+    alignas(64) float accum[HSSA_HIDDEN_DIM];
+    std::memset(accum, 0, sizeof(accum));
+
+    for (size_t idx = 0; idx < num_tokens; ++idx) {
+        hssa_embed_token(tokens[idx], tok_vec);
+        // Add continuous harmonic phase encoding across dimensions
+        const float pos_phase = (float)(idx + 1) * 0.125f;
+        const float inv_dim = 1.0f / (float)HSSA_HIDDEN_DIM;
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; ++j) {
+            tok_vec[j] += 0.25f * std::cos(pos_phase + (float)j * 6.2831853f * inv_dim);
+        }
+        if (hssa_forward_deep_interpolated(ctx, tok_vec, step_out, nullptr) != 0) return -2;
+
+        const float w = 1.0f + 0.5f * ((float)(idx + 1) / (float)num_tokens);
+        __m512 vw = _mm512_set1_ps(w);
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+            __m512 va = _mm512_load_ps(accum + j);
+            __m512 vs = _mm512_load_ps(step_out + j);
+            _mm512_store_ps(accum + j, _mm512_fmadd_ps(vs, vw, va));
+        }
+    }
+
+    // L2 normalize onto S^{1023}
+    __m512 sq = _mm512_setzero_ps();
+    for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+        __m512 va = _mm512_load_ps(accum + j);
+        sq = _mm512_fmadd_ps(va, va, sq);
+    }
+    float norm = std::sqrt(_mm512_reduce_add_ps(sq));
+    float inv_norm = (norm > 1e-7f) ? (1.0f / norm) : 1.0f;
+    __m512 v_inv = _mm512_set1_ps(inv_norm);
+    for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+        _mm512_storeu_ps(out_manifold_vec + j, _mm512_mul_ps(_mm512_load_ps(accum + j), v_inv));
+    }
+    return 0;
+}
+
+int hssa_forward_deep_interpolated(
+    HssaContext* ctx,
+    const float* in_vec,
+    float* out_vec,
+    HssaTelemetry* out_telem
+) {
+    if (!ctx || !in_vec || !out_vec) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
+    double t_start = get_qpc_time_us();
+    std::memcpy(ctx->scratch_in, in_vec, HSSA_HIDDEN_DIM * sizeof(float));
+
+    const uint32_t L = ctx->config.num_layers;
+    const uint32_t shallow_idx = (L >= 4) ? (L / 4 - 1) : 0;
+    const uint32_t mid_idx     = (L >= 2) ? (L / 2 - 1) : 0;
+
+    alignas(64) float local_snaps[3 * HSSA_HIDDEN_DIM];
+    float* snap_buf = ctx->reserved[0] ? static_cast<float*>(ctx->reserved[0]) : local_snaps;
+    float* snap_shallow = snap_buf;
+    float* snap_mid     = snap_buf + HSSA_HIDDEN_DIM;
+    float* snap_deep    = snap_buf + 2 * HSSA_HIDDEN_DIM;
+
+    double t_ssm_0 = get_qpc_time_us();
+    float* cur_in = ctx->scratch_in;
+    float* cur_out = ctx->scratch_out;
+    for (uint32_t l = 0; l < L; ++l) {
+        forward_deltanet_layer(&ctx->layers[l], cur_in, cur_out);
+        if (l == shallow_idx) {
+            std::memcpy(snap_shallow, cur_out, HSSA_HIDDEN_DIM * sizeof(float));
+        }
+        if (l == mid_idx) {
+            std::memcpy(snap_mid, cur_out, HSSA_HIDDEN_DIM * sizeof(float));
+        }
+        std::swap(cur_in, cur_out);
+    }
+    std::memcpy(snap_deep, cur_in, HSSA_HIDDEN_DIM * sizeof(float));
+
+    // Compute adaptive cosine gates between input, shallow, mid, and deep representations
+    __m512 dot_sd = _mm512_setzero_ps();
+    __m512 dot_md = _mm512_setzero_ps();
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+        __m512 vs = _mm512_load_ps(snap_shallow + i);
+        __m512 vm = _mm512_load_ps(snap_mid + i);
+        __m512 vd = _mm512_load_ps(snap_deep + i);
+        dot_sd = _mm512_fmadd_ps(vs, vd, dot_sd);
+        dot_md = _mm512_fmadd_ps(vm, vd, dot_md);
+    }
+    float g_shallow = fast_sigmoid(_mm512_reduce_add_ps(dot_sd) / (float)HSSA_HIDDEN_DIM) * 0.20f;
+    float g_mid     = fast_sigmoid(_mm512_reduce_add_ps(dot_md) / (float)HSSA_HIDDEN_DIM) * 0.30f;
+    float g_deep    = 1.0f - (g_shallow + g_mid);
+
+    __m512 vw_s = _mm512_set1_ps(g_shallow);
+    __m512 vw_m = _mm512_set1_ps(g_mid);
+    __m512 vw_d = _mm512_set1_ps(g_deep);
+    __m512 sq_acc = _mm512_setzero_ps();
+
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+        __m512 vs = _mm512_load_ps(snap_shallow + i);
+        __m512 vm = _mm512_load_ps(snap_mid + i);
+        __m512 vd = _mm512_load_ps(snap_deep + i);
+        __m512 v_blend = _mm512_fmadd_ps(vs, vw_s, _mm512_fmadd_ps(vm, vw_m, _mm512_mul_ps(vd, vw_d)));
+        _mm512_store_ps(ctx->scratch_in + i, v_blend);
+        sq_acc = _mm512_fmadd_ps(v_blend, v_blend, sq_acc);
+    }
+    float rms = std::sqrt(_mm512_reduce_add_ps(sq_acc) / (float)HSSA_HIDDEN_DIM + 1e-6f);
+    __m512 v_inv_rms = _mm512_set1_ps(1.0f / rms);
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+        _mm512_store_ps(ctx->scratch_in + i, _mm512_mul_ps(_mm512_load_ps(ctx->scratch_in + i), v_inv_rms));
+    }
+    double t_ssm_1 = get_qpc_time_us();
+
+    LARGE_INTEGER t_bin_0, t_bin_1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t_bin_0);
+    dual_rail_binarize(ctx->scratch_in, ctx->scratch_vsa);
+    QueryPerformanceCounter(&t_bin_1);
+    double binarize_ns = (double)(t_bin_1.QuadPart - t_bin_0.QuadPart) * 1e9 / (double)freq.QuadPart;
+
+    double t_vsa_0 = get_qpc_time_us();
+    alignas(64) uint64_t best_vec[8];
+    float similarity = 0.0f;
+    VsaDbHandle* target_db = ctx->global_vsa_db;
+    if (target_db && vsa_db_get_vector_count(target_db) > 0) {
+        if (!vsa_db_query_vector(target_db, ctx->scratch_vsa, best_vec, &similarity)) {
+            std::memset(best_vec, 0, sizeof(best_vec));
+            similarity = 0.0f;
+        }
+    } else {
+        std::memset(best_vec, 0, sizeof(best_vec));
+        similarity = 0.0f;
+    }
+    double t_vsa_1 = get_qpc_time_us();
+
+    continuous_residual_inject(ctx->scratch_in, best_vec, similarity, ctx->scratch_state);
+
+    double t_hop_0 = get_qpc_time_us();
+    double init_energy = compute_hopfield_energy(ctx, ctx->scratch_state);
+    relax_hopfield_attractor(ctx, ctx->scratch_state, 5);
+    double final_energy = compute_hopfield_energy(ctx, ctx->scratch_state);
+    double t_hop_1 = get_qpc_time_us();
+
+    std::memcpy(out_vec, ctx->scratch_state, HSSA_HIDDEN_DIM * sizeof(float));
+    double t_end = get_qpc_time_us();
+
+    if (out_telem) {
+        out_telem->total_forward_us = t_end - t_start;
+        out_telem->ssm_recurrence_us = t_ssm_1 - t_ssm_0;
+        out_telem->binarization_ns = binarize_ns;
+        out_telem->vsa_recall_us = t_vsa_1 - t_vsa_0;
+        out_telem->hopfield_relax_us = t_hop_1 - t_hop_0;
+        out_telem->hopfield_initial_energy = init_energy;
+        out_telem->hopfield_final_energy = final_energy;
+        out_telem->hopfield_energy_delta = final_energy - init_energy;
+        out_telem->hopfield_steps = 5;
+        out_telem->state_memory_bytes = (size_t)ctx->config.num_layers * HSSA_DELTANET_STATE_SIZE * sizeof(float);
+        out_telem->vsa_similarity = similarity;
+        out_telem->rejected_contradictions = 0;
+        out_telem->cuda_dma_fwd_us = 0.0;
+        out_telem->cuda_gemv_us = 0.0;
+        out_telem->cuda_dma_rev_us = 0.0;
+        out_telem->cuda_executed = false;
+    }
+    return 0;
 }

@@ -42,7 +42,44 @@ int main() {
     printf("[+] Stats: max_pages=%zu, active_rules=%zu\n", active_pages, active_rules);
     assert(active_rules == 2 && "active_rules count mismatch");
 
-    // 6. Destroy brain and cleanup
+    // 6. Verify Continuous Representation Space & Deep Geodesic Interpolation C-ABI
+    BrainTrainStats tr_stats = {0};
+    int tr_ok = brain_train_corpus(
+        brain,
+        "PopCount architecture uses AVX512 bitwise XNOR and POPCNT operations for fast associative reasoning.\n"
+        "Continuous representation spaces and deep interpolation connect discrete bitplanes with smooth manifolds.\n",
+        4, &tr_stats);
+    assert(tr_ok == 1 && "brain_train_corpus failed");
+
+    float emb_a[512] = {0};
+    int emb_ok = brain_embed_continuous(brain, "PopCount AVX512 bitwise XNOR operations", emb_a);
+    assert(emb_ok == 1 && "brain_embed_continuous failed");
+
+    float sim_close = brain_continuous_similarity(
+        brain,
+        "PopCount AVX512 bitwise XNOR operations",
+        "PopCount AVX512 bitwise POPCNT operations");
+    float sim_far = brain_continuous_similarity(
+        brain,
+        "PopCount AVX512 bitwise XNOR operations",
+        "completely unrelated culinary recipe");
+    assert(sim_close > sim_far && "Expected related technical phrases to have higher continuous similarity");
+
+    float interp_vec[512] = {0};
+    char nearest_tok[64] = {0};
+    int interp_ok = brain_interpolate_continuous(
+        brain,
+        "PopCount AVX512 bitwise operations",
+        "Continuous representation spaces and deep interpolation",
+        0.5f,
+        interp_vec,
+        nearest_tok,
+        sizeof(nearest_tok));
+    assert(interp_ok > 0 && nearest_tok[0] != '\0' && "brain_interpolate_continuous failed");
+    printf("[+] Continuous space verified: sim_close=%.4f > sim_far=%.4f, midpoint_token='%s'\n",
+           sim_close, sim_far, nearest_tok);
+
+    // 7. Destroy brain and cleanup
     brain_destroy(brain);
     printf("[+] Brain destroyed cleanly.\n");
 

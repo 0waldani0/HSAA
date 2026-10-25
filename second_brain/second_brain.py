@@ -90,6 +90,31 @@ class SecondBrain:
             ctypes.c_float,
         ]
         self.lib.brain_generate.restype = ctypes.c_int
+
+        self.lib.brain_embed_continuous.argtypes = [
+            ctypes.POINTER(PopCountBrainStruct),
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self.lib.brain_embed_continuous.restype = ctypes.c_int
+
+        self.lib.brain_continuous_similarity.argtypes = [
+            ctypes.POINTER(PopCountBrainStruct),
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+        ]
+        self.lib.brain_continuous_similarity.restype = ctypes.c_float
+
+        self.lib.brain_interpolate_continuous.argtypes = [
+            ctypes.POINTER(PopCountBrainStruct),
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        self.lib.brain_interpolate_continuous.restype = ctypes.c_int
         
         # Ensure directory exists for state_file if provided
         if state_file:
@@ -189,6 +214,41 @@ class SecondBrain:
         if n_tok <= 0:
             return ""
         return buf.value.decode("utf-8")
+
+    def embed_continuous(self, text: str) -> list:
+        vec = (ctypes.c_float * 512)()
+        ok = self.lib.brain_embed_continuous(self.handle, text.encode("utf-8"), vec)
+        if not ok:
+            return []
+        return [float(vec[i]) for i in range(512)]
+
+    def continuous_similarity(self, text_a: str, text_b: str) -> float:
+        return float(
+            self.lib.brain_continuous_similarity(
+                self.handle,
+                text_a.encode("utf-8"),
+                text_b.encode("utf-8"),
+            )
+        )
+
+    def interpolate_continuous(self, text_a: str, text_b: str, alpha: float = 0.5) -> dict:
+        vec = (ctypes.c_float * 512)()
+        tok_buf = ctypes.create_string_buffer(256)
+        ok = self.lib.brain_interpolate_continuous(
+            self.handle,
+            text_a.encode("utf-8"),
+            text_b.encode("utf-8"),
+            ctypes.c_float(alpha),
+            vec,
+            tok_buf,
+            256,
+        )
+        if not ok:
+            return {"vector": [], "nearest_token": ""}
+        return {
+            "vector": [float(vec[i]) for i in range(512)],
+            "nearest_token": tok_buf.value.decode("utf-8"),
+        }
 
     def close(self):
         if hasattr(self, "handle") and self.handle:

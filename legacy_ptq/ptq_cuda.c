@@ -3,6 +3,21 @@
 #include <string.h>
 #include <stdio.h>
 
+#if !defined(_WIN32)
+#include <dlfcn.h>
+static inline HMODULE LoadLibraryA(const char* name) {
+    HMODULE h = dlopen("libcuda.so.1", RTLD_LAZY);
+    if (!h) h = dlopen(name, RTLD_LAZY);
+    return h;
+}
+static inline void* GetProcAddress(HMODULE h, const char* sym) {
+    return h ? dlsym(h, sym) : NULL;
+}
+static inline void FreeLibrary(HMODULE h) {
+    if (h) dlclose(h);
+}
+#endif
+
 int ptq_cuda_init(CudaDrv *c, CUcontext *ctx, int device_id) {
     if (!c || !ctx) return -1;
     memset(c, 0, sizeof(*c));

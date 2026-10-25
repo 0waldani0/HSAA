@@ -5,12 +5,16 @@
 extern "C" {
 #endif
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#define CUDAAPI __stdcall
+#else
+typedef void* HMODULE;
+#define CUDAAPI
+#endif
 #include <stdint.h>
 #include <stddef.h>
-
-#define CUDAAPI __stdcall
 typedef int CUresult;
 typedef int CUdevice;
 typedef void* CUcontext;

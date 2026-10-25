@@ -1,15 +1,59 @@
 #include "bridge.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#define CUDAAPI __stdcall
+#else
+#include <dlfcn.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+typedef void* HMODULE;
+#define CUDAAPI
+typedef union {
+    int64_t QuadPart;
+} LARGE_INTEGER;
+static inline void QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) {
+    lpFrequency->QuadPart = 1000000000LL;
+}
+static inline void QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    lpPerformanceCount->QuadPart = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+static inline HMODULE LoadLibraryA(const char* name) {
+    HMODULE h = dlopen("libcuda.so.1", RTLD_LAZY);
+    if (!h) h = dlopen(name, RTLD_LAZY);
+    return h;
+}
+static inline void* GetProcAddress(HMODULE h, const char* sym) {
+    return h ? dlsym(h, sym) : nullptr;
+}
+static inline void FreeLibrary(HMODULE h) {
+    if (h) dlclose(h);
+}
+#define MEM_COMMIT 0x1000
+#define MEM_RESERVE 0x2000
+#define MEM_RELEASE 0x8000
+#define PAGE_READWRITE 0x04
+static inline void* VirtualAlloc(void*, size_t dwSize, int, int) {
+    void* ptr = nullptr;
+    size_t aligned_sz = (dwSize + 4095) & ~size_t(4095);
+    if (posix_memalign(&ptr, 4096, aligned_sz) != 0) return nullptr;
+    memset(ptr, 0, aligned_sz);
+    return ptr;
+}
+static inline void VirtualFree(void* lpAddress, size_t, int) {
+    free(lpAddress);
+}
+#endif
 #include <immintrin.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
 #include <mutex>
-
-#define CUDAAPI __stdcall
 typedef int CUresult;
 typedef int CUdevice;
 typedef void* CUcontext;

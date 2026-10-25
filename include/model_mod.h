@@ -138,6 +138,23 @@ void* model_get_layer_vsa_db(const void* ctx, uint32_t layer_idx);
 int   model_set_global_vsa_db(void* ctx, VsaDbHandle* db);
 void* model_get_global_vsa_db(const void* ctx);
 
+/*
+ * Feature 3.4: Continuous Representation Geodesic Interpolation & Deep Multi-Layer Interpolation
+ */
+int model_interpolate_representations(
+    const float* rep_a,
+    const float* rep_b,
+    size_t dim,
+    float alpha,
+    float* out_rep
+);
+
+int model_forward_deep_interpolated(
+    void* ctx,
+    const float* in_vec,
+    float* out_vec
+);
+
 #ifdef __cplusplus
 }
 #endif

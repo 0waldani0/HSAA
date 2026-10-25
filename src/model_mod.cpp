@@ -1,11 +1,24 @@
 #include "model_mod.h"
 #include "vsa_db.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <stdlib.h>
+static inline void* _aligned_malloc(size_t size, size_t alignment) {
+    void* ptr = nullptr;
+    size_t aligned_sz = (size + alignment - 1) & ~(alignment - 1);
+    if (posix_memalign(&ptr, alignment, aligned_sz) != 0) return nullptr;
+    return ptr;
+}
+static inline void _aligned_free(void* ptr) {
+    free(ptr);
+}
+#endif
 #include <immintrin.h>
 
 #include <cstdint>
@@ -592,4 +605,164 @@ void* model_get_global_vsa_db(const void* ctx) {
     return std::atomic_ref<VsaDbHandle*>(
                const_cast<VsaDbHandle*&>(((const ModelContext*)ctx)->global_vsa_db))
         .load(std::memory_order_acquire);
+}
+
+/*
+ * =============================================================================
+ * Feature 3.4: Continuous Representation Geodesic Interpolation & Deep Stack Forward
+ * =============================================================================
+ */
+
+int model_interpolate_representations(
+    const float* rep_a,
+    const float* rep_b,
+    size_t dim,
+    float alpha,
+    float* out_rep
+) {
+    if (!rep_a || !rep_b || !out_rep || dim == 0) return -1;
+    const float t = (alpha < 0.0f) ? 0.0f : ((alpha > 1.0f) ? 1.0f : alpha);
+
+    __m512 acc_aa = _mm512_setzero_ps();
+    __m512 acc_bb = _mm512_setzero_ps();
+    __m512 acc_ab = _mm512_setzero_ps();
+
+    const size_t vec_end = dim & ~static_cast<size_t>(15);
+    size_t i = 0;
+    for (; i < vec_end; i += 16) {
+        __m512 va = _mm512_loadu_ps(rep_a + i);
+        __m512 vb = _mm512_loadu_ps(rep_b + i);
+        acc_aa = _mm512_fmadd_ps(va, va, acc_aa);
+        acc_bb = _mm512_fmadd_ps(vb, vb, acc_bb);
+        acc_ab = _mm512_fmadd_ps(va, vb, acc_ab);
+    }
+    float sum_aa = _mm512_reduce_add_ps(acc_aa);
+    float sum_bb = _mm512_reduce_add_ps(acc_bb);
+    float sum_ab = _mm512_reduce_add_ps(acc_ab);
+    for (size_t rem = vec_end; rem < dim; ++rem) {
+        sum_aa += rep_a[rem] * rep_a[rem];
+        sum_bb += rep_b[rem] * rep_b[rem];
+        sum_ab += rep_a[rem] * rep_b[rem];
+    }
+
+    const float norm_a = std::sqrt(sum_aa);
+    const float norm_b = std::sqrt(sum_bb);
+    const float target_norm = (1.0f - t) * norm_a + t * norm_b;
+    float w_a = 1.0f - t;
+    float w_b = t;
+    bool use_antipodal = false;
+    bool rescale_to_target = false;
+
+    if (norm_a > 1e-6f && norm_b > 1e-6f) {
+        float cos_theta = sum_ab / (norm_a * norm_b);
+        if (cos_theta > 1.0f) cos_theta = 1.0f;
+        if (cos_theta < -1.0f) cos_theta = -1.0f;
+        if (cos_theta < 0.9995f && cos_theta > -0.9995f) {
+            float omega = std::acos(cos_theta);
+            float sin_omega = std::sin(omega);
+            if (sin_omega > 1e-6f) {
+                w_a = (std::sin((1.0f - t) * omega) / sin_omega) * (target_norm / norm_a);
+                w_b = (std::sin(t * omega) / sin_omega) * (target_norm / norm_b);
+            }
+        } else if (cos_theta <= -0.9995f && dim >= 2) {
+            use_antipodal = true;
+        } else {
+            rescale_to_target = true;
+        }
+    }
+
+    if (use_antipodal) {
+        size_t min_idx = 0;
+        float min_abs = std::fabs(rep_a[0]);
+        for (size_t k = 1; k < dim; ++k) {
+            float a_abs = std::fabs(rep_a[k]);
+            if (a_abs < min_abs) {
+                min_abs = a_abs;
+                min_idx = k;
+            }
+        }
+        const float inv_na = 1.0f / norm_a;
+        const float proj = rep_a[min_idx] * inv_na;
+        float orth_nsq = 0.0f;
+        for (size_t k = 0; k < dim; ++k) {
+            float ua = rep_a[k] * inv_na;
+            float comp = ((k == min_idx) ? 1.0f : 0.0f) - proj * ua;
+            out_rep[k] = comp;
+            orth_nsq += comp * comp;
+        }
+        const float inv_orth = (orth_nsq > 1e-12f) ? (1.0f / std::sqrt(orth_nsq)) : 1.0f;
+        const float theta = t * 3.14159265358979323846f;
+        const float scale_a = std::cos(theta) * (target_norm * inv_na);
+        const float scale_o = std::sin(theta) * (target_norm * inv_orth);
+        for (size_t k = 0; k < dim; ++k) {
+            out_rep[k] = scale_a * rep_a[k] + scale_o * out_rep[k];
+        }
+        return 0;
+    }
+
+    __m512 vw_a = _mm512_set1_ps(w_a);
+    __m512 vw_b = _mm512_set1_ps(w_b);
+    __m512 acc_out = _mm512_setzero_ps();
+    size_t j = 0;
+    for (; j < vec_end; j += 16) {
+        __m512 va = _mm512_loadu_ps(rep_a + j);
+        __m512 vb = _mm512_loadu_ps(rep_b + j);
+        __m512 vi = _mm512_fmadd_ps(va, vw_a, _mm512_mul_ps(vb, vw_b));
+        _mm512_storeu_ps(out_rep + j, vi);
+        acc_out = _mm512_fmadd_ps(vi, vi, acc_out);
+    }
+    float out_sq = _mm512_reduce_add_ps(acc_out);
+    for (size_t rem = vec_end; rem < dim; ++rem) {
+        float v = w_a * rep_a[rem] + w_b * rep_b[rem];
+        out_rep[rem] = v;
+        out_sq += v * v;
+    }
+    if (rescale_to_target && out_sq > 1e-12f) {
+        const float scale = target_norm / std::sqrt(out_sq);
+        __m512 v_scale = _mm512_set1_ps(scale);
+        for (size_t k = 0; k < vec_end; k += 16) {
+            _mm512_storeu_ps(out_rep + k, _mm512_mul_ps(_mm512_loadu_ps(out_rep + k), v_scale));
+        }
+        for (size_t rem = vec_end; rem < dim; ++rem) {
+            out_rep[rem] *= scale;
+        }
+    }
+    return 0;
+}
+
+int model_forward_deep_interpolated(
+    void* ctx,
+    const float* in_vec,
+    float* out_vec
+) {
+    if (!ctx || !in_vec || !out_vec) return -1;
+    ModelContext* m = (ModelContext*)ctx;
+    if (m->num_layers == 0) return -2;
+
+    const uint32_t L = m->num_layers;
+    const uint32_t s_idx = (L >= 4) ? (L / 4 - 1) : 0;
+    const uint32_t m_idx = (L >= 2) ? (L / 2 - 1) : 0;
+
+    alignas(64) float cur_a[MODEL_DEFAULT_DIM_N];
+    alignas(64) float cur_b[MODEL_DEFAULT_DIM_N];
+    alignas(64) float snap_s[MODEL_DEFAULT_DIM_N];
+    alignas(64) float snap_m[MODEL_DEFAULT_DIM_N];
+
+    std::memcpy(cur_a, in_vec, MODEL_DEFAULT_DIM_N * sizeof(float));
+    float* src = cur_a;
+    float* dst = cur_b;
+
+    for (uint32_t l = 0; l < L; ++l) {
+        int rc = model_forward_layer(ctx, l, src, dst);
+        if (rc != 0) return rc;
+        if (l == s_idx) std::memcpy(snap_s, dst, MODEL_DEFAULT_DIM_N * sizeof(float));
+        if (l == m_idx) std::memcpy(snap_m, dst, MODEL_DEFAULT_DIM_N * sizeof(float));
+        std::swap(src, dst);
+    }
+
+    // Two-stage geodesic deep interpolation across shallow, mid, and deep layer manifolds
+    alignas(64) float mid_blend[MODEL_DEFAULT_DIM_N];
+    model_interpolate_representations(snap_s, snap_m, MODEL_DEFAULT_DIM_N, 0.65f, mid_blend);
+    model_interpolate_representations(mid_blend, src, MODEL_DEFAULT_DIM_N, 0.72f, out_vec);
+    return 0;
 }

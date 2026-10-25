@@ -218,6 +218,55 @@ POPCNT_BRAIN_API int brain_generate(
     float temperature
 );
 
+// =============================================================================
+// Adapted Continuous Representation Spaces & Deep Interpolation (512-D Manifold)
+//
+// Projects tokens, phrases, and multi-layer recurrent context trajectories into
+// a 512-dimensional continuous representation manifold coupled with the engine's
+// 4-bitplane INT8 + sign POPCNT hardware representation:
+//   * Fuses multi-scale morphological/subword features, RMS-normalized
+//     distributional topic co-occurrence, bidirectional syntactic frames, and
+//     role-cluster centroids into a smooth unit-hypersphere manifold S^{511}.
+//   * Performs deep multi-depth interpolation across fast lexical state,
+//     mid-depth recurrent MLGRU state, and deep 4 KB ternary micro-expert state,
+//     plus geodesic Spherical Linear Interpolation (SLERP) between representations.
+// =============================================================================
+
+// Project a UTF-8 text or code snippet into the adapted 512-dimensional unit-L2
+// continuous representation space (writes 512 floats to out_vec512).
+// Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_embed_continuous(
+    PopCountBrain* brain,
+    const char* text,
+    float* out_vec512
+);
+
+// Compute AVX-512 / AVX2 cosine similarity in [-1.0f, +1.0f] between two UTF-8
+// texts or identifiers in the adapted 512-D continuous representation space.
+// Returns 0.0f on invalid arguments.
+POPCNT_BRAIN_API float brain_continuous_similarity(
+    PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b
+);
+
+// Perform deep geodesic SLERP + attractor manifold interpolation between text_a
+// and text_b at interpolation ratio alpha in [0.0f, 1.0f].
+// - out_vec512 (optional, may be NULL): receives the 512-D unit-norm interpolated vector.
+// - out_nearest_token (optional, may be NULL if max_len == 0): receives the nearest
+//   vocabulary concept / token on the continuous manifold trajectory.
+// Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_interpolate_continuous(
+    PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b,
+    float alpha,
+    float* out_vec512,
+    char* out_nearest_token,
+    size_t max_len
+);
+
 #ifdef __cplusplus
 }
 #endif
+

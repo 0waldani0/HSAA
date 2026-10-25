@@ -298,6 +298,57 @@ size_t      hssa_get_state_memory_bytes(const HssaContext* ctx);
  */
 void dual_rail_binarize(const float* in_vec, uint64_t* out_vsa);
 
+/*
+ * =============================================================================
+ * Adapted Continuous Representation Spaces & Deep Interpolation (AVX-512)
+ * =============================================================================
+ */
+
+/*
+ * Geodesic Spherical Linear Interpolation (SLERP) + Continuous Hopfield Attractor
+ * contraction between two 1024-D continuous state representations in R^{1024}.
+ * Operates with zero heap allocations using AVX-512 FMA intrinsics.
+ *
+ * Parameters:
+ *   ctx:       Optional HssaContext pointer for Hopfield attractor manifold alignment (can be NULL)
+ *   state_a:   Source continuous representation [1024]
+ *   state_b:   Target continuous representation [1024]
+ *   alpha:     Interpolation coordinate in [0.0f, 1.0f]
+ *   out_state: Output interpolated continuous representation [1024]
+ */
+int hssa_interpolate_continuous_states(
+    const HssaContext* ctx,
+    const float* state_a,
+    const float* state_b,
+    float alpha,
+    float* out_state
+);
+
+/*
+ * Encode a token sequence into a unit-normalized 1024-D continuous manifold representation
+ * by combining multi-scale sinusoidal phase embeddings, recurrent DeltaNet state trajectory,
+ * and Hopfield attractor projection.
+ */
+int hssa_encode_continuous_manifold(
+    HssaContext* ctx,
+    const int32_t* tokens,
+    size_t num_tokens,
+    float* out_manifold_vec
+);
+
+/*
+ * Execute a deep-interpolated forward pass across the 28-layer HSSA stack:
+ * Captures shallow (layer L/4), mid (layer L/2), and deep (layer L-1) continuous
+ * state snapshots in preallocated 64-byte aligned scratchpads and performs learned
+ * cosine-gated deep residual interpolation before dual-rail VSA recall and Hopfield relaxation.
+ */
+int hssa_forward_deep_interpolated(
+    HssaContext* ctx,
+    const float* in_vec,
+    float* out_vec,
+    HssaTelemetry* out_telem
+);
+
 #ifdef __cplusplus
 }
 #endif
