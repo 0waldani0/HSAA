@@ -1562,15 +1562,21 @@ int hssa_interpolate_continuous_states(
             }
         }
         const float inv_na = 1.0f / norm_a;
-        const float proj = state_a[min_idx] * inv_na;
+        const float neg_proj_inv_na = -(state_a[min_idx] * inv_na) * inv_na;
         alignas(64) float u_orth[HSSA_HIDDEN_DIM];
-        float orth_nsq = 0.0f;
-        for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
-            float ua = state_a[i] * inv_na;
-            float comp = ((i == min_idx) ? 1.0f : 0.0f) - proj * ua;
-            u_orth[i] = comp;
-            orth_nsq += comp * comp;
+        __m512 v_scale_proj = _mm512_set1_ps(neg_proj_inv_na);
+        for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+            __m512 va = _mm512_loadu_ps(state_a + i);
+            _mm512_store_ps(u_orth + i, _mm512_mul_ps(va, v_scale_proj));
         }
+        u_orth[min_idx] += 1.0f;
+
+        __m512 v_orth_sq = _mm512_setzero_ps();
+        for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
+            __m512 vo = _mm512_load_ps(u_orth + i);
+            v_orth_sq = _mm512_fmadd_ps(vo, vo, v_orth_sq);
+        }
+        const float orth_nsq = _mm512_reduce_add_ps(v_orth_sq);
         const float inv_orth = (orth_nsq > 1e-12f) ? (1.0f / std::sqrt(orth_nsq)) : 1.0f;
         const float theta = t * 3.14159265358979323846f;
         const float scale_a = std::cos(theta) * (target_norm * inv_na);
@@ -1614,13 +1620,28 @@ int hssa_interpolate_continuous_states(
         __m512 v_pull = _mm512_set1_ps(pull);
         for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
             __m512 v_cur = _mm512_loadu_ps(out_state + i);
-            __m512 v_hop = _mm512_loadu_ps(hop_vec + i);
+            __m512 v_hop = _mm512_load_ps(hop_vec + i);
             _mm512_storeu_ps(out_state + i, _mm512_fmadd_ps(v_cur, v_keep, _mm512_mul_ps(v_hop, v_pull)));
         }
     }
 
     return 0;
 }
+
+namespace {
+struct HarmonicBasis1024 {
+    alignas(64) float cos_j[HSSA_HIDDEN_DIM];
+    alignas(64) float sin_j[HSSA_HIDDEN_DIM];
+    HarmonicBasis1024() {
+        const float step = 6.28318530717958647692f / static_cast<float>(HSSA_HIDDEN_DIM);
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; ++j) {
+            const float angle = static_cast<float>(j) * step;
+            cos_j[j] = std::cos(angle);
+            sin_j[j] = std::sin(angle);
+        }
+    }
+};
+} // namespace
 
 int hssa_encode_continuous_manifold(
     HssaContext* ctx,
@@ -1631,22 +1652,32 @@ int hssa_encode_continuous_manifold(
     if (!ctx || !tokens || num_tokens == 0 || !out_manifold_vec) return -1;
     std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
 
+    static const HarmonicBasis1024 kBasis;
+
     alignas(64) float tok_vec[HSSA_HIDDEN_DIM];
     alignas(64) float step_out[HSSA_HIDDEN_DIM];
     alignas(64) float accum[HSSA_HIDDEN_DIM];
     std::memset(accum, 0, sizeof(accum));
 
+    const float inv_num_tokens = 0.5f / static_cast<float>(num_tokens);
     for (size_t idx = 0; idx < num_tokens; ++idx) {
         hssa_embed_token(tokens[idx], tok_vec);
-        // Add continuous harmonic phase encoding across dimensions
-        const float pos_phase = (float)(idx + 1) * 0.125f;
-        const float inv_dim = 1.0f / (float)HSSA_HIDDEN_DIM;
-        for (size_t j = 0; j < HSSA_HIDDEN_DIM; ++j) {
-            tok_vec[j] += 0.25f * std::cos(pos_phase + (float)j * 6.2831853f * inv_dim);
+        // AVX-512 harmonic phase encoding using angle-addition identity:
+        // 0.25 * cos(phi + angle_j) = (0.25 * cos(phi)) * cos(angle_j) + (-0.25 * sin(phi)) * sin(angle_j)
+        const float pos_phase = static_cast<float>(idx + 1) * 0.125f;
+        const __m512 v_cos_p = _mm512_set1_ps(0.25f * std::cos(pos_phase));
+        const __m512 v_neg_sin_p = _mm512_set1_ps(-0.25f * std::sin(pos_phase));
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+            __m512 vt = _mm512_load_ps(tok_vec + j);
+            __m512 vc = _mm512_load_ps(kBasis.cos_j + j);
+            __m512 vs = _mm512_load_ps(kBasis.sin_j + j);
+            vt = _mm512_fmadd_ps(v_cos_p, vc, vt);
+            vt = _mm512_fmadd_ps(v_neg_sin_p, vs, vt);
+            _mm512_store_ps(tok_vec + j, vt);
         }
         if (hssa_forward_deep_interpolated(ctx, tok_vec, step_out, nullptr) != 0) return -2;
 
-        const float w = 1.0f + 0.5f * ((float)(idx + 1) / (float)num_tokens);
+        const float w = 1.0f + static_cast<float>(idx + 1) * inv_num_tokens;
         __m512 vw = _mm512_set1_ps(w);
         for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
             __m512 va = _mm512_load_ps(accum + j);
@@ -1686,11 +1717,10 @@ int hssa_forward_deep_interpolated(
     const uint32_t shallow_idx = (L >= 4) ? (L / 4 - 1) : 0;
     const uint32_t mid_idx     = (L >= 2) ? (L / 2 - 1) : 0;
 
-    alignas(64) float local_snaps[3 * HSSA_HIDDEN_DIM];
+    alignas(64) float local_snaps[2 * HSSA_HIDDEN_DIM];
     float* snap_buf = ctx->reserved[0] ? static_cast<float*>(ctx->reserved[0]) : local_snaps;
     float* snap_shallow = snap_buf;
     float* snap_mid     = snap_buf + HSSA_HIDDEN_DIM;
-    float* snap_deep    = snap_buf + 2 * HSSA_HIDDEN_DIM;
 
     double t_ssm_0 = get_qpc_time_us();
     float* cur_in = ctx->scratch_in;
@@ -1705,20 +1735,32 @@ int hssa_forward_deep_interpolated(
         }
         std::swap(cur_in, cur_out);
     }
-    std::memcpy(snap_deep, cur_in, HSSA_HIDDEN_DIM * sizeof(float));
+    const float* snap_deep = cur_in;
 
-    // Compute adaptive cosine gates between input, shallow, mid, and deep representations
+    // Compute scale-invariant adaptive cosine gates between shallow, mid, and deep representations
     __m512 dot_sd = _mm512_setzero_ps();
     __m512 dot_md = _mm512_setzero_ps();
+    __m512 sq_s   = _mm512_setzero_ps();
+    __m512 sq_m   = _mm512_setzero_ps();
+    __m512 sq_d   = _mm512_setzero_ps();
     for (size_t i = 0; i < HSSA_HIDDEN_DIM; i += 16) {
         __m512 vs = _mm512_load_ps(snap_shallow + i);
         __m512 vm = _mm512_load_ps(snap_mid + i);
         __m512 vd = _mm512_load_ps(snap_deep + i);
         dot_sd = _mm512_fmadd_ps(vs, vd, dot_sd);
         dot_md = _mm512_fmadd_ps(vm, vd, dot_md);
+        sq_s   = _mm512_fmadd_ps(vs, vs, sq_s);
+        sq_m   = _mm512_fmadd_ps(vm, vm, sq_m);
+        sq_d   = _mm512_fmadd_ps(vd, vd, sq_d);
     }
-    float g_shallow = fast_sigmoid(_mm512_reduce_add_ps(dot_sd) / (float)HSSA_HIDDEN_DIM) * 0.20f;
-    float g_mid     = fast_sigmoid(_mm512_reduce_add_ps(dot_md) / (float)HSSA_HIDDEN_DIM) * 0.30f;
+    const float norm_s = std::sqrt(_mm512_reduce_add_ps(sq_s) + 1e-12f);
+    const float norm_m = std::sqrt(_mm512_reduce_add_ps(sq_m) + 1e-12f);
+    const float norm_d = std::sqrt(_mm512_reduce_add_ps(sq_d) + 1e-12f);
+    const float cos_sd = _mm512_reduce_add_ps(dot_sd) / (norm_s * norm_d);
+    const float cos_md = _mm512_reduce_add_ps(dot_md) / (norm_m * norm_d);
+
+    float g_shallow = fast_sigmoid(cos_sd) * 0.20f;
+    float g_mid     = fast_sigmoid(cos_md) * 0.30f;
     float g_deep    = 1.0f - (g_shallow + g_mid);
 
     __m512 vw_s = _mm512_set1_ps(g_shallow);

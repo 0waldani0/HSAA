@@ -2,7 +2,7 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-set "ROOT_DIR=%~dp0"
+set "ROOT_DIR=%~dp0..\"
 set "BUILD_DIR=%ROOT_DIR%build"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 

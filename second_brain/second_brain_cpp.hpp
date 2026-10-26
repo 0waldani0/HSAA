@@ -1,0 +1,132 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+#include "popcnt_brain.h"
+
+namespace hsaa {
+
+struct ContinuousInterpolationResult {
+    std::array<float, 512> vector{};
+    std::string nearest_token;
+};
+
+class SecondBrain {
+public:
+    explicit SecondBrain(size_t max_pages = 4096, const std::string& state_file = "build/second_brain_state.bin")
+        : handle_(brain_create(max_pages, state_file.c_str())) {
+        if (!handle_) {
+            throw std::runtime_error("Failed to initialize PopCountBrain on path: " + state_file);
+        }
+    }
+
+    ~SecondBrain() {
+        if (handle_) {
+            brain_destroy(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    SecondBrain(const SecondBrain&) = delete;
+    SecondBrain& operator=(const SecondBrain&) = delete;
+
+    SecondBrain(SecondBrain&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    SecondBrain& operator=(SecondBrain&& other) noexcept {
+        if (this != &other) {
+            if (handle_) brain_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    bool store_fact(const std::string& subject, const std::string& relation, const std::string& object) {
+        return brain_store_fact(handle_, subject.c_str(), relation.c_str(), object.c_str()) != 0;
+    }
+
+    std::string query(const std::string& subject, const std::string& relation) const {
+        char buf[512] = {0};
+        if (brain_query_relation(handle_, subject.c_str(), relation.c_str(), buf, sizeof(buf)) != 0) {
+            return std::string(buf);
+        }
+        return {};
+    }
+
+    bool has_conflict(const std::string& subject, const std::string& relation, const std::string& proposed_obj) const {
+        return brain_check_conflict(handle_, subject.c_str(), relation.c_str(), proposed_obj.c_str()) != 0;
+    }
+
+    std::pair<size_t, size_t> get_stats() const {
+        size_t pages = 0;
+        size_t rules = 0;
+        brain_get_stats(handle_, &pages, &rules);
+        return {pages, rules};
+    }
+
+    bool save_state(const std::string& filepath) const {
+        return brain_save_state(handle_, filepath.c_str()) != 0;
+    }
+
+    bool load_state(const std::string& filepath) {
+        return brain_load_state(handle_, filepath.c_str()) != 0;
+    }
+
+    BrainTrainStats train_corpus(const std::string& corpus_text, int epochs = 6) {
+        BrainTrainStats stats{};
+        if (brain_train_corpus(handle_, corpus_text.c_str(), epochs, &stats) == 0) {
+            throw std::runtime_error("brain_train_corpus failed");
+        }
+        return stats;
+    }
+
+    BrainTrainStats train_file(const std::string& filepath, int epochs = 6) {
+        BrainTrainStats stats{};
+        if (brain_train_file(handle_, filepath.c_str(), epochs, &stats) == 0) {
+            throw std::runtime_error("brain_train_file failed: " + filepath);
+        }
+        return stats;
+    }
+
+    std::string generate(const std::string& prompt, int max_tokens = 64, float temperature = 0.0f, size_t buffer_size = 32768) {
+        std::vector<char> buf(buffer_size, 0);
+        int n_tok = brain_generate(handle_, prompt.c_str(), buf.data(), buf.size(), max_tokens, temperature);
+        if (n_tok <= 0) return {};
+        return std::string(buf.data());
+    }
+
+    std::array<float, 512> embed_continuous(const std::string& text) const {
+        std::array<float, 512> vec{};
+        if (brain_embed_continuous(handle_, text.c_str(), vec.data()) == 0) {
+            vec.fill(0.0f);
+        }
+        return vec;
+    }
+
+    float continuous_similarity(const std::string& text_a, const std::string& text_b) const {
+        return brain_continuous_similarity(handle_, text_a.c_str(), text_b.c_str());
+    }
+
+    ContinuousInterpolationResult interpolate_continuous(const std::string& text_a, const std::string& text_b, float alpha = 0.5f) const {
+        ContinuousInterpolationResult res{};
+        char tok_buf[256] = {0};
+        if (brain_interpolate_continuous(handle_, text_a.c_str(), text_b.c_str(), alpha, res.vector.data(), tok_buf, sizeof(tok_buf)) > 0) {
+            res.nearest_token = tok_buf;
+        }
+        return res;
+    }
+
+    PopCountBrain* native_handle() const noexcept { return handle_; }
+
+private:
+    PopCountBrain* handle_ = nullptr;
+};
+
+} // namespace hsaa

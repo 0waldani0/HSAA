@@ -75,30 +75,21 @@ cmake --build . --config Release
 
 ---
 
-## 5. Интеграция с Python (ctypes)
+## 5. Интеграция в C++20 (`second_brain_cpp.hpp`)
 
-```python
-import ctypes
+```cpp
+#include "second_brain_cpp.hpp"
+#include <iostream>
 
-# Загрузка собранной библиотеки
-brain_dll = ctypes.CDLL("./build/popcnt_brain.dll")
+int main() {
+    sb::SecondBrain brain(262144, "build/brain.bin");
+    brain.store_fact("Core_i7_11800H", "has_instruction_set", "AVX512_VPOPCNTDQ");
 
-brain_dll.brain_create.restype = ctypes.c_void_p
-brain_dll.brain_create.argtypes = [ctypes.c_size_t, ctypes.c_char_p]
-
-brain_dll.brain_store_fact.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
-brain_dll.brain_query_relation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
-brain_dll.brain_destroy.argtypes = [ctypes.c_void_p]
-
-# Использование
-brain = brain_dll.brain_create(262144, b"brain.bin")
-brain_dll.brain_store_fact(brain, b"Core_i7_11800H", b"has_instruction_set", b"AVX512_VPOPCNTDQ")
-
-buf = ctypes.create_string_buffer(256)
-if brain_dll.brain_query_relation(brain, b"Core_i7_11800H", b"has_instruction_set", buf, 256):
-    print("Answer:", buf.value.decode('utf-8'))
-
-brain_dll.brain_destroy(brain)
+    if (auto ans = brain.query_relation("Core_i7_11800H", "has_instruction_set")) {
+        std::cout << "Answer: " << *ans << "\n";
+    }
+    return 0;
+}
 ```
 
 ---

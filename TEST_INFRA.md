@@ -16,16 +16,13 @@ and the current readiness statement are in `TEST_READY.md`.
   Built and run by `tests\build_tests.bat run`; `build.bat test` delegates to it.
 - **Adversarial / stress suites** (`tests\build_stress*.bat`,
   `tests\build_hssa_m1_tests.bat`, `tests\build_hssa_m2_tests.bat`, `tests\build_hssa_m3_tests.bat`,
-  `build_adversarial_stress.bat`, `tests\build_challenger2.bat`): boundary matrices,
+  `tests\build_adversarial_stress.bat`, `tests\build_challenger2.bat`, `tests\stress_concurrent_builds.cpp`): boundary matrices,
   concurrency, lifecycle and leak checks, CUDA M2, mutation-flip sensitivity.
 - **Benchmarks** (`tests\build_bench_model_mod.bat`,
-  `tests\build_bench_hot_swap.bat`, `tests\build_stress_bench.bat`, `build_micro_bench.bat`): numerical fidelity
+  `tests\build_bench_hot_swap.bat`, `tests\build_stress_bench.bat`, `tests\build_micro_bench.bat`): numerical fidelity
   against independent software references plus latency/throughput.
-- **Regression driver** (`second_brain\measur\regress_par.py`): serial phase
-  (gates, engine library, associative calibration, CUDA M2 on an idle host),
-  parallel phase (module suites, C-ABI probe, E2E, corpus), serial phase
-  (adversarial/benchmark suites, PTQ host validation). A step fails on a
-  non-zero exit code or a `[FAIL]` line in its log.
+- **Native measurement & baseline runner** (`second_brain\measur\native_measur_runner.cpp`):
+  pure C++20 causal full-prefix n-gram evaluation and `PopCountGenerativeLLM` verification with zero Python dependencies.
 
 ## 2. Rules
 

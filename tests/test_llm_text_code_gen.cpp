@@ -697,6 +697,65 @@ int main() {
 
     brain_destroy(brain2);
 
+    // -------------------------------------------------------------------------
+    // TEST 12.3 & 12.4: >1000-Token Hard Context Horizon (L up to 2048) Without Degradation
+    // -------------------------------------------------------------------------
+    PopCountBrain* brain_long = brain_create(4096, "build/test_llm_long_horizon_1000.bin");
+    std::string shared_1100_chain;
+    for (int step = 1; step <= 135; ++step) {
+        shared_1100_chain += " такт_" + std::to_string(step) +
+                             " синхронизирует векторный регистр ядра через общий конвейер памяти";
+    }
+    std::string doc_alpha =
+        "Система гиперконтекста запускает контур_альфа_сверхдальний и" +
+        shared_1100_chain +
+        " завершает вычисление результатом терминал_альфа_успех_1080.";
+    std::string doc_beta =
+        "Система гиперконтекста запускает контур_бета_сверхдальний и" +
+        shared_1100_chain +
+        " завершает вычисление результатом терминал_бета_успех_1080.";
+    std::string long_corpus = doc_alpha + "\n\n" + doc_beta + "\n";
+
+    BrainTrainStats long_stats{};
+    int long_tr_ok = brain_train_corpus(brain_long, long_corpus.c_str(), 3, &long_stats);
+    std::printf("[T12.3 >1000-Token Corpus Stats]: total_tokens=%zu, transitions=%zu, replay_acc=%.2f%%, cov=%.2f%%, time=%.2f ms (%.0f tok/s)\n",
+                long_stats.total_tokens, long_stats.total_transitions,
+                long_stats.replay_accuracy_percent, long_stats.shortlist_coverage_percent,
+                long_stats.train_time_ms, long_stats.tokens_per_sec);
+    check(long_tr_ok == 1 &&
+          long_stats.total_tokens >= 2100 &&
+          long_stats.replay_accuracy_percent >= 99.9 &&
+          long_stats.shortlist_coverage_percent >= 99.9,
+          "T12.3: >1000-token sequences (2160+ corpus tokens) achieve 100% replay accuracy & 100% coverage with O(1) rolling horizon hashes");
+
+    std::string prompt_alpha_1080 =
+        "Система гиперконтекста запускает контур_альфа_сверхдальний и" +
+        shared_1100_chain +
+        " завершает вычисление результатом";
+    std::string prompt_beta_1080 =
+        "Система гиперконтекста запускает контур_бета_сверхдальний и" +
+        shared_1100_chain +
+        " завершает вычисление результатом";
+
+    std::vector<char> long_buf(32768, 0);
+    int n_long_a = brain_generate(brain_long, prompt_alpha_1080.c_str(), long_buf.data(), long_buf.size(), 16, 0.0f);
+    std::string gen_long_a(long_buf.data());
+
+    std::fill(long_buf.begin(), long_buf.end(), 0);
+    int n_long_b = brain_generate(brain_long, prompt_beta_1080.c_str(), long_buf.data(), long_buf.size(), 16, 0.0f);
+    std::string gen_long_b(long_buf.data());
+
+    std::printf("[T12.4 >1000-Token Horizon Disambiguation]:\n  Alpha (L>1080) -> %s\n  Beta  (L>1080) -> %s\n\n",
+                gen_long_a.c_str(), gen_long_b.c_str());
+    check(n_long_a >= 1 && n_long_b >= 1 &&
+          gen_long_a.find("терминал_альфа_успех_1080") != std::string::npos &&
+          gen_long_a.find("терминал_бета_успех_1080") == std::string::npos &&
+          gen_long_b.find("терминал_бета_успех_1080") != std::string::npos &&
+          gen_long_b.find("терминал_альфа_успех_1080") == std::string::npos,
+          "T12.4: >1000-token hard context horizon (L > 1080 tokens) disambiguates identical 1080-token middle chains with zero degradation");
+
+    brain_destroy(brain_long);
+
     std::printf("================================================================\n");
     std::printf("  SUMMARY: %d Passed, %d Failed\n", g_passed, g_failed);
     std::printf("================================================================\n");

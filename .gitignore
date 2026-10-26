@@ -1,37 +1,99 @@
-# Build directories
+# ==============================================================================
+# Build & Output Directories
+# ==============================================================================
 build/
+build_*/
 build_cmake/
+out/
 bin/
 obj/
+dist/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
 
-# Binaries and outputs
+# ==============================================================================
+# Compiled Binaries, Object Files & CUDA Artifacts
+# ==============================================================================
 *.exe
 *.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exp
 *.pdb
 *.ilk
+*.idb
+*.ipdb
+*.iobj
+*.pch
 *.cubin
-*.bin
+*.ptx
+*.fatbin
+*.gpu
 
-# Temporary and test artifacts
+# ==============================================================================
+# Runtime Weight Banks, Brain State Dumps & Temporary Test Artifacts
+# ==============================================================================
+*.bin
+*.tsv
+*.state
+*.db
 *.tmp
+*.bak
 *.log
-__pycache__/
-_unpacked/
+*.out
 stdout.txt
 stderr.txt
+regress_par_logs/
+_unpacked/
 
-# Visual Studio / IDE
+# ==============================================================================
+# IDE, Editor & OS Metadata
+# ==============================================================================
 .vs/
+.vscode/
+.idea/
 *.sln
 *.vcxproj*
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
 CMakeSettings.json
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
 
-# Local agent work products (backups, saved training states)
-*.bak
-*.state
-
-# The local agent work products: briefings, dispatches and the audit
-# trail. They stay in the repository's HISTORY (they are the record of
-# how the work was reviewed) but they are not part of the published
-# tree: they carry the local paths of the machine that produced them.
+# ==============================================================================
+# Legacy / External Tooling & Cloud Sandbox Artifacts (Never Push)
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
 .agents/
+.aistudio/
+node_modules/
+.npm/
+package.json
+package-lock.json
+metadata.json
+server.js
+.env
+.env.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

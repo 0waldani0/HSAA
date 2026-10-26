@@ -34,9 +34,16 @@ if defined VCVARS64 (
 
 :msvc_configured
 
+if not exist "%BUILD_DIR%\popcnt_brain.lib" (
+    echo [*] Building prerequisite popcnt_brain.lib...
+    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /DBUILDING_POPCNT_BRAIN_LIB /c ^
+        "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
+    lib.exe /nologo "%BUILD_DIR%\popcnt_brain_lib.obj" /OUT:"%BUILD_DIR%\popcnt_brain.lib"
+)
+
 echo [*] Compiling Challenger 2 Stress Test Harness...
-cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /EHsc /utf-8 /wd4068 ^
-    /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%legacy_ptq" ^
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 ^
+    /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%legacy_ptq" /I"%ROOT_DIR%tests" ^
     "%ROOT_DIR%src\bridge.cpp" ^
     "%ROOT_DIR%src\vsa_db.cpp" ^
     "%ROOT_DIR%src\model_mod.cpp" ^

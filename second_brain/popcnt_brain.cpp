@@ -6102,11 +6102,7 @@ MassivePretrainReport run_massive_multidomain_pretraining(
     std::vector<std::vector<int>> massive_sequences;
     massive_sequences.reserve(24000);
 
-    std::vector<std::string> search_roots = {"/usr/share/doc", "/usr/lib/python3.11"};
-    const char* local_app = std::getenv("LOCALAPPDATA");
-    if (local_app) {
-        search_roots.push_back(std::string(local_app) + "\\Programs\\Python");
-    }
+    std::vector<std::string> search_roots = {"second_brain/measur/data", "docs", "/usr/share/doc"};
     std::error_code ec;
     for (const auto& root_dir : search_roots) {
         if (!std::filesystem::exists(root_dir, ec)) continue;
@@ -8307,12 +8303,14 @@ struct CodeProseTokenizer {
 };
 
 struct PopCountGenerativeLLM {
-    static constexpr int MAX_HORIZON = 64;
+    static constexpr int MAX_HORIZON = 2048;
     static constexpr int MAX_ROLE_HORIZON = 6;
     static constexpr int SHORTLIST_CAP = 48;
 
     int highest_trained_horizon = 0;
     int highest_trained_reg_horizon = 0;
+    std::vector<int> active_horizons;
+    std::vector<int> active_reg_horizons;
 
     // 4-byte bitfield-compressed NextTokenEntry (50% RAM reduction vs 8-byte struct,
     // fitting 16 entries per 64-byte L1 cache line across all horizon tables).
@@ -8331,6 +8329,96 @@ struct PopCountGenerativeLLM {
         int func_name_tok = -1;
     };
 
+    // Reusable zero-heap-allocation flat candidate table (O(1) direct indexing via generation stamp)
+    struct FlatCandidateTable {
+        std::vector<int> toks;
+        std::vector<int64_t> scores;
+        std::vector<int> max_L;
+        std::vector<int32_t> tok_to_idx;
+        std::vector<uint32_t> stamps;
+        uint32_t cur_stamp = 1;
+
+        void ensure_vocab(size_t vocab_cap) {
+            if (stamps.size() < vocab_cap) {
+                tok_to_idx.resize(vocab_cap, -1);
+                stamps.resize(vocab_cap, 0);
+            }
+        }
+
+        void reset(size_t vocab_cap = 0) {
+            ensure_vocab(vocab_cap);
+            ++cur_stamp;
+            if (cur_stamp == 0) {
+                std::fill(stamps.begin(), stamps.end(), 0U);
+                cur_stamp = 1;
+            }
+            toks.clear();
+            scores.clear();
+            max_L.clear();
+        }
+
+        inline void ensure_tok(int tok) {
+            if (static_cast<size_t>(tok) >= stamps.size()) {
+                size_t new_cap = static_cast<size_t>(tok) + 64;
+                tok_to_idx.resize(new_cap, -1);
+                stamps.resize(new_cap, 0);
+            }
+        }
+
+        inline int find_idx(int tok) const {
+            if (tok < 0 || static_cast<size_t>(tok) >= stamps.size() || stamps[tok] != cur_stamp) {
+                return -1;
+            }
+            return tok_to_idx[tok];
+        }
+
+        inline bool contains(int tok) const {
+            return find_idx(tok) >= 0;
+        }
+
+        inline int get_max_L(int tok) const {
+            int idx = find_idx(tok);
+            return (idx >= 0) ? max_L[idx] : 0;
+        }
+
+        inline int get_or_insert_idx(int tok) {
+            ensure_tok(tok);
+            if (stamps[tok] != cur_stamp) {
+                stamps[tok] = cur_stamp;
+                int idx = static_cast<int>(toks.size());
+                tok_to_idx[tok] = idx;
+                toks.push_back(tok);
+                scores.push_back(0);
+                max_L.push_back(0);
+                return idx;
+            }
+            return tok_to_idx[tok];
+        }
+
+        inline void add_score(int tok, int64_t delta, int L = 0) {
+            if (tok < 0) return;
+            int idx = get_or_insert_idx(tok);
+            scores[idx] += delta;
+            if (L > max_L[idx]) max_L[idx] = L;
+        }
+
+        inline void max_score(int tok, int64_t val, int L = 0) {
+            if (tok < 0) return;
+            int idx = find_idx(tok);
+            if (idx < 0) {
+                idx = get_or_insert_idx(tok);
+                scores[idx] = val;
+                max_L[idx] = L;
+            } else {
+                if (val > scores[idx]) scores[idx] = val;
+                if (L > max_L[idx]) max_L[idx] = L;
+            }
+        }
+
+        inline size_t size() const { return toks.size(); }
+        inline bool empty() const { return toks.empty(); }
+    };
+
     CodeProseTokenizer tokenizer;
     std::unique_ptr<AutoMappedWeightBank> llm_bank_guard;
     std::unique_ptr<NativeSublinearLLM> sublinear_net;
@@ -8339,6 +8427,7 @@ struct PopCountGenerativeLLM {
     std::unordered_map<uint64_t, std::vector<NextTokenEntry>> reg_horizon_tables[MAX_HORIZON + 1];
     std::unordered_map<uint64_t, std::vector<NextTokenEntry>> role_horizon_tables[MAX_ROLE_HORIZON + 1];
     std::vector<int> tok_to_role;
+    std::vector<uint8_t> tok_is_content;
     std::unordered_map<int, std::vector<NextTokenEntry>> skip_table;
     std::vector<NextTokenEntry> top_unigrams;
 
@@ -8352,6 +8441,8 @@ struct PopCountGenerativeLLM {
     mutable std::vector<std::array<int8_t, D_MODEL>> tok_next_cont_centroid;
     mutable std::vector<std::array<int8_t, D_MODEL>> seg_cont_centroid;
     mutable std::vector<int32_t> tok_cont_norm_sq;
+    mutable std::vector<float> tok_cont_inv_norm;
+    mutable FlatCandidateTable step_cands;
     mutable bool cont_space_ready = false;
     mutable bool cont_emb_synced = false;
 
@@ -8360,11 +8451,105 @@ struct PopCountGenerativeLLM {
     BrainTrainStats last_stats{};
     bool is_trained = false;
 
+    // AVX-512BW / AVX2 accelerated 512-bit sketch unpacking to int8 (+val / -val)
+    static inline void unpack_sketch512_to_int8(const uint64_t* sk, int8_t pos_val, int8_t neg_val, int8_t* out) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        const __m512i v_pos = _mm512_set1_epi8(pos_val);
+        const __m512i v_neg = _mm512_set1_epi8(neg_val);
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            __m512i v = _mm512_mask_mov_epi8(v_neg, static_cast<__mmask64>(sk[w]), v_pos);
+            _mm512_storeu_si512(reinterpret_cast<void*>(out + w * 64), v);
+        }
+#else
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t bits = sk[w];
+            int8_t* dst = out + w * 64;
+            for (int b = 0; b < 64; ++b) {
+                dst[b] = ((bits >> b) & 1ULL) ? pos_val : neg_val;
+            }
+        }
+#endif
+    }
+
+    // AVX-512 accelerated accumulation of a 512-bit sketch into float[512]
+    static inline void accumulate_sketch512_f32(const uint64_t* sk, float weight, float* acc) {
+#if defined(__AVX512F__)
+        const __m512 v_pos = _mm512_set1_ps(weight);
+        const __m512 v_neg = _mm512_set1_ps(-weight);
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t bits = sk[w];
+            for (int g = 0; g < 4; ++g) {
+                __mmask16 m = static_cast<__mmask16>((bits >> (g * 16)) & 0xFFFFU);
+                int idx = w * 64 + g * 16;
+                __m512 va = _mm512_loadu_ps(acc + idx);
+                __m512 vd = _mm512_mask_mov_ps(v_neg, m, v_pos);
+                _mm512_storeu_ps(acc + idx, _mm512_add_ps(va, vd));
+            }
+        }
+#else
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t bits = sk[w];
+            for (int b = 0; b < 64; ++b) {
+                acc[w * 64 + b] += ((bits >> b) & 1ULL) ? weight : -weight;
+            }
+        }
+#endif
+    }
+
+    // AVX-512 accelerated accumulation of a 512-bit sketch into int32_t[512]
+    static inline void accumulate_sketch512_i32(const uint64_t* sk, int32_t weight, int32_t* acc) {
+#if defined(__AVX512F__)
+        const __m512i v_pos = _mm512_set1_epi32(weight);
+        const __m512i v_neg = _mm512_set1_epi32(-weight);
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t bits = sk[w];
+            for (int g = 0; g < 4; ++g) {
+                __mmask16 m = static_cast<__mmask16>((bits >> (g * 16)) & 0xFFFFU);
+                int idx = w * 64 + g * 16;
+                __m512i va = _mm512_loadu_si512(reinterpret_cast<const void*>(acc + idx));
+                __m512i vd = _mm512_mask_mov_epi32(v_neg, m, v_pos);
+                _mm512_storeu_si512(reinterpret_cast<void*>(acc + idx), _mm512_add_epi32(va, vd));
+            }
+        }
+#else
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t bits = sk[w];
+            for (int b = 0; b < 64; ++b) {
+                acc[w * 64 + b] += ((bits >> b) & 1ULL) ? weight : -weight;
+            }
+        }
+#endif
+    }
+
+    // AVX-512 accelerated binarization of int32_t[512] into uint64_t[8]
+    static inline void pack_sketch512_from_i32(const int32_t* acc, uint64_t* out_sk) {
+#if defined(__AVX512F__)
+        const __m512i v_zero = _mm512_setzero_si512();
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t mask = 0ULL;
+            for (int g = 0; g < 4; ++g) {
+                __m512i va = _mm512_loadu_si512(reinterpret_cast<const void*>(acc + w * 64 + g * 16));
+                __mmask16 m = _mm512_cmpge_epi32_mask(va, v_zero);
+                mask |= (static_cast<uint64_t>(m) << (g * 16));
+            }
+            out_sk[w] = mask;
+        }
+#else
+        for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+            uint64_t mask = 0ULL;
+            for (int b = 0; b < 64; ++b) {
+                if (acc[w * 64 + b] >= 0) mask |= (1ULL << b);
+            }
+            out_sk[w] = mask;
+        }
+#endif
+    }
+
     // AVX-512BW / AVX2 accelerated 512-D continuous int8 inner product
     static inline int32_t continuous_dot_int8_512(const int8_t* a, const int8_t* b) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
         __m512i acc = _mm512_setzero_si512();
-        for (int i = 0; i < D_MODEL; i += 32) {
+        for (int i = 0; i < static_cast<int>(D_MODEL); i += 32) {
             __m256i va8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
             __m256i vb8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
             __m512i va16 = _mm512_cvtepi8_epi16(va8);
@@ -8374,7 +8559,7 @@ struct PopCountGenerativeLLM {
         return _mm512_reduce_add_epi32(acc);
 #elif defined(__AVX2__)
         __m256i acc = _mm256_setzero_si256();
-        for (int i = 0; i < D_MODEL; i += 16) {
+        for (int i = 0; i < static_cast<int>(D_MODEL); i += 16) {
             __m128i va8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
             __m128i vb8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
             __m256i va16 = _mm256_cvtepi8_epi16(va8);
@@ -8389,14 +8574,24 @@ struct PopCountGenerativeLLM {
         return _mm_cvtsi128_si32(s);
 #else
         int32_t sum = 0;
-        for (int i = 0; i < D_MODEL; ++i) {
+        for (int i = 0; i < static_cast<int>(D_MODEL); ++i) {
             sum += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
         }
         return sum;
 #endif
     }
 
-    // Cosine similarity in Q10 fixed-point [-1024, +1024] between two 512-D int8 vectors
+    // Fast cosine similarity in Q10 fixed-point [-1024, +1024] using precomputed inverse norms (zero sqrt in inner loop)
+    static inline int32_t continuous_cosine_q10_fast(
+        const int8_t* a, float inv_norm_a,
+        const int8_t* b, float inv_norm_b
+    ) {
+        if (inv_norm_a <= 0.0f || inv_norm_b <= 0.0f) return 0;
+        int32_t dot = continuous_dot_int8_512(a, b);
+        int32_t q10 = static_cast<int32_t>(std::lround(static_cast<float>(dot) * (1024.0f * inv_norm_a * inv_norm_b)));
+        return std::max(-1024, std::min(1024, q10));
+    }
+
     static inline int32_t continuous_cosine_q10_512(
         const int8_t* a, int32_t norm_sq_a,
         const int8_t* b, int32_t norm_sq_b
@@ -8404,12 +8599,12 @@ struct PopCountGenerativeLLM {
         if (norm_sq_a <= 0 || norm_sq_b <= 0) return 0;
         int32_t dot = continuous_dot_int8_512(a, b);
         double denom = std::sqrt(static_cast<double>(norm_sq_a) * static_cast<double>(norm_sq_b));
-        if (denom < 1e-9) return 0;
-        int32_t q10 = static_cast<int32_t>(std::llround((static_cast<double>(dot) * 1024.0) / denom));
+        if (denom < 1e-6) return 0;
+        int32_t q10 = static_cast<int32_t>(std::lround((static_cast<double>(dot) * 1024.0) / denom));
         return std::max(-1024, std::min(1024, q10));
     }
 
-    // Deep 3-layer continuous state interpolation in [-15, +15]^512 (weights in Q8, w_fast + w_mid + w_deep = 256)
+    // AVX-512BW vectorized deep 3-layer continuous state interpolation in [-15, +15]^512 (weights in Q8)
     static inline void deep_interpolate_int8_512(
         const int8_t* state_fast,
         const int8_t* state_mid,
@@ -8419,13 +8614,38 @@ struct PopCountGenerativeLLM {
         int32_t w_deep_q8,
         int8_t* out_state
     ) {
-        for (int d = 0; d < D_MODEL; ++d) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        const __m512i vw_f = _mm512_set1_epi16(static_cast<int16_t>(w_fast_q8));
+        const __m512i vw_m = _mm512_set1_epi16(static_cast<int16_t>(w_mid_q8));
+        const __m512i vw_d = _mm512_set1_epi16(static_cast<int16_t>(w_deep_q8));
+        const __m512i v_min = _mm512_set1_epi16(-15);
+        const __m512i v_max = _mm512_set1_epi16(15);
+        const __m512i v_bias = _mm512_set1_epi16(128);
+        const __m512i v_zero = _mm512_setzero_si512();
+        for (int d = 0; d < static_cast<int>(D_MODEL); d += 32) {
+            __m512i vf = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(state_fast + d)));
+            __m512i vm = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(state_mid + d)));
+            __m512i vd = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(state_deep + d)));
+            __m512i acc = _mm512_add_epi16(
+                _mm512_add_epi16(_mm512_mullo_epi16(vf, vw_f), _mm512_mullo_epi16(vm, vw_m)),
+                _mm512_mullo_epi16(vd, vw_d)
+            );
+            __mmask32 neg_m = _mm512_cmplt_epi16_mask(acc, v_zero);
+            __m512i pos_r = _mm512_srai_epi16(_mm512_add_epi16(acc, v_bias), 8);
+            __m512i neg_r = _mm512_sub_epi16(v_zero, _mm512_srai_epi16(_mm512_add_epi16(_mm512_sub_epi16(v_zero, acc), v_bias), 8));
+            __m512i r = _mm512_mask_mov_epi16(pos_r, neg_m, neg_r);
+            r = _mm512_max_epi16(v_min, _mm512_min_epi16(v_max, r));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out_state + d), _mm512_cvtepi16_epi8(r));
+        }
+#else
+        for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
             int32_t acc = static_cast<int32_t>(state_fast[d]) * w_fast_q8
                         + static_cast<int32_t>(state_mid[d])  * w_mid_q8
                         + static_cast<int32_t>(state_deep[d]) * w_deep_q8;
             int32_t rounded = (acc >= 0) ? ((acc + 128) >> 8) : -((-acc + 128) >> 8);
             out_state[d] = static_cast<int8_t>(std::max(-15, std::min(15, rounded)));
         }
+#endif
     }
 
     // Deterministic construction of the adapted 512-D continuous representation manifold
@@ -8435,6 +8655,7 @@ struct PopCountGenerativeLLM {
         tok_cont_emb.assign(V, std::array<int8_t, D_MODEL>{});
         tok_next_cont_centroid.assign(V, std::array<int8_t, D_MODEL>{});
         tok_cont_norm_sq.assign(V, 0);
+        tok_cont_inv_norm.assign(V, 0.0f);
         seg_cont_centroid.assign(segment_records.size(), std::array<int8_t, D_MODEL>{});
         cont_space_ready = true;
         if (V == 0) return;
@@ -8445,34 +8666,22 @@ struct PopCountGenerativeLLM {
         for (size_t t = 0; t < V; ++t) dist_acc[t].fill(0);
 
         for (const auto& seg : segment_records) {
-            int8_t seg_topic_int8[D_MODEL];
-            for (int w = 0; w < WORDS_PER_VEC; ++w) {
-                uint64_t bits = seg.topic_sketch[w];
-                for (int b = 0; b < 64; ++b) {
-                    seg_topic_int8[w * 64 + b] = ((bits >> b) & 1ULL) ? 4 : -4;
-                }
-            }
+            int32_t seg_topic_i32[D_MODEL] = {0};
+            accumulate_sketch512_i32(seg.topic_sketch, 4, seg_topic_i32);
             for (size_t pos = 1; pos + 1 < seg.tokens.size(); ++pos) {
                 int tid = seg.tokens[pos];
                 if (tid < 0 || static_cast<size_t>(tid) >= V) continue;
                 int prev_t = seg.tokens[pos - 1];
                 int next_t = seg.tokens[pos + 1];
-                const uint64_t* p_sk = (prev_t >= 0 && static_cast<size_t>(prev_t) < vocab_morph_sketch.size())
-                    ? vocab_morph_sketch[prev_t].data() : nullptr;
-                const uint64_t* n_sk = (next_t >= 0 && static_cast<size_t>(next_t) < vocab_morph_sketch.size())
-                    ? vocab_morph_sketch[next_t].data() : nullptr;
-
-                auto& acc = dist_acc[tid];
-                for (int w = 0; w < WORDS_PER_VEC; ++w) {
-                    uint64_t pb = p_sk ? p_sk[w] : 0ULL;
-                    uint64_t nb = n_sk ? n_sk[w] : 0ULL;
-                    for (int b = 0; b < 64; ++b) {
-                        int d = w * 64 + b;
-                        int32_t v = seg_topic_int8[d];
-                        if (p_sk) v += ((pb >> b) & 1ULL) ? 3 : -3;
-                        if (n_sk) v += ((nb >> b) & 1ULL) ? 3 : -3;
-                        acc[d] += v;
-                    }
+                auto* acc_ptr = dist_acc[tid].data();
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
+                    acc_ptr[d] += seg_topic_i32[d];
+                }
+                if (prev_t >= 0 && static_cast<size_t>(prev_t) < vocab_morph_sketch.size()) {
+                    accumulate_sketch512_i32(vocab_morph_sketch[prev_t].data(), 3, acc_ptr);
+                }
+                if (next_t >= 0 && static_cast<size_t>(next_t) < vocab_morph_sketch.size()) {
+                    accumulate_sketch512_i32(vocab_morph_sketch[next_t].data(), 3, acc_ptr);
                 }
                 dist_cnt[tid]++;
             }
@@ -8481,7 +8690,8 @@ struct PopCountGenerativeLLM {
         // 2. Build multi-scale lexical + morphological + distributional continuous vector per token
         std::vector<std::array<float, D_MODEL>> raw_cont(V);
         for (size_t t = 0; t < V; ++t) {
-            raw_cont[t].fill(0.0f);
+            float* rdst = raw_cont[t].data();
+            std::memset(rdst, 0, D_MODEL * sizeof(float));
             const std::string& w_str = tokenizer.id_to_word[t];
             std::string nw = hsaa_assoc::normalize(w_str.c_str());
             if (nw.empty()) nw = w_str;
@@ -8494,26 +8704,22 @@ struct PopCountGenerativeLLM {
                 full_sk = fallback_sk;
             }
 
-            // 65% stem prefix sketch so inflected forms share continuous stem coordinates
             uint64_t stem_sk[hsaa_assoc::kW];
             size_t stem_len = (nw.size() >= 5) ? std::max<size_t>(3, (nw.size() * 65) / 100) : nw.size();
             if (stem_len == nw.size()) {
-                for (int w = 0; w < WORDS_PER_VEC; ++w) stem_sk[w] = full_sk[w];
+                std::memcpy(stem_sk, full_sk, sizeof(stem_sk));
             } else {
                 hsaa_assoc::sketch(nw.substr(0, stem_len), stem_sk);
             }
 
             uint64_t m_suf = static_cast<uint64_t>(morph_suffix_hash(w_str));
-            for (int w = 0; w < WORDS_PER_VEC; ++w) {
-                uint64_t suf_bits = hsaa_assoc::mix64(m_suf ^ (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(w + 1)));
-                for (int b = 0; b < 64; ++b) {
-                    int d = w * 64 + b;
-                    float val = (((full_sk[w] >> b) & 1ULL) ? 6.0f : -6.0f)
-                              + (((stem_sk[w] >> b) & 1ULL) ? 4.5f : -4.5f)
-                              + (((suf_bits >> b) & 1ULL)   ? 1.5f : -1.5f);
-                    raw_cont[t][d] = val;
-                }
+            uint64_t suf_sk[hsaa_assoc::kW];
+            for (int w = 0; w < static_cast<int>(WORDS_PER_VEC); ++w) {
+                suf_sk[w] = hsaa_assoc::mix64(m_suf ^ (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(w + 1)));
             }
+            accumulate_sketch512_f32(full_sk, 6.0f, rdst);
+            accumulate_sketch512_f32(stem_sk, 4.5f, rdst);
+            accumulate_sketch512_f32(suf_sk,  1.5f, rdst);
 
             auto subwords = split_identifier_subwords(w_str);
             if (subwords.size() > 1) {
@@ -8522,26 +8728,17 @@ struct PopCountGenerativeLLM {
                     if (nsw.empty()) continue;
                     uint64_t sw_sk[hsaa_assoc::kW];
                     hsaa_assoc::sketch(nsw, sw_sk);
-                    for (int w = 0; w < WORDS_PER_VEC; ++w) {
-                        for (int b = 0; b < 64; ++b) {
-                            raw_cont[t][w * 64 + b] += ((sw_sk[w] >> b) & 1ULL) ? 2.5f : -2.5f;
-                        }
-                    }
+                    accumulate_sketch512_f32(sw_sk, 2.5f, rdst);
                 }
             }
 
             if (dist_cnt[t] > 0) {
                 float inv_c = 1.0f / static_cast<float>(dist_cnt[t]);
-                for (int d = 0; d < D_MODEL; ++d) {
-                    raw_cont[t][d] += std::max(-6.0f, std::min(6.0f, static_cast<float>(dist_acc[t][d]) * inv_c));
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
+                    rdst[d] += std::max(-6.0f, std::min(6.0f, static_cast<float>(dist_acc[t][d]) * inv_c));
                 }
             } else if (t < token_topic_sketch.size()) {
-                const uint64_t* tsk = token_topic_sketch[t].data();
-                for (int w = 0; w < WORDS_PER_VEC; ++w) {
-                    for (int b = 0; b < 64; ++b) {
-                        raw_cont[t][w * 64 + b] += ((tsk[w] >> b) & 1ULL) ? 2.5f : -2.5f;
-                    }
-                }
+                accumulate_sketch512_f32(token_topic_sketch[t].data(), 2.5f, rdst);
             }
         }
 
@@ -8555,7 +8752,7 @@ struct PopCountGenerativeLLM {
                 role_sum[r] = raw_cont[r];
                 role_cnt[r] = 1;
             }
-            for (int d = 0; d < D_MODEL; ++d) {
+            for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                 role_sum[r][d] += raw_cont[t][d];
             }
             role_cnt[r]++;
@@ -8568,21 +8765,21 @@ struct PopCountGenerativeLLM {
                 if (it != role_cnt.end() && it->second > 1) {
                     float inv_rc = 1.0f / static_cast<float>(it->second);
                     const auto& rvec = role_sum[r];
-                    for (int d = 0; d < D_MODEL; ++d) {
+                    for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                         raw_cont[t][d] = 0.78f * raw_cont[t][d] + 0.22f * (rvec[d] * inv_rc);
                     }
                 }
             }
 
             double sq_sum = 0.0;
-            for (int d = 0; d < D_MODEL; ++d) {
+            for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                 sq_sum += static_cast<double>(raw_cont[t][d]) * static_cast<double>(raw_cont[t][d]);
             }
             double rms = std::sqrt(sq_sum / static_cast<double>(D_MODEL));
             float scale = (rms > 1e-5) ? static_cast<float>(9.5 / rms) : 1.0f;
 
             int32_t nsq = 0;
-            for (int d = 0; d < D_MODEL; ++d) {
+            for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                 int32_t q = static_cast<int32_t>(std::lround(raw_cont[t][d] * scale));
                 q = std::max(-15, std::min(15, q));
                 if (q == 0) {
@@ -8597,14 +8794,14 @@ struct PopCountGenerativeLLM {
                 nsq += q * q;
             }
             tok_cont_norm_sq[t] = nsq;
+            tok_cont_inv_norm[t] = (nsq > 0) ? (1.0f / std::sqrt(static_cast<float>(nsq))) : 0.0f;
         }
 
         // 4. Build predictive next-token continuous centroids from 1-gram horizon transitions
-        auto h1_it = horizon_tables[1].begin();
-        for (; h1_it != horizon_tables[1].end(); ++h1_it) {
-            int prev_tok = static_cast<int>(h1_it->first);
+        for (const auto& kv : horizon_tables[1]) {
+            int prev_tok = static_cast<int>(kv.first);
             if (prev_tok < 0 || static_cast<size_t>(prev_tok) >= V) continue;
-            const auto& entries = h1_it->second;
+            const auto& entries = kv.second;
             if (entries.empty()) continue;
             int32_t acc[D_MODEL] = {0};
             int32_t w_sum = 0;
@@ -8612,13 +8809,13 @@ struct PopCountGenerativeLLM {
                 if (e.tok < 0 || static_cast<size_t>(e.tok) >= V) continue;
                 int32_t w = std::max<int32_t>(1, count_bucket(e.count));
                 const auto& cemb = tok_cont_emb[e.tok];
-                for (int d = 0; d < D_MODEL; ++d) {
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                     acc[d] += static_cast<int32_t>(cemb[d]) * w;
                 }
                 w_sum += w;
             }
             if (w_sum > 0) {
-                for (int d = 0; d < D_MODEL; ++d) {
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                     int32_t v = (acc[d] >= 0) ? ((acc[d] + w_sum / 2) / w_sum) : -((-acc[d] + w_sum / 2) / w_sum);
                     tok_next_cont_centroid[prev_tok][d] = static_cast<int8_t>(std::max(-15, std::min(15, v)));
                 }
@@ -8633,12 +8830,12 @@ struct PopCountGenerativeLLM {
             for (int ut : seg.unique_content_tokens) {
                 if (ut >= 0 && static_cast<size_t>(ut) < V) {
                     const auto& cemb = tok_cont_emb[ut];
-                    for (int d = 0; d < D_MODEL; ++d) acc[d] += cemb[d];
+                    for (int d = 0; d < static_cast<int>(D_MODEL); ++d) acc[d] += cemb[d];
                     ++cnt;
                 }
             }
             if (cnt > 0) {
-                for (int d = 0; d < D_MODEL; ++d) {
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                     int32_t v = acc[d] / cnt;
                     seg_cont_centroid[s][d] = static_cast<int8_t>(std::max(-15, std::min(15, v)));
                 }
@@ -8686,10 +8883,17 @@ struct PopCountGenerativeLLM {
         };
         auto pa = split_identifier_subwords(a);
         auto pb = split_identifier_subwords(b);
+        std::vector<std::array<uint64_t, hsaa_assoc::kW>> sk_b(pb.size());
+        for (size_t j = 0; j < pb.size(); ++j) {
+            if (pb[j].size() >= 3) hsaa_assoc::sketch(pb[j], sk_b[j].data());
+        }
         int64_t score = 0;
         for (const auto& sa : pa) {
             if (sa.size() < 2) continue;
-            for (const auto& sb : pb) {
+            uint64_t ska[hsaa_assoc::kW] = {0};
+            bool ska_ready = false;
+            for (size_t j = 0; j < pb.size(); ++j) {
+                const auto& sb = pb[j];
                 if (sb.size() < 2) continue;
                 if (sa == sb) {
                     score += (generic_parts.find(sa) == generic_parts.end()) ? 3072LL : 384LL;
@@ -8697,10 +8901,11 @@ struct PopCountGenerativeLLM {
                     if (sa.find(sb) != std::string::npos || sb.find(sa) != std::string::npos) {
                         score += 1536LL;
                     } else {
-                        uint64_t ska[hsaa_assoc::kW], skb[hsaa_assoc::kW];
-                        hsaa_assoc::sketch(sa, ska);
-                        hsaa_assoc::sketch(sb, skb);
-                        int32_t d = hsaa_assoc::dot512(ska, skb);
+                        if (!ska_ready) {
+                            hsaa_assoc::sketch(sa, ska);
+                            ska_ready = true;
+                        }
+                        int32_t d = hsaa_assoc::dot512(ska, sk_b[j].data());
                         if (d >= 240) score += static_cast<int64_t>(d) * 3LL;
                     }
                 }
@@ -8718,11 +8923,16 @@ struct PopCountGenerativeLLM {
         return score;
     }
 
-    static int count_bucket(uint32_t c) {
+    static inline int count_bucket(uint32_t c) {
         if (c == 0) return 0;
+#if defined(__GNUC__) || defined(__clang__)
+        int b = 32 - __builtin_clz(c);
+        return (b > 15) ? 15 : b;
+#else
         int b = 1;
         while ((c >>= 1) != 0 && b < 15) ++b;
         return b;
+#endif
     }
 
     static uint32_t morph_suffix_hash(const std::string& w) {
@@ -8732,7 +8942,6 @@ struct PopCountGenerativeLLM {
         }
         std::string nw = hsaa_assoc::normalize(w.c_str());
         if (nw.size() < 4) return 0U;
-        // Extract trailing 4 bytes (2 UTF-8 Cyrillic chars or 4 ASCII chars) as inflectional signature
         const size_t n = nw.size();
         uint32_t h = 2166136261U;
         for (size_t i = n - 4; i < n; ++i) {
@@ -8740,6 +8949,44 @@ struct PopCountGenerativeLLM {
             h *= 16777619U;
         }
         return (h == 0U) ? 1U : h;
+    }
+
+    static inline uint64_t mix_token_u64(int tok) {
+        uint64_t x = static_cast<uint64_t>(static_cast<uint32_t>(tok)) + 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    }
+
+    static inline uint64_t step_backward_horizon_roll(uint64_t prev_roll, int older_tok) {
+        return (((prev_roll << 17) | (prev_roll >> 47)) * 0xBF58476D1CE4E5B9ULL) ^ mix_token_u64(older_tok);
+    }
+
+    static inline uint64_t pack_horizon_key_from_roll(uint64_t roll, uint64_t u1) {
+        return ((roll & 0xFFFFFFFFFFFULL) << 20) | (u1 & 0xFFFFFULL);
+    }
+
+    // O(max_L) single-pass backward rolling horizon key generator for L = 1..max_L
+    // Replaces O(L^2) repeated suffix scans with 1 multiply + 1 rotate + 1 XOR per horizon level.
+    static inline int build_horizon_keys(const int* toks, size_t len, int max_L, uint64_t* out_keys) {
+        if (!toks || len == 0 || max_L <= 0) return 0;
+        const int eff_L = static_cast<int>(std::min<size_t>(static_cast<size_t>(max_L), len));
+        const uint64_t u1 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 1]) & 0xFFFFFU);
+        out_keys[1] = u1;
+        if (eff_L == 1) return 1;
+        const uint64_t u2 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 2]) & 0xFFFFFU);
+        out_keys[2] = (u2 << 20) | u1;
+        if (eff_L == 2) return 2;
+        const uint64_t u3 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 3]) & 0xFFFFFU);
+        out_keys[3] = (u3 << 40) | (u2 << 20) | u1;
+        if (eff_L == 3) return 3;
+
+        uint64_t roll = mix_token_u64(toks[len - 3]) ^ (mix_token_u64(toks[len - 2]) * 0x9E3779B97F4A7C15ULL);
+        for (int L = 4; L <= eff_L; ++L) {
+            roll = step_backward_horizon_roll(roll, toks[len - static_cast<size_t>(L)]);
+            out_keys[L] = pack_horizon_key_from_roll(roll, u1);
+        }
+        return eff_L;
     }
 
     static uint64_t make_horizon_key(const int* toks, size_t len, int L) {
@@ -8751,15 +8998,11 @@ struct PopCountGenerativeLLM {
         const uint64_t u3 = static_cast<uint64_t>(static_cast<uint32_t>(toks[len - 3]) & 0xFFFFFU);
         if (L == 3) return (u3 << 40) | (u2 << 20) | u1;
 
-        uint64_t h = 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(L);
-        for (size_t i = len - static_cast<size_t>(L); i < len - 2; ++i) {
-            uint64_t x = static_cast<uint64_t>(static_cast<uint32_t>(toks[i])) + 0x9E3779B97F4A7C15ULL;
-            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-            h ^= x ^ (x >> 31);
-            h = (h << 13) | (h >> 51);
+        uint64_t roll = mix_token_u64(toks[len - 3]) ^ (mix_token_u64(toks[len - 2]) * 0x9E3779B97F4A7C15ULL);
+        for (int k = 4; k <= L; ++k) {
+            roll = step_backward_horizon_roll(roll, toks[len - static_cast<size_t>(k)]);
         }
-        return ((h & 0xFFFFFFULL) << 40) | (u2 << 20) | u1;
+        return pack_horizon_key_from_roll(roll, u1);
     }
 
     int map_token_to_role(int tok) const {
@@ -8782,34 +9025,58 @@ struct PopCountGenerativeLLM {
         return stop.find(norm) == stop.end();
     }
 
+    inline bool is_content_token_id(int tid) const {
+        if (tid < 0) return false;
+        if (static_cast<size_t>(tid) < tok_is_content.size()) {
+            return tok_is_content[tid] != 0;
+        }
+        if (static_cast<size_t>(tid) < tokenizer.id_to_word.size()) {
+            return is_content_token(tokenizer.id_to_word[tid]);
+        }
+        return false;
+    }
+
+    void rebuild_active_horizon_lists() {
+        active_horizons.clear();
+        active_reg_horizons.clear();
+        highest_trained_horizon = 0;
+        highest_trained_reg_horizon = 0;
+        for (int L = MAX_HORIZON; L >= 1; --L) {
+            if (!horizon_tables[L].empty()) {
+                active_horizons.push_back(L);
+                if (L > highest_trained_horizon) highest_trained_horizon = L;
+            }
+            if (!reg_horizon_tables[L].empty()) {
+                active_reg_horizons.push_back(L);
+                if (L > highest_trained_reg_horizon) highest_trained_reg_horizon = L;
+            }
+        }
+    }
+
     void compute_token_bundle_512(const std::vector<int>& toks, uint64_t out_sketch[hsaa_assoc::kW]) const {
         int32_t acc[512] = {0};
         int count = 0;
         for (int t : toks) {
             if (t < 0 || t >= static_cast<int>(tokenizer.id_to_word.size())) continue;
-            const std::string& w = tokenizer.id_to_word[t];
-            if (!is_content_token(w)) continue;
-            std::string nw = hsaa_assoc::normalize(w.c_str());
-            if (nw.empty()) continue;
-            uint64_t ws[hsaa_assoc::kW];
-            hsaa_assoc::sketch(nw, ws);
-            for (int word_idx = 0; word_idx < static_cast<int>(hsaa_assoc::kW); ++word_idx) {
-                uint64_t bits = ws[word_idx];
-                for (int b = 0; b < 64; ++b) {
-                    acc[word_idx * 64 + b] += ((bits >> b) & 1ULL) ? 1 : -1;
-                }
+            if (!is_content_token_id(t)) continue;
+            const uint64_t* ws = nullptr;
+            uint64_t fallback_ws[hsaa_assoc::kW];
+            if (static_cast<size_t>(t) < vocab_morph_sketch.size()) {
+                ws = vocab_morph_sketch[t].data();
+            } else {
+                std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[t].c_str());
+                if (nw.empty()) continue;
+                hsaa_assoc::sketch(nw, fallback_ws);
+                ws = fallback_ws;
             }
+            accumulate_sketch512_i32(ws, 1, acc);
             ++count;
         }
-        for (size_t w = 0; w < hsaa_assoc::kW; ++w) out_sketch[w] = 0ULL;
-        if (count == 0) return;
-        for (int word_idx = 0; word_idx < static_cast<int>(hsaa_assoc::kW); ++word_idx) {
-            uint64_t mask = 0ULL;
-            for (int b = 0; b < 64; ++b) {
-                if (acc[word_idx * 64 + b] >= 0) mask |= (1ULL << b);
-            }
-            out_sketch[word_idx] = mask;
+        if (count == 0) {
+            for (size_t w = 0; w < hsaa_assoc::kW; ++w) out_sketch[w] = 0ULL;
+            return;
         }
+        pack_sketch512_from_i32(acc, out_sketch);
     }
 
     bool train_corpus(const std::string& bank_base_path, const char* corpus_text, int epochs, BrainTrainStats* out_stats) {
@@ -8837,6 +9104,8 @@ struct PopCountGenerativeLLM {
         for (int L = 1; L <= MAX_ROLE_HORIZON; ++L) {
             role_horizon_tables[L].clear();
         }
+        active_horizons.clear();
+        active_reg_horizons.clear();
         tok_to_role.clear();
         skip_table.clear();
         top_unigrams.clear();
@@ -8847,6 +9116,7 @@ struct PopCountGenerativeLLM {
         tok_next_cont_centroid.clear();
         seg_cont_centroid.clear();
         tok_cont_norm_sq.clear();
+        tok_cont_inv_norm.clear();
         cont_space_ready = false;
         cont_emb_synced = false;
 
@@ -8869,10 +9139,12 @@ struct PopCountGenerativeLLM {
 
         const size_t vocab_sz = tokenizer.id_to_word.size();
         vocab_morph_sketch.assign(vocab_sz, {0, 0, 0, 0, 0, 0, 0, 0});
+        tok_is_content.assign(vocab_sz, 0);
         for (size_t t = 0; t < vocab_sz; ++t) {
             std::string nw = hsaa_assoc::normalize(tokenizer.id_to_word[t].c_str());
             if (nw.empty()) nw = tokenizer.id_to_word[t];
             hsaa_assoc::sketch(nw, vocab_morph_sketch[t].data());
+            tok_is_content[t] = is_content_token(tokenizer.id_to_word[t]) ? 1 : 0;
         }
 
         std::vector<std::vector<int>> reg_seqs;
@@ -8884,10 +9156,13 @@ struct PopCountGenerativeLLM {
             std::unordered_map<int, std::unordered_map<int, uint32_t>> raw_skip_counts;
             std::unordered_map<int, uint32_t> raw_uni_counts;
 
-            // Tier 1: Exact distributional syntactic frame (prev_tok, next_tok)
-            // Tier 2: Morphological inflection frame (prev_tok, morph_suffix_hash(next_tok))
             std::vector<std::unordered_map<uint64_t, uint32_t>> tok_frame_counts(vocab_sz);
             std::vector<std::unordered_map<uint64_t, uint32_t>> tok_morph_frame_counts(vocab_sz);
+
+            std::vector<uint32_t> vocab_morph_suf(vocab_sz, 0U);
+            for (size_t t = 0; t < vocab_sz; ++t) {
+                vocab_morph_suf[t] = morph_suffix_hash(tokenizer.id_to_word[t]);
+            }
 
             for (const auto& seq : seqs) {
                 SegmentTopicRecord rec;
@@ -8896,7 +9171,7 @@ struct PopCountGenerativeLLM {
                 std::unordered_set<int> seen_content;
                 for (int st : seq) {
                     if (st >= 0 && static_cast<size_t>(st) < vocab_sz &&
-                        is_content_token(tokenizer.id_to_word[st]) &&
+                        tok_is_content[st] &&
                         seen_content.insert(st).second) {
                         rec.unique_content_tokens.push_back(st);
                     }
@@ -8910,12 +9185,7 @@ struct PopCountGenerativeLLM {
 
                 for (int t : seq) {
                     if (t >= 0 && static_cast<size_t>(t) < vocab_sz) {
-                        for (int w = 0; w < static_cast<int>(hsaa_assoc::kW); ++w) {
-                            uint64_t bits = rec.topic_sketch[w];
-                            for (int b = 0; b < 64; ++b) {
-                                tok_topic_acc[t][w * 64 + b] += ((bits >> b) & 1ULL) ? 1 : -1;
-                            }
-                        }
+                        accumulate_sketch512_i32(rec.topic_sketch, 1, tok_topic_acc[t].data());
                     }
                 }
                 segment_records.push_back(std::move(rec));
@@ -8929,18 +9199,17 @@ struct PopCountGenerativeLLM {
                         raw_skip_counts[seq[pos - 2]][target]++;
                     }
                     if (pos + 1 < seq.size() && target >= 0 && static_cast<size_t>(target) < vocab_sz &&
-                        is_content_token(tokenizer.id_to_word[target])) {
+                        tok_is_content[target]) {
                         const int prev_t = seq[pos - 1];
                         const int next_t = seq[pos + 1];
                         if (prev_t >= 0 && static_cast<size_t>(prev_t) < vocab_sz &&
                             next_t >= 0 && static_cast<size_t>(next_t) < vocab_sz &&
-                            is_content_token(tokenizer.id_to_word[prev_t]) &&
-                            is_content_token(tokenizer.id_to_word[next_t])) {
+                            tok_is_content[prev_t] && tok_is_content[next_t]) {
                             uint64_t frame_key = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
                                                  static_cast<uint64_t>(static_cast<uint32_t>(next_t));
                             tok_frame_counts[target][frame_key]++;
 
-                            uint32_t msuf = morph_suffix_hash(tokenizer.id_to_word[next_t]);
+                            uint32_t msuf = vocab_morph_suf[next_t];
                             if (msuf != 0U) {
                                 uint64_t mframe_key = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
                                                       static_cast<uint64_t>(msuf);
@@ -8953,13 +9222,7 @@ struct PopCountGenerativeLLM {
 
             token_topic_sketch.assign(vocab_sz, {0, 0, 0, 0, 0, 0, 0, 0});
             for (size_t t = 0; t < vocab_sz; ++t) {
-                for (int w = 0; w < static_cast<int>(hsaa_assoc::kW); ++w) {
-                    uint64_t mask = 0ULL;
-                    for (int b = 0; b < 64; ++b) {
-                        if (tok_topic_acc[t][w * 64 + b] >= 0) mask |= (1ULL << b);
-                    }
-                    token_topic_sketch[t][w] = mask;
-                }
+                pack_sketch512_from_i32(tok_topic_acc[t].data(), token_topic_sketch[t].data());
             }
 
             for (auto it = raw_skip_counts.begin(); it != raw_skip_counts.end(); ) {
@@ -8968,7 +9231,6 @@ struct PopCountGenerativeLLM {
             }
             top_unigrams = sort_and_cap(raw_uni_counts, SHORTLIST_CAP);
 
-            // Pass 1: Build distributional role clusters for tokens sharing the exact syntactic frame
             tok_to_role.resize(vocab_sz);
             std::unordered_map<uint64_t, int> frame_to_role_rep;
             std::unordered_map<uint64_t, int> morph_frame_to_role_rep;
@@ -9003,68 +9265,127 @@ struct PopCountGenerativeLLM {
                     if (mfit == morph_frame_to_role_rep.end()) {
                         morph_frame_to_role_rep[best_mframe] = tok_to_role[t];
                     } else if (tok_to_role[t] == static_cast<int>(t)) {
-                        // Pass 2 fallback: cluster via shared (prev_tok, morph_suffix(next_tok)) frame
                         tok_to_role[t] = mfit->second;
                     }
                 }
             }
         }
 
-        // Build horizon tables level by level (L = 1..MAX_HORIZON).
-        // For L >= 5, only suffixes whose (L-1)-suffix was ambiguous (size() > 1) need to be
-        // stored, since an unambiguous suffix at L-1 >= 4 already uniquely determines the successor.
-        for (int L = 1; L <= MAX_HORIZON; ++L) {
-            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h;
-            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg;
+        // Build horizon tables level by level (L = 1..MAX_HORIZON) using O(1) incremental rolling state per position.
+        {
+            std::vector<std::vector<uint64_t>> seq_rolls(seqs.size());
+            std::vector<std::vector<uint8_t>> seq_ambig(seqs.size());
+            for (size_t si = 0; si < seqs.size(); ++si) {
+                seq_rolls[si].assign(seqs[si].size(), 0ULL);
+                seq_ambig[si].assign(seqs[si].size(), 1U);
+            }
+            std::vector<std::vector<uint64_t>> rseq_rolls(reg_seqs.size());
+            std::vector<std::vector<uint8_t>> rseq_ambig(reg_seqs.size());
+            for (size_t ri = 0; ri < reg_seqs.size(); ++ri) {
+                rseq_rolls[ri].assign(reg_seqs[ri].size(), 0ULL);
+                rseq_ambig[ri].assign(reg_seqs[ri].size(), 1U);
+            }
 
-            for (const auto& seq : seqs) {
-                for (size_t pos = static_cast<size_t>(L); pos < seq.size(); ++pos) {
-                    if (L >= 5) {
-                        uint64_t prev_key = make_horizon_key(seq.data(), pos, L - 1);
-                        auto pit = horizon_tables[L - 1].find(prev_key);
-                        if (pit == horizon_tables[L - 1].end() || pit->second.size() <= 1) continue;
+            for (int L = 1; L <= MAX_HORIZON; ++L) {
+                std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h;
+                std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg;
+
+                for (size_t si = 0; si < seqs.size(); ++si) {
+                    const auto& seq = seqs[si];
+                    auto& rolls = seq_rolls[si];
+                    auto& ambig = seq_ambig[si];
+                    for (size_t pos = static_cast<size_t>(L); pos < seq.size(); ++pos) {
+                        const uint64_t u1 = static_cast<uint64_t>(static_cast<uint32_t>(seq[pos - 1]) & 0xFFFFFU);
+                        if (L >= 5) {
+                            if (!ambig[pos]) continue;
+                            uint64_t prev_key = pack_horizon_key_from_roll(rolls[pos], u1);
+                            auto pit = horizon_tables[L - 1].find(prev_key);
+                            if (pit == horizon_tables[L - 1].end() || pit->second.size() <= 1) {
+                                ambig[pos] = 0U;
+                                continue;
+                            }
+                        }
+                        uint64_t key = 0ULL;
+                        if (L == 1) {
+                            key = u1;
+                        } else if (L == 2) {
+                            const uint64_t u2 = static_cast<uint64_t>(static_cast<uint32_t>(seq[pos - 2]) & 0xFFFFFU);
+                            key = (u2 << 20) | u1;
+                        } else if (L == 3) {
+                            const uint64_t u2 = static_cast<uint64_t>(static_cast<uint32_t>(seq[pos - 2]) & 0xFFFFFU);
+                            const uint64_t u3 = static_cast<uint64_t>(static_cast<uint32_t>(seq[pos - 3]) & 0xFFFFFU);
+                            key = (u3 << 40) | (u2 << 20) | u1;
+                            rolls[pos] = mix_token_u64(seq[pos - 3]) ^ (mix_token_u64(seq[pos - 2]) * 0x9E3779B97F4A7C15ULL);
+                        } else {
+                            rolls[pos] = step_backward_horizon_roll(rolls[pos], seq[pos - static_cast<size_t>(L)]);
+                            key = pack_horizon_key_from_roll(rolls[pos], u1);
+                        }
+                        raw_h[key][seq[pos]]++;
                     }
-                    uint64_t key = make_horizon_key(seq.data(), pos, L);
-                    raw_h[key][seq[pos]]++;
                 }
-            }
-            for (const auto& rseq : reg_seqs) {
-                for (size_t pos = static_cast<size_t>(L); pos < rseq.size(); ++pos) {
-                    if (L >= 5) {
-                        uint64_t prev_rkey = make_horizon_key(rseq.data(), pos, L - 1);
-                        auto prit = reg_horizon_tables[L - 1].find(prev_rkey);
-                        if (prit == reg_horizon_tables[L - 1].end() || prit->second.size() <= 1) continue;
+
+                for (size_t ri = 0; ri < reg_seqs.size(); ++ri) {
+                    const auto& rseq = reg_seqs[ri];
+                    auto& rrolls = rseq_rolls[ri];
+                    auto& rambig = rseq_ambig[ri];
+                    for (size_t pos = static_cast<size_t>(L); pos < rseq.size(); ++pos) {
+                        const uint64_t u1 = static_cast<uint64_t>(static_cast<uint32_t>(rseq[pos - 1]) & 0xFFFFFU);
+                        if (L >= 5) {
+                            if (!rambig[pos]) continue;
+                            uint64_t prev_rkey = pack_horizon_key_from_roll(rrolls[pos], u1);
+                            auto prit = reg_horizon_tables[L - 1].find(prev_rkey);
+                            if (prit == reg_horizon_tables[L - 1].end() || prit->second.size() <= 1) {
+                                rambig[pos] = 0U;
+                                continue;
+                            }
+                        }
+                        uint64_t rkey = 0ULL;
+                        if (L == 1) {
+                            rkey = u1;
+                        } else if (L == 2) {
+                            const uint64_t u2 = static_cast<uint64_t>(static_cast<uint32_t>(rseq[pos - 2]) & 0xFFFFFU);
+                            rkey = (u2 << 20) | u1;
+                        } else if (L == 3) {
+                            const uint64_t u2 = static_cast<uint64_t>(static_cast<uint32_t>(rseq[pos - 2]) & 0xFFFFFU);
+                            const uint64_t u3 = static_cast<uint64_t>(static_cast<uint32_t>(rseq[pos - 3]) & 0xFFFFFU);
+                            rkey = (u3 << 40) | (u2 << 20) | u1;
+                            rrolls[pos] = mix_token_u64(rseq[pos - 3]) ^ (mix_token_u64(rseq[pos - 2]) * 0x9E3779B97F4A7C15ULL);
+                        } else {
+                            rrolls[pos] = step_backward_horizon_roll(rrolls[pos], rseq[pos - static_cast<size_t>(L)]);
+                            rkey = pack_horizon_key_from_roll(rrolls[pos], u1);
+                        }
+                        raw_reg[rkey][rseq[pos]]++;
                     }
-                    uint64_t rkey = make_horizon_key(rseq.data(), pos, L);
-                    raw_reg[rkey][rseq[pos]]++;
                 }
-            }
 
-            if (L >= 5 && raw_h.empty() && raw_reg.empty()) {
-                break;
-            }
+                if (L >= 5 && raw_h.empty() && raw_reg.empty()) {
+                    break;
+                }
 
-            if (!raw_h.empty()) highest_trained_horizon = L;
-            if (!raw_reg.empty()) highest_trained_reg_horizon = L;
+                if (!raw_h.empty()) highest_trained_horizon = L;
+                if (!raw_reg.empty()) highest_trained_reg_horizon = L;
 
-            horizon_tables[L].reserve(raw_h.size());
-            for (auto it = raw_h.begin(); it != raw_h.end(); ) {
-                horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
-                it = raw_h.erase(it);
-            }
-            reg_horizon_tables[L].reserve(raw_reg.size());
-            for (auto it = raw_reg.begin(); it != raw_reg.end(); ) {
-                reg_horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
-                it = raw_reg.erase(it);
+                horizon_tables[L].reserve(raw_h.size());
+                for (auto it = raw_h.begin(); it != raw_h.end(); ) {
+                    horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                    it = raw_h.erase(it);
+                }
+                reg_horizon_tables[L].reserve(raw_reg.size());
+                for (auto it = raw_reg.begin(); it != raw_reg.end(); ) {
+                    reg_horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                    it = raw_reg.erase(it);
+                }
             }
         }
         reg_seqs.clear();
         reg_seqs.shrink_to_fit();
+        rebuild_active_horizon_lists();
 
         // Build distributional role-cluster horizon tables (L = 1..MAX_ROLE_HORIZON) for compositional prose backoff
         {
             std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_role[MAX_ROLE_HORIZON + 1];
             std::vector<int> role_seq;
+            uint64_t role_keys[MAX_ROLE_HORIZON + 1];
             for (const auto& seq : seqs) {
                 role_seq.resize(seq.size());
                 for (size_t i = 0; i < seq.size(); ++i) {
@@ -9072,10 +9393,9 @@ struct PopCountGenerativeLLM {
                 }
                 for (size_t pos = 1; pos < seq.size(); ++pos) {
                     const int target = seq[pos];
-                    const int max_L = static_cast<int>(std::min<size_t>(MAX_ROLE_HORIZON, pos));
+                    const int max_L = build_horizon_keys(role_seq.data(), pos, MAX_ROLE_HORIZON, role_keys);
                     for (int L = 1; L <= max_L; ++L) {
-                        uint64_t rkey = make_horizon_key(role_seq.data(), pos, L);
-                        raw_role[L][rkey][target]++;
+                        raw_role[L][role_keys[L]][target]++;
                     }
                 }
             }
@@ -9111,8 +9431,6 @@ struct PopCountGenerativeLLM {
                     }
                 }
             }
-            // Train across the full corpus without arbitrary 512-sequence truncation;
-            // scale epochs adaptively on very large corpora to preserve fast wall-clock time.
             int eff_epochs = (total_tokens <= 25000)
                 ? epochs
                 : std::max(1, std::min(epochs, static_cast<int>(75000 / std::max<size_t>(1, total_tokens))));
@@ -9126,6 +9444,11 @@ struct PopCountGenerativeLLM {
         size_t eval_correct = 0;
         size_t eval_covered = 0;
         std::vector<int> eval_role_seq;
+        FlatCandidateTable eval_cands;
+        eval_cands.ensure_vocab(vocab_sz + 64);
+        uint64_t eval_keys[MAX_HORIZON + 1];
+        uint64_t eval_role_keys[MAX_ROLE_HORIZON + 1];
+
         for (const auto& seq : seqs) {
             if (sublinear_net) sublinear_net->reset_state();
             eval_role_seq.resize(seq.size());
@@ -9136,32 +9459,34 @@ struct PopCountGenerativeLLM {
                 const int gold = seq[pos];
                 ++eval_positions;
 
-                std::unordered_map<int, int64_t> scores;
-                std::unordered_map<int, int> max_l_seen;
+                eval_cands.reset();
                 const int active_max_h = (highest_trained_horizon > 0) ? highest_trained_horizon : MAX_HORIZON;
-                const int max_L = static_cast<int>(std::min<size_t>(active_max_h, pos));
-                for (int L = max_L; L >= 1; --L) {
-                    uint64_t key = make_horizon_key(seq.data(), pos, L);
-                    auto it = horizon_tables[L].find(key);
+                const int max_L = build_horizon_keys(seq.data(), pos, active_max_h, eval_keys);
+                for (int L : active_horizons) {
+                    if (L > max_L) continue;
+                    auto it = horizon_tables[L].find(eval_keys[L]);
                     if (it == horizon_tables[L].end()) continue;
                     uint32_t sum_c = 0;
                     for (const auto& e : it->second) sum_c += e.count;
                     for (const auto& e : it->second) {
                         int b = count_bucket(e.count);
                         int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
-                        if (max_l_seen.find(e.tok) == max_l_seen.end()) {
-                            max_l_seen[e.tok] = L;
-                            scores[e.tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        int idx = eval_cands.find_idx(e.tok);
+                        if (idx < 0) {
+                            eval_cands.add_score(
+                                e.tok,
+                                static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b,
+                                L
+                            );
                         } else {
-                            scores[e.tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
+                            eval_cands.scores[idx] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
                         }
                     }
                 }
-                if (scores.empty()) {
-                    const int max_role_L = static_cast<int>(std::min<size_t>(MAX_ROLE_HORIZON, pos));
+                if (eval_cands.empty()) {
+                    const int max_role_L = build_horizon_keys(eval_role_seq.data(), pos, MAX_ROLE_HORIZON, eval_role_keys);
                     for (int L = max_role_L; L >= 2; --L) {
-                        uint64_t rkey = make_horizon_key(eval_role_seq.data(), pos, L);
-                        auto rit = role_horizon_tables[L].find(rkey);
+                        auto rit = role_horizon_tables[L].find(eval_role_keys[L]);
                         if (rit == role_horizon_tables[L].end()) continue;
                         uint32_t sum_c = 0;
                         for (const auto& e : rit->second) sum_c += e.count;
@@ -9169,11 +9494,11 @@ struct PopCountGenerativeLLM {
                             int b = count_bucket(e.count);
                             int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
                             int64_t rsc = 73728LL + static_cast<int64_t>(L) * 6144LL + static_cast<int64_t>(b) * 512LL + prob_b;
-                            scores[e.tok] = std::max(scores[e.tok], rsc);
+                            eval_cands.max_score(e.tok, rsc, L);
                         }
                     }
                 }
-                if (scores.find(gold) != scores.end()) ++eval_covered;
+                if (eval_cands.contains(gold)) ++eval_covered;
 
                 if (sublinear_net && seq[pos - 1] >= 0 && seq[pos - 1] < sublinear_net->vocab_size) {
                     uint32_t eids[16];
@@ -9189,26 +9514,28 @@ struct PopCountGenerativeLLM {
                     uint64_t sb[WORDS_PER_VEC] = {0};
                     uint64_t mp[NUM_BIT_PLANES][WORDS_PER_VEC] = {{0}};
                     pack_activation_bitplanes(sublinear_net->ffn_out, sb, mp);
-                    for (auto& kv : scores) {
-                        auto ml_it = max_l_seen.find(kv.first);
-                        int seen_L = (ml_it != max_l_seen.end()) ? ml_it->second : 0;
-                        if (seen_L <= 1 && kv.first >= 0 && kv.first < sublinear_net->vocab_size) {
+                    for (size_t ci = 0; ci < eval_cands.size(); ++ci) {
+                        int cand_t = eval_cands.toks[ci];
+                        int seen_L = eval_cands.max_L[ci];
+                        if (seen_L <= 1 && cand_t >= 0 && cand_t < sublinear_net->vocab_size) {
                             int32_t ste_dot = ternary_popcnt_dot_512(
-                                &sublinear_net->vocab_pos[static_cast<size_t>(kv.first) * WORDS_PER_VEC],
-                                &sublinear_net->vocab_neg[static_cast<size_t>(kv.first) * WORDS_PER_VEC],
+                                &sublinear_net->vocab_pos[static_cast<size_t>(cand_t) * WORDS_PER_VEC],
+                                &sublinear_net->vocab_neg[static_cast<size_t>(cand_t) * WORDS_PER_VEC],
                                 sb, mp
                             );
-                            kv.second += static_cast<int64_t>(ste_dot) * 4LL;
+                            eval_cands.scores[ci] += static_cast<int64_t>(ste_dot) * 4LL;
                         }
                     }
                 }
 
                 int best_tok = -1;
                 int64_t best_sc = -1000000000000LL;
-                for (const auto& kv : scores) {
-                    if (kv.second > best_sc || (kv.second == best_sc && kv.first < best_tok)) {
-                        best_sc = kv.second;
-                        best_tok = kv.first;
+                for (size_t ci = 0; ci < eval_cands.size(); ++ci) {
+                    int cand_t = eval_cands.toks[ci];
+                    int64_t sc = eval_cands.scores[ci];
+                    if (sc > best_sc || (sc == best_sc && cand_t < best_tok)) {
+                        best_sc = sc;
+                        best_tok = cand_t;
                     }
                 }
                 if (best_tok == gold) ++eval_correct;
@@ -9255,6 +9582,10 @@ struct PopCountGenerativeLLM {
             std::array<uint64_t, hsaa_assoc::kW> sk{};
             hsaa_assoc::sketch(nw, sk.data());
             vocab_morph_sketch.push_back(sk);
+        }
+        while (tok_is_content.size() < target_sz) {
+            size_t idx = tok_is_content.size();
+            tok_is_content.push_back(is_content_token(tokenizer.id_to_word[idx]) ? 1 : 0);
         }
         while (token_topic_sketch.size() < target_sz) {
             size_t idx = token_topic_sketch.size();
@@ -9424,9 +9755,11 @@ struct PopCountGenerativeLLM {
         tokenizer.word_to_id.clear();
         tokenizer.id_to_word.clear();
         tokenizer.id_to_word.reserve(vocab_sz);
+        tok_is_content.assign(vocab_sz, 0);
         for (uint32_t i = 0; i < vocab_sz; ++i) {
             std::string w;
             if (!r.str(w)) return false;
+            tok_is_content[i] = is_content_token(w) ? 1 : 0;
             tokenizer.word_to_id[w] = static_cast<int>(i);
             tokenizer.id_to_word.push_back(std::move(w));
         }
@@ -9512,19 +9845,16 @@ struct PopCountGenerativeLLM {
             return true;
         };
 
-        highest_trained_horizon = 0;
-        highest_trained_reg_horizon = 0;
         for (int L = 1; L <= MAX_HORIZON; ++L) {
             if (!read_htable(horizon_tables[L])) return false;
-            if (!horizon_tables[L].empty()) highest_trained_horizon = L;
         }
         for (int L = 1; L <= MAX_HORIZON; ++L) {
             if (!read_htable(reg_horizon_tables[L])) return false;
-            if (!reg_horizon_tables[L].empty()) highest_trained_reg_horizon = L;
         }
         for (int L = 1; L <= MAX_ROLE_HORIZON; ++L) {
             if (!read_htable(role_horizon_tables[L])) return false;
         }
+        rebuild_active_horizon_lists();
 
         uint32_t skip_sz = 0;
         if (!r.u32(skip_sz) || skip_sz > 2000000U) return false;
@@ -9956,40 +10286,49 @@ int PopCountGenerativeLLM::generate(
     uint64_t prompt_topic_vec[hsaa_assoc::kW];
     compute_token_bundle_512(prompt_toks, prompt_topic_vec);
 
+    uint64_t ctx_keys[MAX_HORIZON + 1];
+    uint64_t reg_keys[MAX_HORIZON + 1];
+    uint64_t role_keys[MAX_ROLE_HORIZON + 1];
+
     bool has_direct_prefix_match = false;
     bool has_l2_prefix_match = false;
     if (!prompt_toks.empty()) {
         const int active_max_h = (highest_trained_horizon > 0) ? highest_trained_horizon : MAX_HORIZON;
         const int active_max_rh = (highest_trained_reg_horizon > 0) ? highest_trained_reg_horizon : MAX_HORIZON;
-        const int max_L = static_cast<int>(std::min<size_t>(active_max_h, ctx.size()));
-        const int max_rL = static_cast<int>(std::min<size_t>(active_max_rh, reg_ctx.size()));
-        for (int L = std::max(max_L, max_rL); L >= 2; --L) {
-            if (L <= max_L) {
-                uint64_t k = make_horizon_key(ctx.data(), ctx.size(), L);
-                auto it = horizon_tables[L].find(k);
-                if (it != horizon_tables[L].end()) {
-                    for (const auto& e : it->second) {
-                        if (e.tok != CodeProseTokenizer::TOK_EOS) {
-                            has_direct_prefix_match = true;
-                            has_l2_prefix_match = true;
-                            break;
-                        }
+        const int max_L = build_horizon_keys(ctx.data(), ctx.size(), active_max_h, ctx_keys);
+        const int max_rL = !reg_to_tok.empty() ? build_horizon_keys(reg_ctx.data(), reg_ctx.size(), active_max_rh, reg_keys) : 0;
+        const int max_role_L = build_horizon_keys(role_ctx.data(), role_ctx.size(), MAX_ROLE_HORIZON, role_keys);
+
+        for (int L : active_horizons) {
+            if (L < 2 || L > max_L) continue;
+            auto it = horizon_tables[L].find(ctx_keys[L]);
+            if (it != horizon_tables[L].end()) {
+                for (const auto& e : it->second) {
+                    if (e.tok != CodeProseTokenizer::TOK_EOS) {
+                        has_direct_prefix_match = true;
+                        has_l2_prefix_match = true;
+                        break;
                     }
                 }
             }
-            if (!reg_to_tok.empty() && !has_direct_prefix_match && L <= max_rL) {
-                uint64_t rk = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
-                auto rit = reg_horizon_tables[L].find(rk);
+            if (has_direct_prefix_match) break;
+        }
+        if (!reg_to_tok.empty() && !has_direct_prefix_match) {
+            for (int L : active_reg_horizons) {
+                if (L < 2 || L > max_rL) continue;
+                auto rit = reg_horizon_tables[L].find(reg_keys[L]);
                 if (rit != reg_horizon_tables[L].end() && !rit->second.empty()) {
                     has_direct_prefix_match = true;
                     has_l2_prefix_match = true;
+                    break;
                 }
             }
-            if (!has_direct_prefix_match && L <= MAX_ROLE_HORIZON && L <= static_cast<int>(role_ctx.size())) {
-                const std::string& last_w = tokenizer.id_to_word[ctx.back()];
-                if (last_w != "?" && last_w != "." && last_w != "!" && last_w != ":") {
-                    uint64_t role_k = make_horizon_key(role_ctx.data(), role_ctx.size(), L);
-                    auto roit = role_horizon_tables[L].find(role_k);
+        }
+        if (!has_direct_prefix_match && max_role_L >= 2) {
+            const std::string& last_w = tokenizer.id_to_word[ctx.back()];
+            if (last_w != "?" && last_w != "." && last_w != "!" && last_w != ":") {
+                for (int L = max_role_L; L >= 2; --L) {
+                    auto roit = role_horizon_tables[L].find(role_keys[L]);
                     if (roit != role_horizon_tables[L].end()) {
                         for (const auto& e : roit->second) {
                             if (e.tok != CodeProseTokenizer::TOK_EOS) {
@@ -9999,15 +10338,14 @@ int PopCountGenerativeLLM::generate(
                             }
                         }
                     }
+                    if (has_direct_prefix_match) break;
                 }
             }
-            if (has_direct_prefix_match) break;
         }
-        if (!has_direct_prefix_match) {
+        if (!has_direct_prefix_match && max_L >= 1) {
             const std::string& last_w = tokenizer.id_to_word[ctx.back()];
             if (last_w != "?" && last_w != "." && last_w != "!" && last_w != ":") {
-                uint64_t k1 = make_horizon_key(ctx.data(), ctx.size(), 1);
-                auto it1 = horizon_tables[1].find(k1);
+                auto it1 = horizon_tables[1].find(ctx_keys[1]);
                 if (it1 != horizon_tables[1].end()) {
                     for (const auto& e : it1->second) {
                         if (e.tok != CodeProseTokenizer::TOK_EOS) {
@@ -10040,8 +10378,7 @@ int PopCountGenerativeLLM::generate(
         std::vector<int> prompt_content_ids;
         std::unordered_set<int> seen_pt;
         for (int pt : prompt_toks) {
-            const std::string& rw = tokenizer.id_to_word[pt];
-            if (is_content_token(rw) && seen_pt.insert(pt).second) {
+            if (is_content_token_id(pt) && seen_pt.insert(pt).second) {
                 prompt_content_ids.push_back(pt);
             }
         }
@@ -10051,7 +10388,6 @@ int PopCountGenerativeLLM::generate(
             int32_t vdot = hsaa_assoc::dot512(prompt_topic_vec, segment_records[si].topic_sketch);
             int64_t lex_score = 0;
 
-            // Fast O(|P| * |U_seg|) precomputed 512-bit sketch comparison (zero heap allocations in generate)
             for (int pt : prompt_content_ids) {
                 bool exact_hit = false;
                 int32_t best_morph_dot = 0;
@@ -10075,7 +10411,6 @@ int PopCountGenerativeLLM::generate(
                 }
             }
 
-            // Function signature, subword identifier & register-body suffix disambiguation for code segments
             if (!reg_to_tok.empty() && !segment_records[si].scope_reg_to_tok.empty()) {
                 int p_params = 0, s_params = 0;
                 for (size_t r = 0; r < std::min<size_t>(4, reg_to_tok.size()); ++r) {
@@ -10116,8 +10451,6 @@ int PopCountGenerativeLLM::generate(
         }
     }
 
-    // Backfill default local-variable register names (<reg_4..7>) from the matched code segment
-    // when the prompt only provided the function signature without local variable declarations.
     if (!reg_to_tok.empty() && active_target_segment >= 0) {
         const auto& seg_regs = segment_records[active_target_segment].scope_reg_to_tok;
         if (reg_to_tok.size() < seg_regs.size()) {
@@ -10244,6 +10577,9 @@ int PopCountGenerativeLLM::generate(
     std::vector<int> generated_toks;
     generated_toks.reserve(static_cast<size_t>(max_tokens + 12));
 
+    FlatCandidateTable cands;
+    cands.ensure_vocab(tokenizer.id_to_word.size() + 64);
+
     uint64_t rng_state = 0x853C49E6748FEA9BULL;
     for (int pt : prompt_toks) {
         rng_state ^= static_cast<uint64_t>(pt) + 0x9E3779B97F4A7C15ULL + (rng_state << 6) + (rng_state >> 2);
@@ -10251,26 +10587,25 @@ int PopCountGenerativeLLM::generate(
 
     const int hard_step_limit = max_tokens + ((saw_open_brace && !is_python_func && max_tokens >= 32) ? 12 : 0);
     for (int step = 0; step < max_tokens || (saw_open_brace && !delim_stack.empty() && step < hard_step_limit); ++step) {
-        std::unordered_map<int, int64_t> cand_scores;
-        std::unordered_map<int, int> cand_max_L;
+        cands.reset();
 
         if (topic_launched_from_bos && step == 0 && active_target_segment >= 0) {
             const auto& seg_toks = segment_records[active_target_segment].tokens;
             if (seg_toks.size() > 2) {
-                cand_scores[seg_toks[1]] += 5000000LL;
-                cand_max_L[seg_toks[1]] = MAX_HORIZON;
+                cands.add_score(seg_toks[1], 5000000LL, MAX_HORIZON);
             }
         }
 
         const int active_max_h = (highest_trained_horizon > 0) ? highest_trained_horizon : MAX_HORIZON;
         const int active_max_rh = (highest_trained_reg_horizon > 0) ? highest_trained_reg_horizon : MAX_HORIZON;
+        const int max_L = build_horizon_keys(ctx.data(), ctx.size(), std::max(8, active_max_h), ctx_keys);
 
         if (!reg_to_tok.empty()) {
-            const int max_rL = static_cast<int>(std::min<size_t>(active_max_rh, reg_ctx.size()));
+            const int max_rL = build_horizon_keys(reg_ctx.data(), reg_ctx.size(), active_max_rh, reg_keys);
             int highest_reg_L = 0;
-            for (int L = max_rL; L >= 1; --L) {
-                uint64_t rkey = make_horizon_key(reg_ctx.data(), reg_ctx.size(), L);
-                auto rit = reg_horizon_tables[L].find(rkey);
+            for (int L : active_reg_horizons) {
+                if (L > max_rL) continue;
+                auto rit = reg_horizon_tables[L].find(reg_keys[L]);
                 if (rit != reg_horizon_tables[L].end()) {
                     uint32_t r_sum_c = 0;
                     for (const auto& e : rit->second) r_sum_c += e.count;
@@ -10284,18 +10619,19 @@ int PopCountGenerativeLLM::generate(
                         if (L > highest_reg_L) highest_reg_L = L;
                         int b = count_bucket(e.count);
                         int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, r_sum_c));
-                        if (cand_max_L.find(actual_tok) == cand_max_L.end()) {
-                            cand_max_L[actual_tok] = L;
-                            cand_scores[actual_tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        int idx = cands.find_idx(actual_tok);
+                        if (idx < 0) {
+                            cands.add_score(
+                                actual_tok,
+                                static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b,
+                                L
+                            );
                         } else {
-                            cand_scores[actual_tok] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
+                            cands.scores[idx] += static_cast<int64_t>(b) * 128LL + (prob_b / 8);
                         }
                     }
                 }
             }
-            // Disambiguate same-arity functions sharing identical `<reg_0..7>` prefixes by
-            // applying a bounded tie-breaker (`match_L * 1024LL`, strictly < 1 horizon step 65536LL)
-            // only when `active_target_segment.reg_tokens` matches at least `highest_reg_L`:
             if (active_target_segment >= 0 && !segment_records[active_target_segment].reg_tokens.empty()) {
                 const auto& sreg = segment_records[active_target_segment].reg_tokens;
                 for (size_t pos = 1; pos + 1 < sreg.size(); ++pos) {
@@ -10314,17 +10650,16 @@ int PopCountGenerativeLLM::generate(
                         if (r_idx < 0 || r_idx >= static_cast<int>(reg_to_tok.size()) || reg_to_tok[r_idx] < 0) continue;
                         actual_tok = reg_to_tok[r_idx];
                     }
-                    cand_scores[actual_tok] += static_cast<int64_t>(match_L) * 1024LL;
+                    cands.add_score(actual_tok, static_cast<int64_t>(match_L) * 1024LL);
                 }
             }
         }
 
-        if (reg_to_tok.empty() || cand_scores.empty()) {
-            const int max_L = static_cast<int>(std::min<size_t>(active_max_h, ctx.size()));
+        if (reg_to_tok.empty() || cands.empty()) {
             int highest_exact_L = 0;
-            for (int L = max_L; L >= 1; --L) {
-                uint64_t key = make_horizon_key(ctx.data(), ctx.size(), L);
-                auto it = horizon_tables[L].find(key);
+            for (int L : active_horizons) {
+                if (L > max_L) continue;
+                auto it = horizon_tables[L].find(ctx_keys[L]);
                 if (it != horizon_tables[L].end()) {
                     if (L > highest_exact_L) highest_exact_L = L;
                     uint32_t sum_c = 0;
@@ -10332,19 +10667,19 @@ int PopCountGenerativeLLM::generate(
                     for (const auto& e : it->second) {
                         int b = count_bucket(e.count);
                         int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
-                        if (cand_max_L.find(e.tok) == cand_max_L.end()) {
-                            cand_max_L[e.tok] = L;
-                            cand_scores[e.tok] += static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        int idx = cands.find_idx(e.tok);
+                        if (idx < 0) {
+                            cands.add_score(
+                                e.tok,
+                                static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b,
+                                L
+                            );
                         } else {
-                            // Deep multi-horizon interpolation: lower-order confirmations reinforce
-                            // proportionally to their horizon depth L without overriding primary horizon priority.
-                            cand_scores[e.tok] += static_cast<int64_t>(L) * (static_cast<int64_t>(b) * 64LL + (prob_b / 8));
+                            cands.scores[idx] += static_cast<int64_t>(L) * (static_cast<int64_t>(b) * 64LL + (prob_b / 8));
                         }
                     }
                 }
             }
-            // Contextual window disambiguation inside active_target_segment when only a 1-gram
-            // (such as a preposition "на" or "через" after a skipped word) matched at L=1:
             if (highest_exact_L == 1 && active_target_segment >= 0 && ctx.size() >= 3) {
                 const auto& seg_toks = segment_records[active_target_segment].tokens;
                 const int last_t = ctx.back();
@@ -10356,7 +10691,7 @@ int PopCountGenerativeLLM::generate(
                     size_t c_start = (ctx.size() > 6) ? (ctx.size() - 6) : 1;
                     size_t s_start = (pos > 6) ? (pos - 6) : 1;
                     for (size_t ci = c_start; ci + 1 < ctx.size(); ++ci) {
-                        if (!is_content_token(tokenizer.id_to_word[ctx[ci]])) continue;
+                        if (!is_content_token_id(ctx[ci])) continue;
                         for (size_t si = s_start; si < pos; ++si) {
                             if (seg_toks[si] == ctx[ci]) {
                                 ++shared_win;
@@ -10364,43 +10699,37 @@ int PopCountGenerativeLLM::generate(
                             }
                         }
                     }
-                    cand_scores[next_t] += 16384LL + static_cast<int64_t>(shared_win) * 16384LL;
+                    cands.add_score(next_t, 16384LL + static_cast<int64_t>(shared_win) * 16384LL);
                 }
             }
-            // Compositional role-cluster backoff when exact multi-word horizon misses:
-            // Scored strictly above isolated 1-grams (~68,096) and strictly below exact 2-grams (~131,072).
             if (highest_exact_L <= 1 && role_ctx.size() >= 2) {
-                const int max_role_L = static_cast<int>(std::min<size_t>(MAX_ROLE_HORIZON, role_ctx.size()));
+                const int max_role_L = build_horizon_keys(role_ctx.data(), role_ctx.size(), MAX_ROLE_HORIZON, role_keys);
                 for (int L = max_role_L; L >= 2; --L) {
-                    uint64_t rkey = make_horizon_key(role_ctx.data(), role_ctx.size(), L);
-                    auto rit = role_horizon_tables[L].find(rkey);
+                    auto rit = role_horizon_tables[L].find(role_keys[L]);
                     if (rit != role_horizon_tables[L].end()) {
                         uint32_t sum_c = 0;
                         for (const auto& e : rit->second) sum_c += e.count;
                         for (const auto& e : rit->second) {
-                            if (cand_scores.size() >= SHORTLIST_CAP && cand_scores.find(e.tok) == cand_scores.end()) continue;
+                            int idx = cands.find_idx(e.tok);
+                            if (idx < 0 && cands.size() >= SHORTLIST_CAP) continue;
                             int b = count_bucket(e.count);
                             int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
                             int64_t role_sc = 73728LL + static_cast<int64_t>(L) * 6144LL + static_cast<int64_t>(b) * 512LL + prob_b;
-                            auto ml_it = cand_max_L.find(e.tok);
-                            if (ml_it == cand_max_L.end() || ml_it->second < L) {
-                                cand_max_L[e.tok] = L;
-                                cand_scores[e.tok] = std::max(cand_scores[e.tok], role_sc);
+                            if (idx < 0 || cands.max_L[idx] < L) {
+                                cands.max_score(e.tok, role_sc, L);
                             } else {
-                                cand_scores[e.tok] += static_cast<int64_t>(b) * 64LL + (prob_b / 8);
+                                cands.scores[idx] += static_cast<int64_t>(b) * 64LL + (prob_b / 8);
                             }
                         }
                     }
                 }
-                // Continuous Manifold Analogical Backoff: when exact multi-word & role horizons miss on
-                // unseen/inflected tail tokens, interpolate transitions from nearest neighbors in tok_cont_emb.
-                if (cand_scores.empty() && !ctx.empty()) {
+                if (cands.empty() && !ctx.empty()) {
                     const int last_t = ctx.back();
                     if (last_t >= 0 && static_cast<size_t>(last_t) < tok_cont_emb.size()) {
                         const int8_t* q_vec = tok_cont_emb[last_t].data();
                         const int32_t q_nsq = tok_cont_norm_sq[last_t];
                         int best_nn = -1;
-                        int32_t best_cos = 680; // >= 0.664 cosine threshold in Q10
+                        int32_t best_cos = 680;
                         const size_t first_dyn = static_cast<size_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS);
                         for (size_t tid = first_dyn; tid < tok_cont_emb.size(); ++tid) {
                             if (static_cast<int>(tid) == last_t) continue;
@@ -10414,9 +10743,9 @@ int PopCountGenerativeLLM::generate(
                             auto nn_it = horizon_tables[1].find(static_cast<uint64_t>(best_nn));
                             if (nn_it != horizon_tables[1].end()) {
                                 for (const auto& e : nn_it->second) {
-                                    if (cand_scores.size() >= SHORTLIST_CAP) break;
+                                    if (cands.size() >= SHORTLIST_CAP) break;
                                     int64_t interp_sc = (static_cast<int64_t>(best_cos) * 64LL) + static_cast<int64_t>(count_bucket(e.count)) * 512LL;
-                                    cand_scores[e.tok] = std::max(cand_scores[e.tok], interp_sc);
+                                    cands.max_score(e.tok, interp_sc);
                                 }
                             }
                         }
@@ -10425,17 +10754,20 @@ int PopCountGenerativeLLM::generate(
             }
         }
 
-        if (ctx.size() >= 2 && cand_scores.size() < SHORTLIST_CAP) {
+        if (ctx.size() >= 2 && cands.size() < SHORTLIST_CAP) {
             auto skit = skip_table.find(ctx[ctx.size() - 2]);
             if (skit != skip_table.end()) {
                 for (const auto& e : skit->second) {
-                    if (cand_scores.find(e.tok) == cand_scores.end()) {
-                        if (cand_scores.size() >= SHORTLIST_CAP) break;
-                        cand_scores[e.tok] = static_cast<int64_t>(count_bucket(e.count)) * 256LL;
+                    if (!cands.contains(e.tok)) {
+                        if (cands.size() >= SHORTLIST_CAP) break;
+                        cands.add_score(e.tok, static_cast<int64_t>(count_bucket(e.count)) * 256LL);
                     }
                 }
             }
         }
+
+        uint64_t tail2_sk[hsaa_assoc::kW] = {0};
+        bool tail2_sk_ready = false;
         for (const auto& ft : live_facts) {
             bool subj_in_ctx = false;
             for (size_t i = 1; i < ctx.size(); ++i) {
@@ -10452,8 +10784,8 @@ int PopCountGenerativeLLM::generate(
             if (!subj_in_ctx) continue;
 
             if (ctx.back() == ft.o_toks.back()) {
-                if (cand_scores.empty()) {
-                    cand_scores[CodeProseTokenizer::TOK_EOS] += 6000000LL;
+                if (cands.empty()) {
+                    cands.add_score(CodeProseTokenizer::TOK_EOS, 6000000LL);
                 }
                 continue;
             }
@@ -10477,7 +10809,7 @@ int PopCountGenerativeLLM::generate(
                         }
                     }
                     if (ok) {
-                        cand_scores[ft.o_toks[k]] += 4000000LL;
+                        cands.add_score(ft.o_toks[k], 4000000LL);
                         matched_obj_prefix = true;
                         break;
                     }
@@ -10501,30 +10833,32 @@ int PopCountGenerativeLLM::generate(
                 if (hsaa_assoc::dot512(t1sk, ft.assoc_ptr->rkey) >= 300) {
                     rel_at_tail = true;
                 } else if (ctx.size() >= 3) {
-                    std::string tail2 = hsaa_assoc::normalize(
-                        (tokenizer.id_to_word[ctx[ctx.size() - 2]] + " " + tokenizer.id_to_word[ctx.back()]).c_str()
-                    );
-                    uint64_t t2sk[hsaa_assoc::kW];
-                    hsaa_assoc::sketch(tail2, t2sk);
-                    if (hsaa_assoc::dot512(t2sk, ft.assoc_ptr->rkey) >= 300) {
+                    if (!tail2_sk_ready) {
+                        std::string tail2 = hsaa_assoc::normalize(
+                            (tokenizer.id_to_word[ctx[ctx.size() - 2]] + " " + tokenizer.id_to_word[ctx.back()]).c_str()
+                        );
+                        hsaa_assoc::sketch(tail2, tail2_sk);
+                        tail2_sk_ready = true;
+                    }
+                    if (hsaa_assoc::dot512(tail2_sk, ft.assoc_ptr->rkey) >= 300) {
                         rel_at_tail = true;
                     }
                 }
             }
 
             if (rel_at_tail) {
-                cand_scores[ft.o_toks[0]] += 4000000LL;
-            } else if (ctx.back() == ft.s_toks.back() && cand_max_L.find(ctx.back()) == cand_max_L.end()) {
-                cand_scores[ft.r_toks[0]] += 1500000LL;
+                cands.add_score(ft.o_toks[0], 4000000LL);
+            } else if (ctx.back() == ft.s_toks.back() && cands.get_max_L(ctx.back()) == 0) {
+                cands.add_score(ft.r_toks[0], 1500000LL);
             }
         }
 
         bool used_unigram_fallback = false;
-        if (cand_scores.empty()) {
+        if (cands.empty()) {
             used_unigram_fallback = true;
             for (const auto& e : top_unigrams) {
-                cand_scores[e.tok] = static_cast<int64_t>(count_bucket(e.count)) * 128LL;
-                if (cand_scores.size() >= 16) break;
+                cands.add_score(e.tok, static_cast<int64_t>(count_bucket(e.count)) * 128LL);
+                if (cands.size() >= 16) break;
             }
         }
 
@@ -10543,8 +10877,6 @@ int PopCountGenerativeLLM::generate(
                 sublinear_net->top_k,
                 sublinear_net->ffn_out
             );
-            // Deep 3-layer state interpolation across fast context manifold, mid-depth mLGGRU
-            // recurrent state, and deep 4KB ternary micro-expert output (Q8 weights: 48 + 64 + 144 = 256).
             int8_t fast_ctx_state[D_MODEL] = {0};
             if (static_cast<size_t>(ctx.back()) < tok_cont_emb.size()) {
                 const auto& cur_c = tok_cont_emb[ctx.back()];
@@ -10567,9 +10899,6 @@ int PopCountGenerativeLLM::generate(
             pack_activation_bitplanes(deep_interp_state, sb, mp);
             has_ste_out = true;
 
-            // Break the unseen-context shortlist ceiling: when all n-gram/role/fact tables
-            // missed and we fell back to top_unigrams, allow the deep-interpolated STE path
-            // to inject its top-scoring vocabulary candidate with the standard unigram base score.
             if (used_unigram_fallback) {
                 int32_t ste_top_score = 0;
                 int ste_top_tok = compute_vocab_argmax_popcnt(
@@ -10579,8 +10908,8 @@ int PopCountGenerativeLLM::generate(
                     static_cast<int>(std::min<size_t>(tokenizer.id_to_word.size(), static_cast<size_t>(sublinear_net->vocab_size))),
                     &ste_top_score
                 );
-                if (ste_top_tok >= 0 && ste_top_score > 0 && cand_scores.find(ste_top_tok) == cand_scores.end()) {
-                    cand_scores[ste_top_tok] = 128LL;
+                if (ste_top_tok >= 0 && ste_top_score > 0 && !cands.contains(ste_top_tok)) {
+                    cands.add_score(ste_top_tok, 128LL);
                 }
             }
         }
@@ -10592,26 +10921,32 @@ int PopCountGenerativeLLM::generate(
         if (saw_open_brace && delim_stack.empty() && prev_tok == id_rbrace) {
             break;
         }
-        // Clean sentence-boundary stopping near max_tokens limit: measure the length of the
-        // upcoming sentence in active_target_segment (defaulting to 16 tokens) so prose never
-        // starts a new sentence that cannot finish within the remaining max_tokens budget.
+        // Clean sentence-boundary stopping near max_tokens limit using longest-suffix match in active_target_segment
         if (!saw_open_brace && !is_python_func && delim_stack.empty() &&
             step >= 1 && (prev_w == "." || prev_w == "!" || prev_w == "?")) {
             int needed_for_next_sent = 16;
             if (active_target_segment >= 0 && ctx.size() >= 2) {
                 const auto& seg_toks = segment_records[active_target_segment].tokens;
                 int prev2 = ctx[ctx.size() - 2];
+                int best_match_len = 0;
                 for (size_t pos = 1; pos + 1 < seg_toks.size(); ++pos) {
                     if (seg_toks[pos] == prev_tok && seg_toks[pos - 1] == prev2) {
-                        int count_to_end = 0;
-                        for (size_t k = pos + 1; k < seg_toks.size(); ++k) {
-                            if (seg_toks[k] == CodeProseTokenizer::TOK_EOS) break;
-                            ++count_to_end;
-                            const std::string& kw = tokenizer.id_to_word[seg_toks[k]];
-                            if (kw == "." || kw == "!" || kw == "?") break;
+                        int mlen = 2;
+                        while (pos >= static_cast<size_t>(mlen) && ctx.size() > static_cast<size_t>(mlen) &&
+                               seg_toks[pos - mlen] == ctx[ctx.size() - 1 - mlen]) {
+                            ++mlen;
                         }
-                        if (count_to_end > 0) needed_for_next_sent = count_to_end;
-                        break;
+                        if (mlen > best_match_len) {
+                            best_match_len = mlen;
+                            int count_to_end = 0;
+                            for (size_t k = pos + 1; k < seg_toks.size(); ++k) {
+                                if (seg_toks[k] == CodeProseTokenizer::TOK_EOS) break;
+                                ++count_to_end;
+                                const std::string& kw = tokenizer.id_to_word[seg_toks[k]];
+                                if (kw == "." || kw == "!" || kw == "?") break;
+                            }
+                            if (count_to_end > 0) needed_for_next_sent = count_to_end;
+                        }
                     }
                 }
             }
@@ -10620,9 +10955,12 @@ int PopCountGenerativeLLM::generate(
             }
         }
 
-        for (auto& kv : cand_scores) {
-            const int cand = kv.first;
-            int64_t& sc = kv.second;
+        const uint64_t g9_prefix = (ctx.size() >= 8) ? (ctx_keys[8] * 0x100000001B3ULL) : 0ULL;
+
+        for (size_t ci = 0; ci < cands.size(); ++ci) {
+            const int cand = cands.toks[ci];
+            int64_t& sc = cands.scores[ci];
+            const int seen_L = cands.max_L[ci];
 
             if (cand == CodeProseTokenizer::TOK_PAD || cand == CodeProseTokenizer::TOK_BOS ||
                 CodeProseTokenizer::is_reg_token(cand)) {
@@ -10633,7 +10971,6 @@ int PopCountGenerativeLLM::generate(
             const std::string& cand_w = (cand >= 0 && static_cast<size_t>(cand) < tokenizer.id_to_word.size())
                 ? tokenizer.id_to_word[cand] : "";
 
-            // Strict C++ vs Python syntax isolation guard
             if (saw_open_brace && !is_python_func) {
                 if (cand_w == "def" || cand_w == "elif" || cand_w == "None" ||
                     cand_w == "True" || cand_w == "False" ||
@@ -10656,10 +10993,6 @@ int PopCountGenerativeLLM::generate(
                     &sublinear_net->vocab_neg[static_cast<size_t>(cand) * WORDS_PER_VEC],
                     sb, mp
                 );
-                auto ml_it = cand_max_L.find(cand);
-                int seen_L = (ml_it != cand_max_L.end()) ? ml_it->second : 0;
-                // Give the 512-bit STE neural bitplanes substantial voting weight on low-order
-                // backoff (L <= 1) so recurrent state drives disambiguation instead of acting as a 0.006% tie-breaker.
                 sc += (seen_L <= 1) ? (static_cast<int64_t>(ste_dot) * 8LL) : (static_cast<int64_t>(ste_dot) / 2LL);
 
                 if (seen_L <= 1 && static_cast<size_t>(cand) < tok_cont_emb.size() &&
@@ -10703,9 +11036,11 @@ int PopCountGenerativeLLM::generate(
                 sc = -1000000000LL;
                 continue;
             }
-            if (ctx.size() >= 8) {
-                uint64_t g9 = (make_horizon_key(ctx.data(), ctx.size(), 8) * 0x100000001B3ULL) ^
-                              static_cast<uint64_t>(cand + 0x9E3779B9U);
+            // Only penalize repeated 9-grams when the candidate is NOT backed by a deeper
+            // long-horizon context (seen_L <= 9). When seen_L > 9, the extended horizon
+            // (up to 2048 tokens) disambiguates repeated phrases in long documents without degradation.
+            if (ctx.size() >= 8 && seen_L <= 9) {
+                uint64_t g9 = g9_prefix ^ static_cast<uint64_t>(cand + 0x9E3779B9U);
                 if (visited_9grams.find(g9) != visited_9grams.end()) {
                     sc -= 5000000LL;
                 }
@@ -10714,10 +11049,12 @@ int PopCountGenerativeLLM::generate(
 
         int chosen_tok = -1;
         int64_t best_sc = -100000000LL;
-        for (const auto& kv : cand_scores) {
-            if (kv.second > best_sc || (kv.second == best_sc && kv.first < chosen_tok)) {
-                best_sc = kv.second;
-                chosen_tok = kv.first;
+        for (size_t ci = 0; ci < cands.size(); ++ci) {
+            const int cand = cands.toks[ci];
+            const int64_t sc = cands.scores[ci];
+            if (sc > best_sc || (sc == best_sc && cand < chosen_tok)) {
+                best_sc = sc;
+                chosen_tok = cand;
             }
         }
         if (chosen_tok < 0 || best_sc <= -50000000LL) break;
@@ -10726,10 +11063,11 @@ int PopCountGenerativeLLM::generate(
             int64_t margin = static_cast<int64_t>(4096.0f * temperature);
             std::vector<std::pair<int, int64_t>> viable;
             int64_t sum_w = 0;
-            for (const auto& kv : cand_scores) {
-                if (kv.second >= best_sc - margin && kv.second > -50000000LL) {
-                    int64_t w = (kv.second - (best_sc - margin)) + 1;
-                    viable.push_back({kv.first, w});
+            for (size_t ci = 0; ci < cands.size(); ++ci) {
+                const int64_t sc = cands.scores[ci];
+                if (sc >= best_sc - margin && sc > -50000000LL) {
+                    int64_t w = (sc - (best_sc - margin)) + 1;
+                    viable.push_back({cands.toks[ci], w});
                     sum_w += w;
                 }
             }
@@ -10754,8 +11092,7 @@ int PopCountGenerativeLLM::generate(
         }
 
         if (ctx.size() >= 8) {
-            uint64_t g9 = (make_horizon_key(ctx.data(), ctx.size(), 8) * 0x100000001B3ULL) ^
-                          static_cast<uint64_t>(chosen_tok + 0x9E3779B9U);
+            uint64_t g9 = g9_prefix ^ static_cast<uint64_t>(chosen_tok + 0x9E3779B9U);
             visited_9grams.insert(g9);
         }
 
@@ -11081,47 +11418,72 @@ bool PopCountGenerativeLLM::embed_continuous_text(
     float* out_vec512
 ) const {
     if (!text || !out_vec512) return false;
-    for (int d = 0; d < D_MODEL; ++d) out_vec512[d] = 0.0f;
+    std::memset(out_vec512, 0, D_MODEL * sizeof(float));
 
     std::string raw(text);
     if (raw.empty()) return false;
 
     ensure_continuous_representation_space();
     auto toks = const_cast<CodeProseTokenizer&>(tokenizer).tokenize_segment(raw, false, false);
-    float accum[D_MODEL] = {0.0f};
-    int32_t fast_state[D_MODEL] = {0};
-    int32_t slow_state[D_MODEL] = {0};
+    alignas(64) float accum[D_MODEL] = {0.0f};
+    alignas(64) int32_t fast_state[D_MODEL] = {0};
+    alignas(64) int32_t slow_state[D_MODEL] = {0};
     int valid_toks = 0;
 
+    const float inv_n_toks = 1.0f / static_cast<float>(std::max<size_t>(1, toks.size()));
     for (size_t i = 0; i < toks.size(); ++i) {
         int tid = toks[i];
-        float pos_w = 1.0f + 0.35f * (static_cast<float>(i + 1) / static_cast<float>(std::max<size_t>(1, toks.size())));
+        float pos_w = 1.0f + 0.35f * (static_cast<float>(i + 1) * inv_n_toks);
         if (tid >= 0 && static_cast<size_t>(tid) < tok_cont_emb.size()) {
-            const std::string& w_str = tokenizer.id_to_word[tid];
-            float content_w = is_content_token(w_str) ? 1.6f : 0.45f;
+            float content_w = is_content_token_id(tid) ? 1.6f : 0.45f;
             float w = pos_w * content_w;
-            const auto& cemb = tok_cont_emb[tid];
-            const auto& ncent = tok_next_cont_centroid[tid];
+            const int8_t* cemb = tok_cont_emb[tid].data();
+            const int8_t* ncent = tok_next_cont_centroid[tid].data();
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            const __m512 vw075 = _mm512_set1_ps(w * 0.75f);
+            const __m512 vw025 = _mm512_set1_ps(w * 0.25f);
+            const __m512i v3 = _mm512_set1_epi32(3);
+            const __m512i v5 = _mm512_set1_epi32(5);
+            const __m512i v7 = _mm512_set1_epi32(7);
+            for (int d = 0; d < D_MODEL; d += 16) {
+                __m128i vc8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(cemb + d));
+                __m128i vn8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ncent + d));
+                __m512i vc32 = _mm512_cvtepi8_epi32(vc8);
+                __m512i vn32 = _mm512_cvtepi8_epi32(vn8);
+
+                __m512i vfast = _mm512_load_si512(reinterpret_cast<const __m512i*>(fast_state + d));
+                __m512i vslow = _mm512_load_si512(reinterpret_cast<const __m512i*>(slow_state + d));
+                vfast = _mm512_srai_epi32(_mm512_add_epi32(_mm512_mullo_epi32(vfast, v3), _mm512_mullo_epi32(vc32, v5)), 3);
+                vslow = _mm512_srai_epi32(_mm512_add_epi32(_mm512_mullo_epi32(vslow, v7), vc32), 3);
+                _mm512_store_si512(reinterpret_cast<__m512i*>(fast_state + d), vfast);
+                _mm512_store_si512(reinterpret_cast<__m512i*>(slow_state + d), vslow);
+
+                __m512 vacc = _mm512_load_ps(accum + d);
+                vacc = _mm512_fmadd_ps(vw075, _mm512_cvtepi32_ps(vc32), vacc);
+                vacc = _mm512_fmadd_ps(vw025, _mm512_cvtepi32_ps(vn32), vacc);
+                _mm512_store_ps(accum + d, vacc);
+            }
+#else
             for (int d = 0; d < D_MODEL; ++d) {
                 int32_t v = cemb[d];
                 fast_state[d] = (fast_state[d] * 3 + v * 5) >> 3;
                 slow_state[d] = (slow_state[d] * 7 + v * 1) >> 3;
                 accum[d] += w * (0.75f * static_cast<float>(v) + 0.25f * static_cast<float>(ncent[d]));
             }
+#endif
             ++valid_toks;
         }
     }
 
-    // Blend multi-scale lexical-morphological continuous features directly from raw text
-    // so unseen/inflected words and OOV identifiers project smoothly onto the same manifold.
     std::string norm_all = hsaa_assoc::normalize(raw.c_str());
     if (!norm_all.empty()) {
         uint64_t full_sk[hsaa_assoc::kW];
         hsaa_assoc::sketch(norm_all, full_sk);
         float lex_w = (valid_toks > 0) ? 3.5f : 9.0f;
         for (int w = 0; w < WORDS_PER_VEC; ++w) {
+            uint64_t word_bits = full_sk[w];
             for (int b = 0; b < 64; ++b) {
-                accum[w * 64 + b] += (((full_sk[w] >> b) & 1ULL) ? lex_w : -lex_w);
+                accum[w * 64 + b] += (((word_bits >> b) & 1ULL) ? lex_w : -lex_w);
             }
         }
         std::string cur;
@@ -11133,8 +11495,9 @@ bool PopCountGenerativeLLM::embed_continuous_text(
                     uint64_t st_sk[hsaa_assoc::kW];
                     hsaa_assoc::sketch(cur.substr(0, slen), st_sk);
                     for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                        uint64_t word_bits = st_sk[w];
                         for (int b = 0; b < 64; ++b) {
-                            accum[w * 64 + b] += (((st_sk[w] >> b) & 1ULL) ? 3.0f : -3.0f);
+                            accum[w * 64 + b] += (((word_bits >> b) & 1ULL) ? 3.0f : -3.0f);
                         }
                     }
                 }
@@ -11145,15 +11508,25 @@ bool PopCountGenerativeLLM::embed_continuous_text(
         }
     }
 
-    // Deep interpolation of fast syntactic EMA and slow semantic EMA states
     if (valid_toks > 0) {
+#if defined(__AVX512F__)
+        const __m512 v03 = _mm512_set1_ps(0.3f);
+        const __m512 v02 = _mm512_set1_ps(0.2f);
+        for (int d = 0; d < D_MODEL; d += 16) {
+            __m512 vf = _mm512_cvtepi32_ps(_mm512_load_si512(reinterpret_cast<const __m512i*>(fast_state + d)));
+            __m512 vs = _mm512_cvtepi32_ps(_mm512_load_si512(reinterpret_cast<const __m512i*>(slow_state + d)));
+            __m512 vacc = _mm512_load_ps(accum + d);
+            vacc = _mm512_fmadd_ps(v03, vf, _mm512_fmadd_ps(v02, vs, vacc));
+            _mm512_store_ps(accum + d, vacc);
+        }
+#else
         for (int d = 0; d < D_MODEL; ++d) {
             float deep_ema = 0.6f * static_cast<float>(fast_state[d]) + 0.4f * static_cast<float>(slow_state[d]);
             accum[d] += 0.5f * deep_ema;
         }
+#endif
     }
 
-    // Reinforce with associative fact manifold if brain has matching subject/object facts
     if (brain && !brain->assoc_facts.empty() && !norm_all.empty()) {
         uint64_t q_sk[hsaa_assoc::kW];
         hsaa_assoc::sketch(norm_all, q_sk);
@@ -11162,26 +11535,42 @@ bool PopCountGenerativeLLM::embed_continuous_text(
             if (s_dot >= kAssocMinSubjectDot) {
                 uint64_t o_sk[hsaa_assoc::kW];
                 hsaa_assoc::sketch(hsaa_assoc::normalize(f.object.c_str()), o_sk);
-                float fw = static_cast<float>(s_dot) / 256.0f;
+                float fw = (static_cast<float>(s_dot) / 256.0f) * 2.5f;
                 for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                    uint64_t word_bits = o_sk[w];
                     for (int b = 0; b < 64; ++b) {
-                        accum[w * 64 + b] += fw * (((o_sk[w] >> b) & 1ULL) ? 2.5f : -2.5f);
+                        accum[w * 64 + b] += (((word_bits >> b) & 1ULL) ? fw : -fw);
                     }
                 }
             }
         }
     }
 
-    // L2 normalize to unit hypersphere S^511
     double norm_sq = 0.0;
+#if defined(__AVX512F__)
+    __m512 vsum = _mm512_setzero_ps();
+    for (int d = 0; d < D_MODEL; d += 16) {
+        __m512 v = _mm512_load_ps(accum + d);
+        vsum = _mm512_fmadd_ps(v, v, vsum);
+    }
+    norm_sq = static_cast<double>(_mm512_reduce_add_ps(vsum));
+#else
     for (int d = 0; d < D_MODEL; ++d) {
         norm_sq += static_cast<double>(accum[d]) * static_cast<double>(accum[d]);
     }
+#endif
     if (norm_sq < 1e-12) return false;
     float inv_norm = static_cast<float>(1.0 / std::sqrt(norm_sq));
+#if defined(__AVX512F__)
+    __m512 vinv = _mm512_set1_ps(inv_norm);
+    for (int d = 0; d < D_MODEL; d += 16) {
+        _mm512_storeu_ps(out_vec512 + d, _mm512_mul_ps(_mm512_load_ps(accum + d), vinv));
+    }
+#else
     for (int d = 0; d < D_MODEL; ++d) {
         out_vec512[d] = accum[d] * inv_norm;
     }
+#endif
     return true;
 }
 
@@ -11198,16 +11587,23 @@ int PopCountGenerativeLLM::interpolate_continuous_manifold(
     if (!text_a || !text_b || !out_vec512) return 0;
 
     float clamped_a = std::max(0.0f, std::min(1.0f, alpha));
-    float va[D_MODEL];
-    float vb[D_MODEL];
+    alignas(64) float va[D_MODEL];
+    alignas(64) float vb[D_MODEL];
     if (!embed_continuous_text(brain, text_a, va)) return 0;
     if (!embed_continuous_text(brain, text_b, vb)) return 0;
 
-    // Geodesic Spherical Linear Interpolation (SLERP) on S^511
     double dot = 0.0;
+#if defined(__AVX512F__)
+    __m512 vdot = _mm512_setzero_ps();
+    for (int d = 0; d < D_MODEL; d += 16) {
+        vdot = _mm512_fmadd_ps(_mm512_load_ps(va + d), _mm512_load_ps(vb + d), vdot);
+    }
+    dot = static_cast<double>(_mm512_reduce_add_ps(vdot));
+#else
     for (int d = 0; d < D_MODEL; ++d) {
         dot += static_cast<double>(va[d]) * static_cast<double>(vb[d]);
     }
+#endif
     dot = std::max(-1.0, std::min(1.0, dot));
 
     float w_a = 1.0f - clamped_a;
@@ -11224,9 +11620,8 @@ int PopCountGenerativeLLM::interpolate_continuous_manifold(
         use_antipodal_arc = true;
     }
 
-    float interp[D_MODEL];
+    alignas(64) float interp[D_MODEL];
     if (use_antipodal_arc) {
-        // Construct deterministic orthogonal unit tangent vector u_orth on S^511 via Gram-Schmidt
         int min_idx = 0;
         float min_abs = std::fabs(va[0]);
         for (int d = 1; d < D_MODEL; ++d) {
@@ -11236,37 +11631,63 @@ int PopCountGenerativeLLM::interpolate_continuous_manifold(
                 min_idx = d;
             }
         }
-        float u_orth[D_MODEL];
-        double proj = static_cast<double>(va[min_idx]);
+        alignas(64) float u_orth[D_MODEL];
+        const float proj = va[min_idx];
+        for (int d = 0; d < D_MODEL; ++d) {
+            u_orth[d] = -proj * va[d];
+        }
+        u_orth[min_idx] += 1.0f;
         double orth_nsq = 0.0;
         for (int d = 0; d < D_MODEL; ++d) {
-            double comp = (d == min_idx ? 1.0 : 0.0) - proj * static_cast<double>(va[d]);
-            u_orth[d] = static_cast<float>(comp);
-            orth_nsq += comp * comp;
+            orth_nsq += static_cast<double>(u_orth[d]) * static_cast<double>(u_orth[d]);
         }
         float inv_orth = (orth_nsq > 1e-12) ? static_cast<float>(1.0 / std::sqrt(orth_nsq)) : 1.0f;
         const float theta = clamped_a * 3.14159265358979323846f;
         const float ca = std::cos(theta);
-        const float sa = std::sin(theta);
+        const float sa_inv = std::sin(theta) * inv_orth;
         for (int d = 0; d < D_MODEL; ++d) {
-            interp[d] = ca * va[d] + sa * (u_orth[d] * inv_orth);
+            interp[d] = ca * va[d] + sa_inv * u_orth[d];
         }
     } else {
+#if defined(__AVX512F__)
+        const __m512 vwa = _mm512_set1_ps(w_a);
+        const __m512 vwb = _mm512_set1_ps(w_b);
+        for (int d = 0; d < D_MODEL; d += 16) {
+            __m512 v = _mm512_fmadd_ps(vwa, _mm512_load_ps(va + d), _mm512_mul_ps(vwb, _mm512_load_ps(vb + d)));
+            _mm512_store_ps(interp + d, v);
+        }
+#else
         for (int d = 0; d < D_MODEL; ++d) {
             interp[d] = w_a * va[d] + w_b * vb[d];
         }
+#endif
     }
     double nsq = 0.0;
+#if defined(__AVX512F__)
+    __m512 vnsq = _mm512_setzero_ps();
+    for (int d = 0; d < D_MODEL; d += 16) {
+        __m512 v = _mm512_load_ps(interp + d);
+        vnsq = _mm512_fmadd_ps(v, v, vnsq);
+    }
+    nsq = static_cast<double>(_mm512_reduce_add_ps(vnsq));
+#else
     for (int d = 0; d < D_MODEL; ++d) {
         nsq += static_cast<double>(interp[d]) * static_cast<double>(interp[d]);
     }
+#endif
     float inv_n = (nsq > 1e-12) ? static_cast<float>(1.0 / std::sqrt(nsq)) : 1.0f;
+#if defined(__AVX512F__)
+    const __m512 vinv_n = _mm512_set1_ps(inv_n);
+    for (int d = 0; d < D_MODEL; d += 16) {
+        _mm512_store_ps(interp + d, _mm512_mul_ps(_mm512_load_ps(interp + d), vinv_n));
+    }
+#else
     for (int d = 0; d < D_MODEL; ++d) {
         interp[d] *= inv_n;
     }
+#endif
 
-    // Continuous Hopfield Attractor Refinement + Nearest Concept Resolution over tok_cont_emb
-    int8_t q_int8[D_MODEL];
+    alignas(64) int8_t q_int8[D_MODEL];
     int32_t q_nsq = 0;
     for (int d = 0; d < D_MODEL; ++d) {
         int32_t q = static_cast<int32_t>(std::lround(interp[d] * 220.0f));
@@ -11277,13 +11698,12 @@ int PopCountGenerativeLLM::interpolate_continuous_manifold(
 
     int best_tid = -1;
     int32_t best_cos_q10 = -2048;
-    float attractor[D_MODEL] = {0.0f};
+    alignas(64) float attractor[D_MODEL] = {0.0f};
     float attractor_w_sum = 0.0f;
 
     const size_t first_dyn = static_cast<size_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS);
     for (size_t tid = first_dyn; tid < tok_cont_emb.size(); ++tid) {
-        const std::string& w_str = tokenizer.id_to_word[tid];
-        if (!is_content_token(w_str)) continue;
+        if (!is_content_token_id(static_cast<int>(tid))) continue;
         int32_t cos_q10 = continuous_cosine_q10_512(
             q_int8, q_nsq,
             tok_cont_emb[tid].data(), tok_cont_norm_sq[tid]
@@ -11293,18 +11713,27 @@ int PopCountGenerativeLLM::interpolate_continuous_manifold(
             best_tid = static_cast<int>(tid);
         }
         if (cos_q10 > 512) {
-            float aw = static_cast<float>(cos_q10 - 512) / 512.0f;
+            float aw = static_cast<float>(cos_q10 - 512) * (1.0f / 512.0f);
             aw = aw * aw;
-            float inv_t = (tok_cont_norm_sq[tid] > 0)
-                ? (1.0f / std::sqrt(static_cast<float>(tok_cont_norm_sq[tid]))) : 0.0f;
-            for (int d = 0; d < D_MODEL; ++d) {
-                attractor[d] += aw * static_cast<float>(tok_cont_emb[tid][d]) * inv_t;
+            float scale = aw * ((tid < tok_cont_inv_norm.size()) ? tok_cont_inv_norm[tid] : 0.0f);
+            const int8_t* emb_ptr = tok_cont_emb[tid].data();
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            const __m512 vscale = _mm512_set1_ps(scale);
+            for (int d = 0; d < D_MODEL; d += 16) {
+                __m128i v8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(emb_ptr + d));
+                __m512 vf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(v8));
+                __m512 va_acc = _mm512_load_ps(attractor + d);
+                _mm512_store_ps(attractor + d, _mm512_fmadd_ps(vscale, vf, va_acc));
             }
+#else
+            for (int d = 0; d < D_MODEL; ++d) {
+                attractor[d] += scale * static_cast<float>(emb_ptr[d]);
+            }
+#endif
             attractor_w_sum += aw;
         }
     }
 
-    // Blend geodesic SLERP vector with continuous manifold attractor (preserving strict endpoint fidelity at alpha=0 and alpha=1)
     float manifold_pull = 0.18f * (4.0f * clamped_a * (1.0f - clamped_a));
     if (attractor_w_sum > 1e-5f && manifold_pull > 1e-4f) {
         double ansq = 0.0;
@@ -11325,9 +11754,7 @@ int PopCountGenerativeLLM::interpolate_continuous_manifold(
         }
     }
 
-    for (int d = 0; d < D_MODEL; ++d) {
-        out_vec512[d] = interp[d];
-    }
+    std::memcpy(out_vec512, interp, D_MODEL * sizeof(float));
 
     if (out_nearest_token && max_len > 0 && best_tid >= 0 &&
         static_cast<size_t>(best_tid) < tokenizer.id_to_word.size()) {

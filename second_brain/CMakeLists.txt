@@ -19,7 +19,7 @@ add_library(popcnt_brain_static STATIC popcnt_brain.cpp)
 target_include_directories(popcnt_brain_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(popcnt_brain_static PRIVATE BUILDING_POPCNT_BRAIN_LIB)
 
-# Shared Library (DLL) for Python ctypes / C FFI bindings
+# Shared Library (DLL/SO) for C-ABI / Native FFI bindings
 add_library(popcnt_brain_shared SHARED popcnt_brain.cpp)
 target_include_directories(popcnt_brain_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(popcnt_brain_shared PRIVATE BUILDING_POPCNT_BRAIN_DLL)

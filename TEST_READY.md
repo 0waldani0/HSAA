@@ -5,7 +5,7 @@
 **Entry points:**
 - `build.bat test` - full native E2E (`tests\build_tests.bat run`).
 - `build.bat test_hssa`, `test_vsa_db`, `test_model_mod`, `test_bench`, `test_bridge` - per-module suites.
-- `python second_brain\measur\regress_par.py` - the complete regression (module suites, E2E, C-ABI probe, corpus, CUDA M2, adversarial/benchmark suites). Logs: `second_brain\measur\regress_par_logs\`.
+- `second_brain\measur\native_measur_runner.cpp` & `tests\stress_concurrent_builds.cpp` - native C++20 causal baseline and concurrent build verification (zero Python).
 
 ---
 
@@ -52,10 +52,10 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 | model_mod benchmark | `tests\build_bench_model_mod.bat run` | 5 / 5 |
 | VSA hot-swap benchmark | `tests\build_bench_hot_swap.bat run` | 3 / 3 |
 | Challenger 2 | `tests\build_challenger2.bat` | 4 / 4 |
-| Adversarial stress | `build_adversarial_stress.bat` | pass |
-| Micro-benchmark | `build_micro_bench.bat` | pass |
+| Adversarial stress | `tests\build_adversarial_stress.bat` | pass |
+| Micro-benchmark | `tests\build_micro_bench.bat` | pass |
 | PTQ host validation | `tests\build_ptq_validation.bat run` | 5 / 5 (N/M tiling and fused rank rejections) |
-| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 28 / 28 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override) |
+| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 55 / 55 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override, L>1000 hard context horizon up to MAX_HORIZON=2048) |
 | C-ABI probe (F22) | `second_brain\measur\build_capi_probe.bat` | exit 0 |
 | Assoc calibration | `second_brain\measur\build_assoc_calib.bat` | recall/FP table at the shipped gate |
 

@@ -16,21 +16,14 @@ The harvest depends on the machine's Python installation, so the DERIVED
 corpora are shipped here: with them the numbers below reproduce exactly on any
 machine.
 
-## The scripts
+## The native C++20 / C11 harnesses
 
-| script | what it measures | command |
+| source | what it measures | build / command |
 |---|---|---|
-| `baselines_bpe_causal.py` | the causal count chain on the subword split, decomposed by level, AND on the ENGINE's own population (175,876 positions) so it can be compared with the engine | `python baselines_bpe_causal.py` |
-| `baselines_word_causal.py` | the same for the word-level (same-domain) split, PLUS the engine's own population (63,432 positions) and the FULL-PREFIX chain (the longest matching suffix of the whole context, i.e. the context the engine actually has) -- the word-level comparison is only valid when both sides are on one population | `python baselines_word_causal.py` |
-| `sweep_slots.py` | the engine on a chosen corpus AND the co-location sweep: the bottleneck slot count per expert page (16 by default) is widened in a SCRATCH COPY of the engine (the shipped source is untouched) and the accuracy, the coverage, the load histogram and the training cost are measured per slot count | `python sweep_slots.py --word --word2 --slots --bpe` |
-| `measure_all.py` | the engine itself: the count-weight sweep, the candidate-set coverage curve over k, and the plain-vs-backoff A/B. Each configuration is built from a fresh copy of the engine into its own scratch directory and runs on one core, six at a time | `python measure_all.py` |
-| `corpus_regression.py` | the 801-line reference corpus at three (epochs, seed) settings; the guard fails if the accuracy drops below the recorded floor | `python corpus_regression.py` |
-| `acceptance_harness.cpp` | the harness `measure_all.py` compiles: it includes the engine source directly, trains on the train split, then scores the held-out half (accuracy, E[accepted(k)] by depth, and the candidate-set coverage) | compiled by `measure_all.py` |
-| `regress_par.py` | the FULL regression, with the independent steps in parallel: the two gates, the engine library, the self-test, the four suites, the C-API probe, the native e2e suite and the corpus group | `python regress_par.py` |
-| `regress_fast.py` | the FAST lane: the same mechanical checks with incremental builds, parallel groups and one short corpus training. It does NOT include the full e2e suite or the full-epoch corpus accuracy -- it is a smoke lane, not the release gate | `python regress_fast.py` |
-| `corpus_group.py` | the reference corpus, the state round trip and the state-format diagnostic, all from ONE training (the state file it writes is reused by the other two facts) | `python corpus_group.py` |
-`measure_all.py` needs MSVC (`vswhere` -> `vcvars64`) and writes its report to
-`%TEMP%\opencode\measure_all_report.txt`.
+| `native_measur_runner.cpp` | causal full-prefix count baseline on `bpe_train.txt` / `bpe_holdout.txt` and `samedomain_train.txt` / `samedomain_holdout.txt`, plus `PopCountGenerativeLLM` verification on `llm_text_code_corpus.txt` (zero Python) | link with `popcnt_brain` |
+| `acceptance_harness.cpp` | includes the engine source directly, trains on the train split, then scores the held-out half (accuracy, E[accepted(k)] by depth, and the candidate-set coverage) | native C++20 build |
+| `assoc_calib.cpp` | measures recall and false-positive rate of the 512-bit trigram SimHash lexical fallback across typo classes | `build_assoc_calib.bat` |
+| `capi_probe.c` | verifies C11 ABI compatibility, lifecycle, fact storage, conflict checks, and lexical fallback | `build_capi_probe.bat` |
 
 ## The measured results (the shipped engine)
 

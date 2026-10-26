@@ -15,13 +15,12 @@
 
 ## STATE
 - O: muse spark (opencode) active | G: gemini (antigravity) active | U: active
-- Doing: HSSA M3 completed and closed the defects left by the interrupted session: `hssa_generate`/`hssa_set_unembedding_matrix`/`hssa_register_candidate_axiom` implemented (zero-heap decode, 264 us/tok), NULL-registry crash fixed, contradiction veto made absolute.
+- Doing: Extended `PopCountGenerativeLLM` hard context horizon from `L <= 24` to `MAX_HORIZON = 2048` (`O(1)` incremental rolling suffix hashes, `active_horizons` non-empty index, `FlatCandidateTable`), vectorized `hssa.cpp`/`model_mod.cpp`/`popcnt_brain.cpp` with AVX-512 intrinsics, replaced all Python scripts with native C++20 (`second_brain_cpp.hpp`, `native_measur_runner.cpp`, `stress_concurrent_builds.cpp`), and relocated stray root test scripts into `tests/`.
 - Blocked: -
 
 ## NEXT
-- [->] Decide the disposition of the 4 root-level build scripts (`build_adversarial_stress.bat`, `build_challenger2.bat`, `build_micro_bench.bat`, `build_test_ssm_median.bat`): relocate into `tests/` or amend the NO-GARBAGE rule. They are live (3 have no `tests/` counterpart) so they were not deleted.
 - [->] Revisit GPU offload only if the model scales to `M,N >= 8192` or a `>= 16`-vector batch; until then the CPU path is the fast path.
-- [->] Connect `second_brain` C-ABI (`popcnt_brain.h`) to local Python / llama.cpp agent runtime as external factual memory & hallucination filter.
+- [->] Connect `second_brain` C-ABI (`popcnt_brain.h`) / C++20 wrapper (`second_brain_cpp.hpp`) to local `llama.cpp` runtime as external factual memory & hallucination filter.
 
 ## DECISIONS (recall-semantics repair, M1)
 - **Defect (Critical)**: `hssa_forward_token` and `model_mod` both seeded `similarity = 1.0f` and, on a miss or an empty database, echoed the query itself back as the "recalled" vector. Consequences: (a) `out_telem->vsa_similarity` reported a perfect match for every input on paths that never scanned anything, and (b) `continuous_residual_inject` added `gamma * 1.0 * Phi(query)` into the memory state, i.e. a projection of the current input labelled as memory. `vsa_db_query_vector` was already correct (`*out_sim = 0.0f`, returns 0 on a miss); the corruption was entirely on the caller side.

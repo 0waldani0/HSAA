@@ -682,20 +682,39 @@ int model_interpolate_representations(
             }
         }
         const float inv_na = 1.0f / norm_a;
-        const float proj = rep_a[min_idx] * inv_na;
-        float orth_nsq = 0.0f;
-        for (size_t k = 0; k < dim; ++k) {
-            float ua = rep_a[k] * inv_na;
-            float comp = ((k == min_idx) ? 1.0f : 0.0f) - proj * ua;
-            out_rep[k] = comp;
-            orth_nsq += comp * comp;
+        const float neg_proj_inv_na = -(rep_a[min_idx] * inv_na) * inv_na;
+        __m512 v_scale_proj = _mm512_set1_ps(neg_proj_inv_na);
+        for (size_t k = 0; k < vec_end; k += 16) {
+            __m512 va = _mm512_loadu_ps(rep_a + k);
+            _mm512_storeu_ps(out_rep + k, _mm512_mul_ps(va, v_scale_proj));
+        }
+        for (size_t rem = vec_end; rem < dim; ++rem) {
+            out_rep[rem] = rep_a[rem] * neg_proj_inv_na;
+        }
+        out_rep[min_idx] += 1.0f;
+
+        __m512 v_orth_sq = _mm512_setzero_ps();
+        for (size_t k = 0; k < vec_end; k += 16) {
+            __m512 vo = _mm512_loadu_ps(out_rep + k);
+            v_orth_sq = _mm512_fmadd_ps(vo, vo, v_orth_sq);
+        }
+        float orth_nsq = _mm512_reduce_add_ps(v_orth_sq);
+        for (size_t rem = vec_end; rem < dim; ++rem) {
+            orth_nsq += out_rep[rem] * out_rep[rem];
         }
         const float inv_orth = (orth_nsq > 1e-12f) ? (1.0f / std::sqrt(orth_nsq)) : 1.0f;
         const float theta = t * 3.14159265358979323846f;
         const float scale_a = std::cos(theta) * (target_norm * inv_na);
         const float scale_o = std::sin(theta) * (target_norm * inv_orth);
-        for (size_t k = 0; k < dim; ++k) {
-            out_rep[k] = scale_a * rep_a[k] + scale_o * out_rep[k];
+        __m512 vs_a = _mm512_set1_ps(scale_a);
+        __m512 vs_o = _mm512_set1_ps(scale_o);
+        for (size_t k = 0; k < vec_end; k += 16) {
+            __m512 va = _mm512_loadu_ps(rep_a + k);
+            __m512 vo = _mm512_loadu_ps(out_rep + k);
+            _mm512_storeu_ps(out_rep + k, _mm512_fmadd_ps(va, vs_a, _mm512_mul_ps(vo, vs_o)));
+        }
+        for (size_t rem = vec_end; rem < dim; ++rem) {
+            out_rep[rem] = scale_a * rep_a[rem] + scale_o * out_rep[rem];
         }
         return 0;
     }
