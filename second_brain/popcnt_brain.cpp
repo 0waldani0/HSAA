@@ -185,13 +185,13 @@ static constexpr uint64_t TRAIN_STATE_MAGIC         = 0x4853535452495354ULL; // 
 static constexpr uint32_t TRAIN_STATE_VERSION       = 2;
 static constexpr size_t   BANK_MAPPING_BYTES        = ALLOC_META_OFFSET + ALLOC_META_BYTES;
 static constexpr uint32_t ALLOC_DIR_SLOTS           = ALLOC_DIR_PAGES * (PAGE_BYTES / 16);
-static constexpr uint32_t ALLOC_MAX_PAGES_PER_OWNER = 8;      // 8 pages x 16 slots = 128 rules
+static constexpr uint32_t ALLOC_MAX_PAGES_PER_OWNER = 512;    // 512 pages x 16 slots = 8,192 rules
 static constexpr uint32_t ALLOC_REGION_CAUSAL       = 0;
 static constexpr uint32_t ALLOC_REGION_FACT         = 1;
 static constexpr uint32_t ALLOC_NO_PAGE             = 0xFFFFFFFFu;
 static constexpr uint64_t ALLOC_MAGIC               = 0x48435353414C4F43ULL; // "HSSALLOC"
 static constexpr uint32_t ALLOC_VERSION             = 1;
-static constexpr int32_t  ALLOC_SAME_RULE_THRESHOLD = 460;   // XNOR agreement for "same rule"
+static constexpr int32_t  ALLOC_SAME_RULE_THRESHOLD = 500;   // XNOR agreement for "same rule"
 
 struct AllocHeader {
     uint64_t magic;                 // ALLOC_MAGIC once the allocator is live
@@ -682,51 +682,56 @@ inline bool bank_store_rule(
 
     const uint64_t key = bank_alloc_key(region, owner_id);
     auto* bank_pages = static_cast<TernaryMLPExpertPage*>(mmap_bank_base);
-    uint32_t pages[ALLOC_MAX_PAGES_PER_OWNER];
-    const int npages = bank_alloc_pages_for_key(
-        mmap_bank_base, key, pages, ALLOC_MAX_PAGES_PER_OWNER);
+    const AllocEntry* dir = bank_alloc_dir(mmap_bank_base);
+    const uint32_t start = bank_alloc_slot(key);
 
-    // 1) the same rule again -> overwrite it in place (last write wins)
-    for (int p = 0; p < npages; ++p) {
-        if (pages[p] >= BANK_TOTAL_BLOCKS) continue;   // corrupted directory entry
-        auto& page = bank_pages[pages[p]];
+    uint32_t free_page = ALLOC_NO_PAGE;
+    size_t free_slot = 0;
+    uint32_t npages = 0;
+
+    // Single open-addressed directory walk: check existing pages for an in-place
+    // rule update while remembering the first available free slot.
+    for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+        const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+        const AllocEntry& e = dir[idx];
+        if (e.key == 0) break;
+        if (e.key != key) continue;
+        if (!bank_page_in_region(e.page, region) || e.page >= BANK_TOTAL_BLOCKS) continue;
+        ++npages;
+        auto& page = bank_pages[e.page];
         for (size_t r = 0; r < D_BOTTLENECK; ++r) {
-            if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
+            if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) {
+                if (free_page == ALLOC_NO_PAGE) {
+                    free_page = e.page;
+                    free_slot = r;
+                }
+                continue;
+            }
             if (vsa_bipolar_dot_512(rule_key_bits, page.w_down_pos[r]) > ALLOC_SAME_RULE_THRESHOLD) {
                 bank_write_rule_slot(page, r, rule_key_bits, rule_val_bits);
                 return true;
             }
         }
     }
-    // 2) a free slot
-    for (int p = 0; p < npages; ++p) {
-        if (pages[p] >= BANK_TOTAL_BLOCKS) continue;   // corrupted directory entry
-        auto& page = bank_pages[pages[p]];
-        for (size_t r = 0; r < D_BOTTLENECK; ++r) {
-            if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) {
-                bank_write_rule_slot(page, r, rule_key_bits, rule_val_bits);
-                return true;
-            }
-        }
+
+    if (free_page != ALLOC_NO_PAGE) {
+        bank_write_rule_slot(bank_pages[free_page], free_slot, rule_key_bits, rule_val_bits);
+        return true;
     }
-    // 3) no room -> another page for this owner.
-    //
-    // The budget of ALLOC_MAX_PAGES_PER_OWNER pages is a REAL limit: a rule
-    // stored on a page the lookup never visits would be a silent loss, so the
-    // write is refused instead.
-    if (npages >= static_cast<int>(ALLOC_MAX_PAGES_PER_OWNER)) return false;
+
+    // All existing pages for this owner are full -> probe a new clean page in the bank.
+    if (npages >= ALLOC_MAX_PAGES_PER_OWNER) return false;
     const uint32_t page_id = bank_alloc_new_page(mmap_bank_base, region);
     if (page_id == ALLOC_NO_PAGE) return false;
     if (!bank_alloc_add_page(mmap_bank_base, key, page_id)) {
-        bank_alloc_release_page(mmap_bank_base, region, page_id);   // do not leak it
+        bank_alloc_release_page(mmap_bank_base, region, page_id);
         return false;
     }
     bank_write_rule_slot(bank_pages[page_id], 0, rule_key_bits, rule_val_bits);
     return true;
 }
 
-// Look a rule up. Every page the owner owns is searched, so a rule stored
-// after the owner's first page filled up is still found.
+// Look a rule up across all open-addressed pages owned by (region, owner_id).
 inline int bank_query_rule(
     const void* __restrict__ mmap_bank_base,
     uint32_t region,
@@ -744,25 +749,27 @@ inline int bank_query_rule(
     }
 
     const uint64_t key = bank_alloc_key(region, owner_id);
-    uint32_t pages[ALLOC_MAX_PAGES_PER_OWNER];
-    const int npages = bank_alloc_pages_for_key(
-        const_cast<void*>(mmap_bank_base), key, pages, ALLOC_MAX_PAGES_PER_OWNER);
-    if (npages == 0) return 0;
-
+    const AllocEntry* dir = bank_alloc_dir(const_cast<void*>(mmap_bank_base));
+    const uint32_t start = bank_alloc_slot(key);
     const auto* bank_pages = static_cast<const TernaryMLPExpertPage*>(mmap_bank_base);
+
     int32_t best_sim = -1024;
     int best_r = -1;
     uint32_t best_page = ALLOC_NO_PAGE;
-    for (int p = 0; p < npages; ++p) {
-        if (pages[p] >= BANK_TOTAL_BLOCKS) continue;   // corrupted directory entry
-        const auto& page = bank_pages[pages[p]];
+    for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+        const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+        const AllocEntry& e = dir[idx];
+        if (e.key == 0) break;
+        if (e.key != key) continue;
+        if (!bank_page_in_region(e.page, region) || e.page >= BANK_TOTAL_BLOCKS) continue;
+        const auto& page = bank_pages[e.page];
         for (size_t r = 0; r < D_BOTTLENECK; ++r) {
             if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
             const int32_t sim = vsa_bipolar_dot_512(query_key_bits, page.w_down_pos[r]);
             if (sim > best_sim) {
                 best_sim = sim;
                 best_r = static_cast<int>(r);
-                best_page = pages[p];
+                best_page = e.page;
             }
         }
     }
@@ -2217,6 +2224,7 @@ struct NativeSublinearLLM {
     int last_token_id = -1;
     int prev_prev_token_id = -1;
     bool multi_scale_vsa_trained = false;
+    bool high_L_pruned = false;
     int ctx_ring[4] = {-1, -1, -1, -1};
     int ctx_ring_len = 0;
 
@@ -2689,6 +2697,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         }
         trained_pages.clear();
         multi_scale_vsa_trained = false;
+        high_L_pruned = false;
         uint64_t magic = 0;
         uint32_t version = 0, nwords = 0, vocab = 0, emb = 0;
         if (!r.u64(magic)) return fail("the state blob is too short to hold the magic");
@@ -2830,6 +2839,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         // still "parse", with a wrong boundary
         if (r.at != r.n) return fail("the blob has trailing bytes");
         multi_scale_vsa_trained = !trained_pages.empty();
+        rebuild_vsa_lsh_buckets();
         return true;
     }
 
@@ -2885,6 +2895,8 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
     std::vector<int8_t> embeddings;          // [vocab_size * D_MODEL]
     std::vector<uint64_t> vocab_pos;         // [vocab_size * WORDS_PER_VEC]
     std::vector<uint64_t> vocab_neg;         // [vocab_size * WORDS_PER_VEC]
+    std::vector<uint64_t> context_sem_bits;  // [vocab_size * HALF_WORDS] distributional role bits for context keys
+    std::unordered_map<uint64_t, std::vector<uint32_t>> vsa_lsh_buckets; // SimHash/LSH bucket -> page IDs
 
     int8_t wc_master[D_MODEL][D_MODEL];      // Latent master weights for Bitwise MLGRU
     uint64_t wf_pos[D_MODEL][WORDS_PER_VEC];
@@ -2954,6 +2966,7 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
           embeddings(v_size * D_MODEL, 0),
           vocab_pos(v_size * WORDS_PER_VEC, 0),
           vocab_neg(v_size * WORDS_PER_VEC, 0),
+          context_sem_bits(v_size * HALF_WORDS, 0),
           tree_nodes(skip_init ? 0 : (((1U << TREE_DEPTH) - 1U) * WORDS_PER_VEC), 0),
           swa_count(0),
           has_active_prompt_half(false),
@@ -2978,8 +2991,13 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         for (int v = 0; v < vocab_size; ++v) {
             for (size_t i = 0; i < D_MODEL; ++i) {
                 uint64_t r = next_rand();
-                int8_t mag = static_cast<int8_t>(10 + (r % 5));
                 int8_t sgn = (r & 0x100ULL) ? 1 : -1;
+                int8_t mag = static_cast<int8_t>(10 + (r % 5));
+                if (i < 256) {
+                    // Encode initial semantic bit in magnitude parity (even=1, odd=0)
+                    // while keeping sign for vocab_pos/vocab_neg untouched.
+                    mag = (sgn > 0) ? 12 : 11;
+                }
                 embeddings[v * D_MODEL + i] = sgn * mag;
             }
         }
@@ -3011,12 +3029,48 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
     }
 
     void sync_vocab_bitmasks() {
+        if (context_sem_bits.size() < static_cast<size_t>(vocab_size) * HALF_WORDS) {
+            context_sem_bits.resize(static_cast<size_t>(vocab_size) * HALF_WORDS, 0ULL);
+        }
         for (int v = 0; v < vocab_size; ++v) {
             sync_latent_row_to_ternary_masks(
                 &embeddings[v * D_MODEL], 1,
                 &vocab_pos[v * WORDS_PER_VEC],
                 &vocab_neg[v * WORDS_PER_VEC]
             );
+            const int8_t* emb_row = &embeddings[static_cast<size_t>(v) * D_MODEL];
+            uint64_t* sem_row = &context_sem_bits[static_cast<size_t>(v) * HALF_WORDS];
+            for (size_t w = 0; w < HALF_WORDS; ++w) {
+                uint64_t word_bits = 0ULL;
+                for (size_t b = 0; b < 64; ++b) {
+                    int8_t val = emb_row[(w << 6) + b];
+                    int mag = (val >= 0) ? static_cast<int>(val) : -static_cast<int>(val);
+                    if ((mag & 1) == 0) {
+                        word_bits |= (1ULL << b);
+                    }
+                }
+                sem_row[w] = word_bits;
+            }
+        }
+    }
+
+    void align_token_context_semantics(int tok, int proto) {
+        if (tok < 0 || tok >= vocab_size || proto < 0 || proto >= vocab_size || tok == proto) return;
+        if (context_sem_bits.size() < static_cast<size_t>(vocab_size) * HALF_WORDS) {
+            context_sem_bits.resize(static_cast<size_t>(vocab_size) * HALF_WORDS, 0ULL);
+        }
+        const uint64_t* proto_sem = &context_sem_bits[static_cast<size_t>(proto) * HALF_WORDS];
+        uint64_t* tok_sem = &context_sem_bits[static_cast<size_t>(tok) * HALF_WORDS];
+        int8_t* tok_emb = &embeddings[static_cast<size_t>(tok) * D_MODEL];
+        for (size_t w = 0; w < HALF_WORDS; ++w) {
+            uint64_t pw = proto_sem[w];
+            tok_sem[w] = pw;
+            for (size_t b = 0; b < 64; ++b) {
+                size_t d = (w << 6) + b;
+                int8_t sgn = (tok_emb[d] >= 0) ? 1 : -1;
+                int8_t mag = ((pw >> b) & 1ULL) ? 12 : 11;
+                tok_emb[d] = sgn * mag;
+            }
         }
     }
 
@@ -3031,34 +3085,134 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         ctx_ring[0] = ctx_ring[1] = ctx_ring[2] = ctx_ring[3] = -1;
     }
 
-    // Deterministic 512-bit VSA context hypervector formed by binding the 512-bit
-    // vocabulary bitmasks of the L context tokens via circular word/bit shifts and XNOR.
+    static constexpr uint64_t vsa_pos_mask(int L, int i) {
+        if (L <= 1) return 0xFFFFFFFFFFFFFFFFULL;
+        if (L == 2) return (i == 0) ? 0x5555555555555555ULL : 0xAAAAAAAAAAAAAAAAULL;
+        if (L == 3) {
+            if (i == 0) return 0x9249249249249249ULL;
+            if (i == 1) return 0x2492492492492492ULL;
+            return 0x4924924924924924ULL;
+        }
+        if (i == 0) return 0x1111111111111111ULL;
+        if (i == 1) return 0x2222222222222222ULL;
+        if (i == 2) return 0x4444444444444444ULL;
+        return 0x8888888888888888ULL;
+    }
+
+    // Isometric bit-partitioned 512-bit VSA context hypervector:
+    // - Words 0..3 (256 bits) bind position-rotated distributional role signatures
+    //   (`context_sem_bits`), preserving Hamming similarity across similar words.
+    // - Words 4..7 (256 bits) bind position-rotated lexical bitmasks (`vocab_pos`),
+    //   with order `L` (0..4) encoded in the low 3 bits of word 7.
     void compute_vsa_context_key_512(
         const int* __restrict__ ctx_tokens,
         int L,
         uint64_t* __restrict__ out_key_bits
     ) const {
-        uint64_t acc[WORDS_PER_VEC];
-        for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
-            acc[w] = 0x9E3779B97F4A7C15ULL ^
-                     (static_cast<uint64_t>(L + 1) * 0xBF58476D1CE4E5B9ULL) ^
-                     (w * 0x94D049BB133111EBULL);
+        if (L <= 0 || !ctx_tokens) {
+            for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+                out_key_bits[w] = 0x9E3779B97F4A7C15ULL ^ (w * 0x94D049BB133111EBULL);
+            }
+            out_key_bits[7] = (out_key_bits[7] & ~7ULL);
+            return;
         }
+        uint64_t acc[WORDS_PER_VEC] = {0};
+        const bool has_sem = (context_sem_bits.size() >= static_cast<size_t>(vocab_size) * HALF_WORDS);
         for (int i = 0; i < L; ++i) {
             int tok = ctx_tokens[i];
             if (tok < 0 || tok >= vocab_size) tok = 0;
             const uint64_t* vp = vocab_pos.data() + static_cast<size_t>(tok) * WORDS_PER_VEC;
-            unsigned int sh = static_cast<unsigned int>(((i + 1) * 13 + L * 7) & 63);
-            size_t w_off = static_cast<size_t>((i + L) & (WORDS_PER_VEC - 1));
-            for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
-                uint64_t v = vp[(w + w_off) & (WORDS_PER_VEC - 1)];
-                uint64_t rot = (sh == 0U) ? v : ((v << sh) | (v >> (64U - sh)));
-                uint64_t mix = rot ^ ((vp[(w + w_off + 3) & (WORDS_PER_VEC - 1)] * 0x2545F4914F6CDD1DULL) >> 17);
-                acc[w] = ((acc[w] << 7) | (acc[w] >> 57)) ^ mix;
+            const uint64_t* vs = has_sem
+                ? (context_sem_bits.data() + static_cast<size_t>(tok) * HALF_WORDS)
+                : vp;
+            const uint64_t mask = vsa_pos_mask(L, i);
+            const unsigned int sh = static_cast<unsigned int>(((i + 1) * 13 + L * 7) & 63);
+            for (size_t w = 0; w < HALF_WORDS; ++w) {
+                uint64_t sv = vs[(w + static_cast<size_t>(i)) & (HALF_WORDS - 1)];
+                uint64_t srot = (sh == 0U) ? sv : ((sv << sh) | (sv >> (64U - sh)));
+                acc[w] |= (srot & mask);
+
+                uint64_t lv = vp[HALF_WORDS + ((w + static_cast<size_t>(i)) & (HALF_WORDS - 1))];
+                uint64_t lrot = (sh == 0U) ? lv : ((lv << sh) | (lv >> (64U - sh)));
+                acc[HALF_WORDS + w] |= (lrot & mask);
             }
         }
+        uint64_t pad = 0xBF58476D1CE4E5B9ULL ^ (static_cast<uint64_t>(L) * 0x94D049BB133111EBULL);
+        const uint64_t covered = (L == 3)
+            ? (vsa_pos_mask(3, 0) | vsa_pos_mask(3, 1) | vsa_pos_mask(3, 2))
+            : ~0ULL;
         for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
-            out_key_bits[w] = acc[w];
+            out_key_bits[w] = (acc[w] & covered) | (pad & ~covered);
+        }
+        out_key_bits[7] = (out_key_bits[7] & ~7ULL) | (static_cast<uint64_t>(L) & 7ULL);
+    }
+
+    static uint64_t compute_vsa_lsh_band_hash(
+        const uint64_t* __restrict__ key_bits,
+        int L,
+        int band
+    ) {
+        if (band == 0) {
+            // Semantic SimHash band: hashes only the 256-bit distributional role subspace (words 0..3) + order L
+            uint64_t h = 0x9E3779B97F4A7C15ULL ^ (static_cast<uint64_t>(L) * 0xBF58476D1CE4E5B9ULL);
+            for (size_t w = 0; w < HALF_WORDS; ++w) {
+                h ^= key_bits[w] * (0x94D049BB133111EBULL + (w << 1));
+                h = ((h << 29) | (h >> 35)) * 0xBF58476D1CE4E5B9ULL;
+            }
+            return (h ^ (h >> 31)) | (1ULL << 60);
+        }
+        if (L >= 2 && band >= 1 && band <= L) {
+            // Leave-one-position-out LSH band: hashes the (L - 1) context positions excluding position (band - 1)
+            const int drop_pos = band - 1;
+            const uint64_t keep_mask = ~vsa_pos_mask(L, drop_pos);
+            uint64_t h = 0xC2B2AE3D27D4EB4FULL ^
+                         (static_cast<uint64_t>(L) * 0x9E3779B97F4A7C15ULL) ^
+                         (static_cast<uint64_t>(band) * 0x2545F4914F6CDD1DULL);
+            for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+                uint64_t kw = (w == 7) ? (key_bits[7] & ~7ULL) : key_bits[w];
+                uint64_t masked = kw & keep_mask;
+                h ^= masked * (0xBF58476D1CE4E5B9ULL + (w << 2));
+                h = ((h << 23) | (h >> 41)) * 0x94D049BB133111EBULL;
+            }
+            return (h ^ (h >> 31)) | (static_cast<uint64_t>(band + 1) << 60);
+        }
+        // Sub-word lexical LSH band for L == 1
+        size_t w_idx = static_cast<size_t>(HALF_WORDS + ((band - 1) & 1));
+        uint64_t h = key_bits[w_idx] * 0x9E3779B97F4A7C15ULL ^ (static_cast<uint64_t>(L) << 16);
+        return (h ^ (h >> 29)) | (static_cast<uint64_t>(band + 5) << 60);
+    }
+
+    void index_page_in_vsa_lsh(uint32_t pid, const uint64_t* __restrict__ key_bits, int L) {
+        if (L <= 0 || L > 4) return;
+        const int num_bands = (L >= 2) ? (L + 1) : 3;
+        for (int b = 0; b < num_bands; ++b) {
+            uint64_t bh = compute_vsa_lsh_band_hash(key_bits, L, b);
+            auto& vec = vsa_lsh_buckets[bh];
+            if (vec.empty() || vec.back() != pid) {
+                if (std::find(vec.begin(), vec.end(), pid) == vec.end()) {
+                    vec.push_back(pid);
+                }
+            }
+        }
+    }
+
+    void rebuild_vsa_lsh_buckets() {
+        vsa_lsh_buckets.clear();
+        if (!bank || !bank->base_ptr || trained_pages.empty()) return;
+        const auto* pages = static_cast<const TernaryMLPExpertPage*>(bank->base_ptr);
+        for (uint32_t pid : trained_pages) {
+            if (pid >= TOTAL_EXPERTS) continue;
+            const auto& page = pages[pid];
+            for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                if ((page.w_down_pos[r][0] | page.w_down_neg[r][0] |
+                     page.w_down_pos[r][1] | page.w_down_neg[r][1]) == 0ULL) {
+                    break;
+                }
+                int L = static_cast<int>(page.w_down_pos[r][7] & 7ULL);
+                if (L >= 1 && L <= 4) {
+                    index_page_in_vsa_lsh(pid, page.w_down_pos[r], L);
+                }
+            }
         }
     }
 
@@ -3098,6 +3252,99 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                     return true;
                 }
             }
+        }
+        return false;
+    }
+
+    // Soft Hamming associative VSA resonance over SimHash/LSH buckets for unseen (OOV) contexts:
+    // Probes pages sharing either the 256-bit semantic SimHash band or a leave-one-position-out
+    // LSH band at order L, selecting the slot with maximal bipolar dot above the order-specific
+    // soft Hamming threshold.
+    bool probe_vsa_context_soft_hamming(
+        const TernaryMLPExpertPage* __restrict__ pages,
+        const uint64_t* __restrict__ key_bits,
+        int L,
+        uint32_t* __restrict__ out_pid,
+        int* __restrict__ out_slot,
+        int32_t* __restrict__ out_best_dot = nullptr
+    ) const {
+        if (L <= 0 || L > 4 || vsa_lsh_buckets.empty()) return false;
+        const int32_t min_full_dot = (L == 4) ? 340 : ((L == 3) ? 308 : ((L == 2) ? 336 : 360));
+        const int num_bands = (L >= 2) ? (L + 1) : 3;
+
+        int32_t best_score = -1024;
+        int32_t best_dot = -1024;
+        uint32_t best_pid = 0;
+        int best_r = -1;
+
+        uint32_t visited_pids[128];
+        size_t n_visited = 0;
+
+        for (int b = 0; b < num_bands; ++b) {
+            const uint64_t bh = compute_vsa_lsh_band_hash(key_bits, L, b);
+            auto it = vsa_lsh_buckets.find(bh);
+            if (it == vsa_lsh_buckets.end()) continue;
+
+            for (uint32_t pid : it->second) {
+                if (pid >= TOTAL_EXPERTS) continue;
+                bool seen = false;
+                for (size_t vi = 0; vi < n_visited; ++vi) {
+                    if (visited_pids[vi] == pid) { seen = true; break; }
+                }
+                if (seen) continue;
+                if (n_visited < 128) visited_pids[n_visited++] = pid;
+
+                const TernaryMLPExpertPage& page = pages[pid];
+                for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                    if ((page.w_down_pos[r][0] | page.w_down_neg[r][0] |
+                         page.w_down_pos[r][1] | page.w_down_neg[r][1]) == 0ULL) {
+                        break;
+                    }
+                    const uint64_t* slot_bits = page.w_down_pos[r];
+                    if (static_cast<int>(slot_bits[7] & 7ULL) != L) continue;
+
+                    const int32_t sem_dot = vsa_bipolar_dot_256(key_bits, slot_bits);
+                    const int32_t lex_dot = vsa_bipolar_dot_256(key_bits + HALF_WORDS, slot_bits + HALF_WORDS);
+                    const int32_t full_dot = sem_dot + lex_dot;
+                    if (full_dot < min_full_dot) continue;
+
+                    int matched_positions = 0;
+                    for (int pos = 0; pos < L; ++pos) {
+                        const uint64_t pmask = vsa_pos_mask(L, pos);
+                        bool pos_exact = true;
+                        for (size_t w = HALF_WORDS; w < WORDS_PER_VEC; ++w) {
+                            const uint64_t eff_mask = (w == 7) ? (pmask & ~7ULL) : pmask;
+                            if (((key_bits[w] ^ slot_bits[w]) & eff_mask) != 0ULL) {
+                                pos_exact = false;
+                                break;
+                            }
+                        }
+                        if (pos_exact) ++matched_positions;
+                    }
+
+                    const bool sem_eligible =
+                        (sem_dot >= 220 && (L == 1 || matched_positions >= L - 1)) ||
+                        (sem_dot == 256 && L >= 2 && matched_positions >= L - 2);
+                    const bool lsh_leave_one_out_eligible =
+                        (L >= 3 && matched_positions >= L - 1 && full_dot >= 308 && sem_dot >= 160);
+                    if (!sem_eligible && !lsh_leave_one_out_eligible) continue;
+
+                    const int32_t score = full_dot + (sem_dot >> 1) + (matched_positions * 32);
+                    if (score > best_score || (score == best_score && full_dot > best_dot)) {
+                        best_score = score;
+                        best_dot = full_dot;
+                        best_pid = pid;
+                        best_r = static_cast<int>(r);
+                    }
+                }
+            }
+        }
+
+        if (best_r >= 0) {
+            if (out_pid) *out_pid = best_pid;
+            if (out_slot) *out_slot = best_r;
+            if (out_best_dot) *out_best_dot = best_dot;
+            return true;
         }
         return false;
     }
@@ -3242,6 +3489,7 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
             uint32_t matched_pid = 0;
             int matched_slot = -1;
             bool found = false;
+            bool used_soft_hamming = false;
 
             const int max_L = std::min(ctx_ring_len, 4);
             for (int L = max_L; L >= 1; --L) {
@@ -3249,6 +3497,22 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                 if (probe_vsa_context_page_slot(pages, key_bits, &matched_pid, &matched_slot)) {
                     found = true;
                     break;
+                }
+                if (!high_L_pruned &&
+                    probe_vsa_context_soft_hamming(pages, key_bits, L, &matched_pid, &matched_slot)) {
+                    found = true;
+                    used_soft_hamming = true;
+                    break;
+                }
+            }
+            if (!found && high_L_pruned) {
+                for (int L = max_L; L >= 1; --L) {
+                    compute_vsa_context_key_512(&ctx_ring[ctx_ring_len - L], L, key_bits);
+                    if (probe_vsa_context_soft_hamming(pages, key_bits, L, &matched_pid, &matched_slot)) {
+                        found = true;
+                        used_soft_hamming = true;
+                        break;
+                    }
                 }
             }
             if (!found && !use_backoff_shortlist) {
@@ -3259,7 +3523,10 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
             }
 
             if (found) {
-                unpack_vsa_key_bits_to_int8(key_bits, mlgru_out);
+                const uint64_t* active_slot_key = (used_soft_hamming && matched_slot >= 0)
+                    ? pages[matched_pid].w_down_pos[matched_slot]
+                    : key_bits;
+                unpack_vsa_key_bits_to_int8(active_slot_key, mlgru_out);
                 pack_activation_bitplanes(mlgru_out, sign_bits, mag_planes);
                 for (int k = 0; k < top_k; ++k) {
                     out_eids[k] = matched_pid;
@@ -3350,6 +3617,57 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         return decide_token(ffn_out, prev_prev_token_id, last_token_id);
     }
 
+    void align_distributional_context_frames(const std::vector<std::vector<int>>& sequences) {
+        std::map<std::pair<int, int>, std::vector<int>> frame_fillers;
+        std::vector<std::pair<int, int>> frame_order;
+        auto record_frame = [&](int a, int b, int filler) {
+            if (filler < 0 || filler >= vocab_size) return;
+            std::pair<int, int> key{a, b};
+            auto it = frame_fillers.find(key);
+            if (it == frame_fillers.end()) {
+                frame_order.push_back(key);
+                frame_fillers[key].push_back(filler);
+            } else {
+                auto& vec = it->second;
+                if (std::find(vec.begin(), vec.end(), filler) == vec.end()) {
+                    vec.push_back(filler);
+                }
+            }
+        };
+        for (const auto& seq : sequences) {
+            for (size_t t = 0; t < seq.size(); ++t) {
+                if (t >= 1 && t + 1 < seq.size()) {
+                    record_frame(seq[t - 1], seq[t + 1], seq[t]);
+                }
+                if (t + 2 < seq.size()) {
+                    record_frame(-1000000 - seq[t + 1], seq[t + 2], seq[t]);
+                }
+                if (t >= 2) {
+                    record_frame(seq[t - 2], -1000000 - seq[t - 1], seq[t]);
+                }
+            }
+        }
+        std::unordered_set<int> aligned_toks;
+        for (const auto& fkey : frame_order) {
+            const auto& vec = frame_fillers[fkey];
+            if (vec.size() < 2 || vec.size() > 16) continue;
+            int proto = vec[0];
+            for (int tok : vec) {
+                if (aligned_toks.count(tok)) {
+                    proto = tok;
+                    break;
+                }
+            }
+            aligned_toks.insert(proto);
+            for (int tok : vec) {
+                if (!aligned_toks.count(tok)) {
+                    align_token_context_semantics(tok, proto);
+                    aligned_toks.insert(tok);
+                }
+            }
+        }
+    }
+
     // End-to-End General Corpus Training (`На чем угодно прям как ЛЛМ`):
     // Consolidates multi-scale VSA context keys (L = 1..4) and modal target
     // prototypes directly into 16-slot (4096 B) TernaryMLPExpertPages with
@@ -3365,6 +3683,13 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         (void)epochs;
         split_subspace_key = force_split_subspace_key;
         multi_scale_vsa_trained = false;
+        high_L_pruned = false;
+        sync_vocab_bitmasks();
+
+        // Discover distributional equivalence classes from (w_{t-1}, w_{t+1}),
+        // right-context (w_{t+1}, w_{t+2}), and left-context (w_{t-2}, w_{t-1}) frames
+        // to align context_sem_bits across words that play the same syntactic/semantic role.
+        align_distributional_context_frames(sequences);
 
         if (use_backoff_shortlist) build_backoff_tables(sequences);
 
@@ -3482,7 +3807,8 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         std::unordered_set<uint32_t> touched_pages;
         std::unordered_map<uint32_t, size_t> page_load;
 
-        auto insert_vsa_slot = [&](const uint64_t* key_bits, int target_tok) {
+        vsa_lsh_buckets.clear();
+        auto insert_vsa_slot = [&](const uint64_t* key_bits, int target_tok, int L) {
             if (target_tok < 0 || target_tok >= vocab_size) return;
             const uint64_t* targ_pos = &vocab_pos[static_cast<size_t>(target_tok) * WORDS_PER_VEC];
             const uint64_t* targ_neg = &vocab_neg[static_cast<size_t>(target_tok) * WORDS_PER_VEC];
@@ -3514,6 +3840,9 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                         page.w_up_neg[r_idx][w]   = targ_neg[w];
                     }
                     page_load[pid]++;
+                    if (L >= 1 && L <= 4) {
+                        index_page_in_vsa_lsh(pid, key_bits, L);
+                    }
                     break;
                 }
             }
@@ -3523,11 +3852,12 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         {
             uint64_t key_bits_L0[WORDS_PER_VEC];
             compute_vsa_context_key_512(nullptr, 0, key_bits_L0);
-            insert_vsa_slot(key_bits_L0, uni_best_tok);
+            insert_vsa_slot(key_bits_L0, uni_best_tok, 0);
         }
 
-        // Insert L = 1..4 contexts in ascending order, skipping L >= 3 entries
-        // whose modal target is already identical to their shorter suffix fallback.
+        // Insert L = 1..4 contexts in ascending order. Only prune redundant L >= 3
+        // entries when total contexts exceed 100,000, so normal corpora keep all
+        // higher-order VSA slots available as LSH anchors for soft Hamming generalization.
         auto predict_from_lower_L = [&](const int* ctx_end_inclusive, int max_lower_L) -> int {
             for (int l = max_lower_L; l >= 1; --l) {
                 uint64_t h = hash_ngram(ctx_end_inclusive - l + 1, l);
@@ -3537,18 +3867,23 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
             return uni_best_tok;
         };
 
+        const size_t total_modal_contexts =
+            modal_by_L[1].size() + modal_by_L[2].size() + modal_by_L[3].size() + modal_by_L[4].size();
+        const bool prune_redundant_high_L = (total_modal_contexts > 100000);
+        high_L_pruned = prune_redundant_high_L;
+
         for (int L = 1; L <= 4; ++L) {
             uint64_t key_bits[WORDS_PER_VEC];
             for (const auto& kv : modal_by_L[L]) {
                 const CtxModalEntry& e = kv.second;
                 const auto& seq = sequences[e.seq_idx];
                 const int* ctx_ptr = &seq[e.pos_t + 1 - static_cast<size_t>(L)];
-                if (L >= 3) {
+                if (prune_redundant_high_L && L >= 3) {
                     int fallback_tok = predict_from_lower_L(&seq[e.pos_t], L - 1);
                     if (e.best_tok == fallback_tok) continue;
                 }
                 compute_vsa_context_key_512(ctx_ptr, L, key_bits);
-                insert_vsa_slot(key_bits, e.best_tok);
+                insert_vsa_slot(key_bits, e.best_tok, L);
             }
         }
 
@@ -3935,7 +4270,11 @@ struct MultiLayerExpertRelayEngine {
         }
     }
 
-    uint32_t route_single_layer_128_popcnt(size_t l, const uint64_t* __restrict__ query_bits) const {
+    uint32_t route_single_layer_128_popcnt(
+        size_t l,
+        const uint64_t* __restrict__ query_bits,
+        uint32_t probe_step = 0
+    ) const {
         const uint64_t* q1 = query_bits;
         // At Layer 0 (Entry Layer), route on the shared coarse prefix `q1` so all branches sharing
         // a prefix enter the same Entry Expert E^{(0)}, which then dispatches them across Layers 1..7!
@@ -3949,7 +4288,15 @@ struct MultiLayerExpertRelayEngine {
             if (s1 > best_s1) { best_s1 = s1; best_u = static_cast<uint32_t>(i); }
             if (s2 > best_s2) { best_s2 = s2; best_v = static_cast<uint32_t>(i); }
         }
-        return static_cast<uint32_t>(l * PAGES_PER_RELAY_LAYER) + ((best_u << 7) | best_v);
+        uint32_t base_offset = (best_u << 7) | best_v;
+        if (probe_step > 0U) {
+            uint64_t h = (query_bits[0] * 0x9E3779B97F4A7C15ULL) ^
+                         (query_bits[1] * 0xBF58476D1CE4E5B9ULL) ^
+                         static_cast<uint64_t>(l + 1U);
+            uint32_t stride = static_cast<uint32_t>((h >> 17) | 1ULL) & (PAGES_PER_RELAY_LAYER - 1U);
+            base_offset = (base_offset + probe_step * stride) & (PAGES_PER_RELAY_LAYER - 1U);
+        }
+        return static_cast<uint32_t>(l * PAGES_PER_RELAY_LAYER) + base_offset;
     }
 
     void register_layer_centroid_128(size_t l, const uint64_t* __restrict__ query_bits) {
@@ -4015,19 +4362,35 @@ struct MultiLayerExpertRelayEngine {
             uint64_t q_bits[WORDS_PER_VEC];
             build_expert_to_expert_query_bits(l, curr_x, prev_page, prev_mask, prev_best_r, q_bits);
 
-            uint32_t chosen_page = route_single_layer_128_popcnt(l, q_bits);
+            uint32_t chosen_page = route_single_layer_128_popcnt(l, q_bits, 0);
             uint16_t mask = 0;
             int best_r = -1;
             int32_t max_h = 0;
 
             bool fired = false;
             if (!resolved_by_specialist) {
-                fired = execute_single_expert_and_get_steering(
-                    bank_pages, chosen_page, curr_x, next_x, &mask, &best_r, &max_h
-                );
-                if (fired) {
-                    std::memcpy(curr_x, next_x, D_MODEL);
-                    resolved_by_specialist = true;
+                for (uint32_t probe = 0; probe < 256U; ++probe) {
+                    uint32_t cand_page = route_single_layer_128_popcnt(l, q_bits, probe);
+                    if (probe > 0U && !initialized_relay_pages.count(cand_page)) break;
+                    uint16_t cand_mask = 0;
+                    int cand_best_r = -1;
+                    int32_t cand_max_h = 0;
+                    bool cand_fired = execute_single_expert_and_get_steering(
+                        bank_pages, cand_page, curr_x, next_x, &cand_mask, &cand_best_r, &cand_max_h
+                    );
+                    if (probe == 0U || cand_fired) {
+                        chosen_page = cand_page;
+                        mask = cand_mask;
+                        best_r = cand_best_r;
+                        max_h = cand_max_h;
+                    }
+                    if (cand_fired) {
+                        fired = true;
+                        std::memcpy(curr_x, next_x, D_MODEL);
+                        resolved_by_specialist = true;
+                        break;
+                    }
+                    if (!initialized_relay_pages.count(cand_page)) break;
                 }
             }
 
@@ -4179,31 +4542,39 @@ struct MultiLayerExpertRelayEngine {
 
                     uint64_t q_bits[WORDS_PER_VEC];
                     build_expert_to_expert_query_bits(l, x_l, prev_p, prev_m, prev_r, q_bits);
-                    const uint32_t pid = route_single_layer_128_popcnt(l, q_bits);
-                    if (!initialized_relay_pages.count(pid)) {
-                        std::memset(&bank_pages[pid], 0, sizeof(TernaryMLPExpertPage));
-                        initialized_relay_pages.insert(pid);
-                    }
 
-                    // The specialist quota: a page that is full delegates this
-                    // branch to the next layer (the same rule as the
-                    // supervised trainer).
-                    size_t occupied_r = 0;
-                    bool already_matches_r = false;
                     int32_t xl_l1 = 0;
                     for (size_t i = 0; i < D_MODEL; ++i) xl_l1 += std::abs(static_cast<int32_t>(x_l[i]));
                     const int32_t exact_res_thresh = (xl_l1 * 15) >> 4;
                     uint64_t xs[WORDS_PER_VEC], xm[NUM_BIT_PLANES][WORDS_PER_VEC];
                     pack_activation_bitplanes(x_l, xs, xm);
-                    for (size_t r = 0; r < D_BOTTLENECK; ++r) {
-                        if ((bank_pages[pid].w_down_pos[r][0] | bank_pages[pid].w_down_neg[r][0]) != 0ULL) {
-                            ++occupied_r;
-                            if (ternary_popcnt_dot_512(bank_pages[pid].w_down_pos[r], bank_pages[pid].w_down_neg[r], xs, xm) >= exact_res_thresh) {
-                                already_matches_r = true;
+
+                    const size_t per_page_cap = std::min<size_t>(max_neurons_per_page, D_BOTTLENECK);
+                    const uint32_t max_probes = (max_neurons_per_page >= D_BOTTLENECK || l + 1 == NUM_RELAY_LAYERS) ? 256U : 1U;
+                    uint32_t pid = ALLOC_NO_PAGE;
+                    for (uint32_t probe = 0; probe < max_probes; ++probe) {
+                        uint32_t cand_pid = route_single_layer_128_popcnt(l, q_bits, probe);
+                        if (!initialized_relay_pages.count(cand_pid)) {
+                            std::memset(&bank_pages[cand_pid], 0, sizeof(TernaryMLPExpertPage));
+                            initialized_relay_pages.insert(cand_pid);
+                        }
+                        size_t occupied_r = 0;
+                        bool already_matches_r = false;
+                        for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                            if ((bank_pages[cand_pid].w_down_pos[r][0] | bank_pages[cand_pid].w_down_neg[r][0]) != 0ULL) {
+                                ++occupied_r;
+                                if (ternary_popcnt_dot_512(bank_pages[cand_pid].w_down_pos[r], bank_pages[cand_pid].w_down_neg[r], xs, xm) >= exact_res_thresh) {
+                                    already_matches_r = true;
+                                }
                             }
                         }
+                        const size_t eff_cap = (probe > 0U) ? D_BOTTLENECK : per_page_cap;
+                        if (already_matches_r || occupied_r < eff_cap) {
+                            pid = cand_pid;
+                            break;
+                        }
                     }
-                    if (!already_matches_r && occupied_r >= max_neurons_per_page) continue;
+                    if (pid == ALLOC_NO_PAGE) continue;
 
                     // A repulsive update is NOT applied in the FIRST layer.
                     // The first layer builds the state's own representation,
@@ -4296,31 +4667,42 @@ struct MultiLayerExpertRelayEngine {
 
                     uint64_t q_bits[WORDS_PER_VEC];
                     build_expert_to_expert_query_bits(l, x_l, prev_p, prev_m, prev_r, q_bits);
-                    uint32_t pid = route_single_layer_128_popcnt(l, q_bits);
-                    if (!initialized_relay_pages.count(pid)) {
-                        std::memset(&bank_pages[pid], 0, sizeof(TernaryMLPExpertPage));
-                        initialized_relay_pages.insert(pid);
-                    }
 
-                    // Count how many bottleneck neurons are already occupied on `pid`
-                    size_t occupied_r = 0;
-                    bool already_matches_r = false;
                     int32_t xl_l1 = 0;
                     for (size_t i = 0; i < D_MODEL; ++i) xl_l1 += std::abs(static_cast<int32_t>(x_l[i]));
                     int32_t exact_res_thresh = (xl_l1 * 15) >> 4;
                     uint64_t xs[WORDS_PER_VEC], xm[NUM_BIT_PLANES][WORDS_PER_VEC];
                     pack_activation_bitplanes(x_l, xs, xm);
-                    for (size_t r = 0; r < D_BOTTLENECK; ++r) {
-                        if ((bank_pages[pid].w_down_pos[r][0] | bank_pages[pid].w_down_neg[r][0]) != 0ULL) {
-                            ++occupied_r;
-                            if (ternary_popcnt_dot_512(bank_pages[pid].w_down_pos[r], bank_pages[pid].w_down_neg[r], xs, xm) >= exact_res_thresh) {
-                                already_matches_r = true;
+
+                    // Open-addressed page probing lifts the 16-slot limit per bucket:
+                    // when max_neurons_per_page >= D_BOTTLENECK (or on the final layer),
+                    // probe free pages within the layer instead of dropping transitions.
+                    const size_t per_page_cap = std::min<size_t>(max_neurons_per_page, D_BOTTLENECK);
+                    const uint32_t max_probes = (max_neurons_per_page >= D_BOTTLENECK || l + 1 == NUM_RELAY_LAYERS) ? 256U : 1U;
+                    uint32_t pid = ALLOC_NO_PAGE;
+                    for (uint32_t probe = 0; probe < max_probes; ++probe) {
+                        uint32_t cand_pid = route_single_layer_128_popcnt(l, q_bits, probe);
+                        if (!initialized_relay_pages.count(cand_pid)) {
+                            std::memset(&bank_pages[cand_pid], 0, sizeof(TernaryMLPExpertPage));
+                            initialized_relay_pages.insert(cand_pid);
+                        }
+                        size_t occupied_r = 0;
+                        bool already_matches_r = false;
+                        for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                            if ((bank_pages[cand_pid].w_down_pos[r][0] | bank_pages[cand_pid].w_down_neg[r][0]) != 0ULL) {
+                                ++occupied_r;
+                                if (ternary_popcnt_dot_512(bank_pages[cand_pid].w_down_pos[r], bank_pages[cand_pid].w_down_neg[r], xs, xm) >= exact_res_thresh) {
+                                    already_matches_r = true;
+                                }
                             }
                         }
+                        const size_t eff_cap = (probe > 0U) ? D_BOTTLENECK : per_page_cap;
+                        if (already_matches_r || occupied_r < eff_cap) {
+                            pid = cand_pid;
+                            break;
+                        }
                     }
-                    // If this expert page has reached its specialist neuron quota for this layer,
-                    // it delegates this branch to the next layer's specialist expert `E^{(l+1)}`!
-                    if (!already_matches_r && occupied_r >= max_neurons_per_page) continue;
+                    if (pid == ALLOC_NO_PAGE) continue;
 
                     int8_t y_l[D_MODEL];
                     execute_single_expert_and_get_steering(bank_pages, pid, x_l, y_l, nullptr, nullptr, nullptr);
@@ -7721,6 +8103,7 @@ int main(int argc, char** argv) {
 struct AssocFact {
     uint64_t skey[hsaa_assoc::kW];
     uint64_t rkey[hsaa_assoc::kW];
+    uint64_t okey[hsaa_assoc::kW];
     std::string subject_raw;
     std::string relation_raw;
     std::string subject_norm;
@@ -9618,12 +10001,21 @@ struct PopCountGenerativeLLM {
             sublinear_net = std::make_unique<NativeSublinearLLM>(lbank, net_vocab, 4, false, 2026);
             for (size_t tid = 0; tid < tokenizer.id_to_word.size(); ++tid) {
                 const uint64_t* sk = vocab_morph_sketch[tid].data();
+                const int rv = (tid < tok_to_role.size() && tok_to_role[tid] >= 0 &&
+                                static_cast<size_t>(tok_to_role[tid]) < vocab_morph_sketch.size())
+                    ? tok_to_role[tid]
+                    : static_cast<int>(tid);
+                const uint64_t* rsk = vocab_morph_sketch[rv].data();
                 for (int w = 0; w < WORDS_PER_VEC; ++w) {
                     sublinear_net->vocab_pos[tid * WORDS_PER_VEC + w] = sk[w];
                     sublinear_net->vocab_neg[tid * WORDS_PER_VEC + w] = ~sk[w];
                     for (int b = 0; b < 64; ++b) {
-                        sublinear_net->embeddings[tid * D_MODEL + w * 64 + b] =
-                            ((sk[w] >> b) & 1ULL) ? 12 : -12;
+                        int8_t sgn = ((sk[w] >> b) & 1ULL) ? 1 : -1;
+                        int8_t mag = 12;
+                        if (w < HALF_WORDS) {
+                            mag = ((rsk[w] >> b) & 1ULL) ? 12 : 11;
+                        }
+                        sublinear_net->embeddings[tid * D_MODEL + w * 64 + b] = sgn * mag;
                     }
                 }
             }
@@ -9795,15 +10187,20 @@ struct PopCountGenerativeLLM {
             const int new_v = static_cast<int>(std::max<size_t>(target_sz + 32, static_cast<size_t>(old_v + 64)));
             sublinear_net->vocab_pos.resize(static_cast<size_t>(new_v) * WORDS_PER_VEC, 0ULL);
             sublinear_net->vocab_neg.resize(static_cast<size_t>(new_v) * WORDS_PER_VEC, ~0ULL);
-            sublinear_net->embeddings.resize(static_cast<size_t>(new_v) * D_MODEL, -12);
+            sublinear_net->context_sem_bits.resize(static_cast<size_t>(new_v) * HALF_WORDS, 0ULL);
+            sublinear_net->embeddings.resize(static_cast<size_t>(new_v) * D_MODEL, -11);
             for (int tid = old_v; tid < static_cast<int>(target_sz); ++tid) {
                 const uint64_t* sk = vocab_morph_sketch[tid].data();
                 for (int w = 0; w < WORDS_PER_VEC; ++w) {
                     sublinear_net->vocab_pos[static_cast<size_t>(tid) * WORDS_PER_VEC + w] = sk[w];
                     sublinear_net->vocab_neg[static_cast<size_t>(tid) * WORDS_PER_VEC + w] = ~sk[w];
+                    if (w < HALF_WORDS) {
+                        sublinear_net->context_sem_bits[static_cast<size_t>(tid) * HALF_WORDS + w] = sk[w];
+                    }
                     for (int b = 0; b < 64; ++b) {
-                        sublinear_net->embeddings[static_cast<size_t>(tid) * D_MODEL + w * 64 + b] =
-                            ((sk[w] >> b) & 1ULL) ? 12 : -12;
+                        int8_t sgn = ((sk[w] >> b) & 1ULL) ? 1 : -1;
+                        int8_t mag = (sgn > 0) ? 12 : 11;
+                        sublinear_net->embeddings[static_cast<size_t>(tid) * D_MODEL + w * 64 + b] = sgn * mag;
                     }
                 }
             }
@@ -10100,10 +10497,33 @@ struct PopCountGenerativeLLM {
             for (size_t i = 0; i < vpos_sz; ++i) {
                 uint64_t vp = sublinear_net->vocab_pos[i];
                 sublinear_net->vocab_neg[i] = ~vp;
+                size_t tid = i / WORDS_PER_VEC;
+                size_t w = i % WORDS_PER_VEC;
+                uint64_t sem_w = vp;
+                if (w < HALF_WORDS && tid < tok_to_role.size()) {
+                    int rv = tok_to_role[tid];
+                    if (rv >= 0 && static_cast<size_t>(rv) < saved_net_vocab) {
+                        sem_w = sublinear_net->vocab_pos[static_cast<size_t>(rv) * WORDS_PER_VEC + w];
+                    }
+                }
+                if (w < HALF_WORDS) {
+                    sublinear_net->context_sem_bits[tid * HALF_WORDS + w] = sem_w;
+                }
                 int8_t* emb_row = &sublinear_net->embeddings[i * 64];
                 for (size_t b = 0; b < 64; ++b) {
-                    emb_row[b] = ((vp >> b) & 1ULL) ? 12 : -12;
+                    int8_t sgn = ((vp >> b) & 1ULL) ? 1 : -1;
+                    int8_t mag = (w < HALF_WORDS) ? (((sem_w >> b) & 1ULL) ? 12 : 11) : 12;
+                    emb_row[b] = sgn * mag;
                 }
+            }
+
+            if (!segment_records.empty()) {
+                std::vector<std::vector<int>> restored_seqs;
+                restored_seqs.reserve(segment_records.size());
+                for (const auto& rec : segment_records) {
+                    if (rec.tokens.size() >= 2) restored_seqs.push_back(rec.tokens);
+                }
+                sublinear_net->align_distributional_context_frames(restored_seqs);
             }
 
             uint32_t n_slots = 0;
@@ -10130,6 +10550,8 @@ struct PopCountGenerativeLLM {
                 }
             }
             sublinear_net->multi_scale_vsa_trained = !sublinear_net->trained_pages.empty();
+            sublinear_net->high_L_pruned = (n_slots > 100000);
+            sublinear_net->rebuild_vsa_lsh_buckets();
         }
         if (r.at != r.n) return false;
 
@@ -10182,9 +10604,53 @@ namespace {
 constexpr int32_t kAssocMinSubjectDot = 200;
 constexpr int32_t kAssocMinRelationDot = 200;
 
+uint32_t assoc_fnv1a32(const std::string& s) {
+    uint32_t h = 2166136261U;
+    for (unsigned char c : s) {
+        h ^= static_cast<uint32_t>(c);
+        h *= 16777619U;
+    }
+    return h;
+}
+
+uint32_t assoc_subj_owner_id(const std::string& sn) {
+    return 0x80000000U | (assoc_fnv1a32(sn) & 0x3FFFFFFFU);
+}
+
+uint32_t assoc_rel_owner_id(const std::string& rn) {
+    return 0xC0000000U | (assoc_fnv1a32(rn) & 0x3FFFFFFFU);
+}
+
+constexpr uint32_t kAssocJointOwnerId = 0x40000000U;
+
+void assoc_make_joint_key(const uint64_t* skey, const uint64_t* rkey, uint64_t* out_jkey) {
+    for (size_t w = 0; w < hsaa_assoc::kW; ++w) {
+        out_jkey[w] = (skey[w] & 0x5555555555555555ULL) | (rkey[w] & 0xAAAAAAAAAAAAAAAAULL);
+    }
+}
+
+void assoc_store_in_bank(PopCountBrain* brain, const AssocFact& f) {
+    if (!brain || !brain->bank_guard || !brain->bank_guard->get() || !brain->bank_guard->get()->base_ptr) {
+        return;
+    }
+    void* base = brain->bank_guard->get()->base_ptr;
+    if (!f.subject_norm.empty()) {
+        bank_store_rule(base, ALLOC_REGION_FACT, assoc_subj_owner_id(f.subject_norm), f.rkey, f.okey);
+    }
+    if (!f.relation_norm.empty()) {
+        bank_store_rule(base, ALLOC_REGION_FACT, assoc_rel_owner_id(f.relation_norm), f.skey, f.okey);
+    }
+    if (f.subject_norm.size() >= 6 && f.relation_norm.size() >= 6) {
+        uint64_t jkey[hsaa_assoc::kW];
+        assoc_make_joint_key(f.skey, f.rkey, jkey);
+        bank_store_rule(base, ALLOC_REGION_FACT, kAssocJointOwnerId, jkey, f.okey);
+    }
+}
+
 void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     const std::string sn = hsaa_assoc::normalize(subject);
     const std::string rn = hsaa_assoc::normalize(relation);
+    const std::string on = hsaa_assoc::normalize(object);
     for (AssocFact& f : brain->assoc_facts) {
         const bool exact_raw = (f.subject_raw == subject && f.relation_raw == relation);
         const bool same_norm = (!sn.empty() && !rn.empty() && f.subject_norm == sn && f.relation_norm == rn);
@@ -10199,6 +10665,8 @@ void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relatio
                 f.relation_raw = relation;
             }
             f.object = object;
+            hsaa_assoc::sketch(on.empty() ? f.object : on, f.okey);
+            assoc_store_in_bank(brain, f);
             return;
         }
     }
@@ -10210,6 +10678,8 @@ void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relatio
     f.relation_norm = rn;
     hsaa_assoc::sketch(f.subject_norm, f.skey);
     hsaa_assoc::sketch(f.relation_norm, f.rkey);
+    hsaa_assoc::sketch(on.empty() ? f.object : on, f.okey);
+    assoc_store_in_bank(brain, f);
     brain->assoc_facts.push_back(std::move(f));
 }
 
@@ -10220,6 +10690,61 @@ const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, c
     uint64_t qr[hsaa_assoc::kW];
     hsaa_assoc::sketch(sn, qs);
     hsaa_assoc::sketch(rn, qr);
+
+    // 1. Primary path: hardware-backed 4 KB VSA bank associative lookup via bank_query_rule
+    if (brain && brain->bank_guard && brain->bank_guard->get() && brain->bank_guard->get()->base_ptr) {
+        const void* base = brain->bank_guard->get()->base_ptr;
+        const AssocFact* best_bank_fact = nullptr;
+        int32_t best_bank_score = -2147483647;
+
+        auto resolve_from_val_bits = [&](const uint64_t* val_bits, int mode) {
+            for (const AssocFact& f : brain->assoc_facts) {
+                const int32_t do_sim = vsa_bipolar_dot_512(val_bits, f.okey);
+                if (do_sim < 480) continue;
+                const int32_t ds = hsaa_assoc::dot512(qs, f.skey);
+                const int32_t dr = hsaa_assoc::dot512(qr, f.rkey);
+                bool eligible = false;
+                if (mode == 0) {
+                    eligible = (sn == f.subject_norm) && (dr >= kAssocMinRelationDot);
+                } else if (mode == 1) {
+                    eligible = (rn == f.relation_norm) && (ds >= kAssocMinSubjectDot);
+                } else {
+                    eligible = (sn.size() >= 6 && rn.size() >= 6 &&
+                                f.subject_norm.size() >= 6 && f.relation_norm.size() >= 6 &&
+                                ds >= 320 && dr >= 320);
+                }
+                if (!eligible) continue;
+                const int32_t score = ds + dr + (do_sim == 512 ? 2048 : do_sim);
+                if (score > best_bank_score) {
+                    best_bank_score = score;
+                    best_bank_fact = &f;
+                }
+            }
+        };
+
+        uint64_t val_bits[WORDS_PER_VEC];
+        int32_t sim = 0;
+        uint32_t pid = ALLOC_NO_PAGE;
+        if (!sn.empty() &&
+            bank_query_rule(base, ALLOC_REGION_FACT, assoc_subj_owner_id(sn),
+                            qr, kAssocMinRelationDot, val_bits, &sim, &pid)) {
+            resolve_from_val_bits(val_bits, 0);
+        }
+        if (!rn.empty() &&
+            bank_query_rule(base, ALLOC_REGION_FACT, assoc_rel_owner_id(rn),
+                            qs, kAssocMinSubjectDot, val_bits, &sim, &pid)) {
+            resolve_from_val_bits(val_bits, 1);
+        }
+        if (sn.size() >= 6 && rn.size() >= 6) {
+            uint64_t jkey[hsaa_assoc::kW];
+            assoc_make_joint_key(qs, qr, jkey);
+            if (bank_query_rule(base, ALLOC_REGION_FACT, kAssocJointOwnerId,
+                                jkey, 320, val_bits, &sim, &pid)) {
+                resolve_from_val_bits(val_bits, 2);
+            }
+        }
+        if (best_bank_fact) return best_bank_fact;
+    }
 
     const AssocFact* best = nullptr;
     int32_t best_score = -2147483647;
@@ -10905,6 +11430,40 @@ int PopCountGenerativeLLM::generate(
                         }
                     }
                     cands.add_score(next_t, 16384LL + static_cast<int64_t>(shared_win) * 16384LL);
+                }
+            }
+            bool exact_is_ambiguous = (highest_exact_L <= 1);
+            if (!exact_is_ambiguous && highest_exact_L <= MAX_HORIZON) {
+                auto it_hi = horizon_tables[highest_exact_L].find(ctx_keys[highest_exact_L]);
+                if (it_hi != horizon_tables[highest_exact_L].end() && it_hi->second.size() > 1) {
+                    exact_is_ambiguous = true;
+                }
+            }
+            if (exact_is_ambiguous &&
+                sublinear_net && sublinear_net->multi_scale_vsa_trained &&
+                sublinear_net->bank && sublinear_net->bank->base_ptr && ctx.size() >= 2) {
+                const auto* pages = static_cast<const TernaryMLPExpertPage*>(sublinear_net->bank->base_ptr);
+                const int max_vsa_L = static_cast<int>(std::min<size_t>(ctx.size(), 4));
+                for (int L = max_vsa_L; L > highest_exact_L && L >= 2; --L) {
+                    uint64_t key_bits[WORDS_PER_VEC];
+                    sublinear_net->compute_vsa_context_key_512(&ctx[ctx.size() - static_cast<size_t>(L)], L, key_bits);
+                    uint32_t matched_pid = 0;
+                    int matched_slot = -1;
+                    int32_t soft_dot = 0;
+                    if (sublinear_net->probe_vsa_context_soft_hamming(pages, key_bits, L, &matched_pid, &matched_slot, &soft_dot)) {
+                        int32_t vsim = 0;
+                        int resolved_tok = vsa_resolve_token_popcnt(
+                            pages[matched_pid].w_up_pos[matched_slot],
+                            sublinear_net->vocab_pos.data(),
+                            static_cast<int>(std::min<size_t>(tokenizer.id_to_word.size(), static_cast<size_t>(sublinear_net->vocab_size))),
+                            &vsim
+                        );
+                        if (resolved_tok >= 0 && vsim >= 480) {
+                            int64_t soft_sc = static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(soft_dot) * 8LL;
+                            cands.max_score(resolved_tok, soft_sc, L);
+                            break;
+                        }
+                    }
                 }
             }
             if (highest_exact_L <= 1 && role_ctx.size() >= 2) {

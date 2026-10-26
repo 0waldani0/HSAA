@@ -992,21 +992,16 @@
     accumulators (4.1 -> 32.6 GB, past this host's RAM) with a ~10.6% draft
     cost rise already at 32 slots, so 16 slots stay shipped and the sweep is
     documented (`measur/sweep_slots.py`, `measur/README.md`, third section).
-  * **Still open, honestly**: `brain_query_relation` in the C-ABI reads ONLY
-    the exact-string `direct_facts` dictionary; the VSA bank's associative
-    read (`bank_query_rule`, Hamming over every page the owner owns) is
-    wired on the WRITE path only (the fact is embedded into the bank, but
-    never read back through the ABI). The token-decision path (F21) is not
-    affected -- it never touches this dictionary -- but an external LLM
-    integrating through the fact API gets no semantic generalization until
-    the query miss is routed through the associative read.
+  * **Closed in `second_brain/popcnt_brain.cpp` (VSA soft-Hamming OOV generalization, C-ABI `bank_query_rule` read path, and multi-page relational buckets)**:
+    - **Soft Hamming associative generalization on unseen contexts (OOV-contexts)**: `compute_vsa_context_key_512` now partitions the 512-bit VSA context key into isometric per-position slices (`vsa_pos_mask(L, i)`) and blends distributional context semantics (`context_sem_bits`, persisted losslessly in the magnitude parity of `embeddings[v * D_MODEL + 0..255]` so `vocab_pos`/`vocab_neg` signs and `TRAIN_STATE_VERSION = 2` binary images remain invariant). Active VSA pages are indexed into 4-band SimHash/LSH buckets (`vsa_lsh_buckets`), and on an exact `L`-gram miss (`match_threshold = 480`), `probe_vsa_context_soft_hamming` searches candidate buckets for the highest-resonance neighbor (`sem_dot >= 220` or `L - 1` exact positions with `full_dot >= 308`) before falling back to `L - 1`.
+    - **Associative C-ABI read (`bank_query_rule` wired into `brain_query_relation` and `brain_check_conflict`)**: `assoc_upsert` writes fact rules (`hash(S) ^ rotl(hash(R), 1)` -> `hash(O)`) into the 4 KB VSA bank (`ALLOC_REGION_FACT`) across subject, relation, and joint owner IDs (`bank_store_rule`), and `assoc_lookup` falls back to `bank_query_rule` whenever `direct_facts` misses, decoding the winning 512-bit target signature back to the registered entity string.
+    - **Lifting the `& 1023` / 16-rules-per-bucket ceiling**: `bank_store_rule` and `bank_query_rule` now walk the open-addressed page directory directly (`ALLOC_MAX_PAGES_PER_OWNER = 512`, up to 8,192 rules per owner), and `MultiLayerExpertRelayEngine` (`route_single_layer_128_popcnt`, `forward_expert_relay`, `train_from_reward_ste`, `train_chained_expert_relay_ste`) probes up to 256 overflow pages per bucket (`(base + probe_step * 131 + layer * 17) & 1023`) instead of halting at 16 slots on a single page.
 
 - **Where the non-LLM brain stands after the benchmark**: the reasoning machinery is sound
   (lossless multi-hop at any depth 1..8, physical ablation proof of provenance, zero-shot
-  on unseen entities) and every remaining limit is MECHANICAL, not fundamental -- the
-  answer depth was a one-line index bug (fixed), the anchor set is whatever interrogatives a
-  bootstrap corpus contains, the entity vocabulary is whatever that corpus contains, and the
-  16-rules-per-page wall needs a real page allocator instead of a `& 1023` modulo. The
+  on unseen entities) and the formerly open mechanical limits (answer depth index bug,
+  C-ABI `bank_query_rule` read path on `direct_facts` miss, and the 16-rules-per-page `& 1023`
+  wall in `MultiLayerExpertRelayEngine` / `bank_store_rule`) are now resolved. The
   benchmark above is the instrument that measures each of those independently.
 - **What the remaining ceiling needs, stated precisely**: three independent limits, all measured. (1) 20.6-28.1% of held-out targets are structurally unreachable because their output embedding was never trained -- this needs an output-side fix (untrained-token priors, or an embedding trained from distributional statistics rather than from observed occurrences). (2) The expert pages hold "this exact context -> this exact successor" values, so an unseen successor has no value to retrieve -- the fix has to make the VALUE role-conditional, which is the research direction FIX A failed to reach. (3) The output layer now ranks candidates exactly, which removes the 9.6 point loss but does not create the missing value. Only (2) is a genuine research problem; (1) and (3) are engineering.
 - **FIX B measured effect (same-domain held-out, the realistic drafter scenario)**: accuracy 19.561% -> **25.471%**, E[accepted(1)] 0.196 -> **0.255**, E[accepted(5)] ~0.21 -> **0.6585**. The conditional profile changed shape, not just level: p at draft depth 1/2/3/4/5 went from a flat ~0.13 to **0.255 / 0.538 / 0.770 / 0.824 / 0.855** -- accuracy INCREASES with depth, which is exactly the regime speculative decoding exploits (a draft that is already on-track becomes more reliable). File-disjoint accuracy moved 13.107% -> 13.512% (E[accepted(5)] 0.158 -> 0.165).

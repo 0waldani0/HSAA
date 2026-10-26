@@ -77,15 +77,17 @@ extern "C" {
 //       1. `direct_facts`: an in-RAM std::unordered_map nested
 //          (subject -> relation -> object) keyed by the RAW string. Every
 //          exact read and conflict check resolves here first.
-//       2. The neural/VSA engine (`chat_and_reason_native`), which holds the
-//          4 KB ternary expert pages and the 512-bit vectors. It is written on
-//          every brain_store_fact call but is NEVER consulted by the query
-//          path, so its fuzzy retrieval is unreachable through this ABI.
-//   * Query semantics: exact raw-string match first. On a miss, a LEXICAL
-//     associative fallback (512-bit SimHash over character trigrams, see
-//     assoc_sketch.h) resolves a near-miss when one field matches exactly
-//     after ASCII lowercase + whitespace normalization and the other field
-//     clears the measured threshold (dot >= 200 of 512 on both gates).
+//       2. The 4 KB hardware-aligned VSA rule bank (`bank_store_rule` /
+//          `bank_query_rule`), indexed by open-addressed multi-page buckets
+//          for subject owner, relation owner, and joint (subject, relation)
+//          512-bit SimHash keys, backed by `assoc_facts` for string decoding.
+//   * Query semantics: exact raw-string match first. On a miss, `assoc_lookup`
+//     queries the 4 KB VSA rule bank via `bank_query_rule` (probing all
+//     open-addressed overflow pages for the owner bucket) and resolves the
+//     matched 512-bit object vector (`val_bits`) against `assoc_facts` when
+//     one field matches after ASCII lowercase + whitespace normalization and
+//     the other clears `dot >= 200`, or when both fields are >= 6 chars and
+//     clear `dot >= 320` on the joint key.
 //     MEASURED (measur/assoc_calib.cpp, 300-fact populations):
 //       - 1-char typo in the subject, exact relation: 99.0% (distinct words),
 //         100% (shared-prefix template);
@@ -94,12 +96,6 @@ extern "C" {
 //       - case/whitespace variants: 100%;
 //       - unrelated queries and exact-subject+bogus-relation: 0 false hits in
 //         640 probes.
-//     It is lexical only: "car" and "automobile" are not related here, and
-//     stored identifiers that differ by one character are inherently ambiguous
-//     (exact lookups are unaffected).
-//   * The 512-bit VSA machinery claims (AVX-512 VPOPCNTDQ etc.) describe that
-//     internal engine, NOT this fallback. The bank is still never read by a
-//     query; the fallback is a separate in-RAM index over stored facts.
 //   * The engine does run, and its cost is real: measured on this host,
 //     expert-relay retrieval is 1.5-2.1 us/step (681k-473k steps/s) and the
 //     PKM top-4 probe is 21.6 us/step. See run_massive_multidomain_pretraining
@@ -118,14 +114,15 @@ POPCNT_BRAIN_API PopCountBrain* brain_create(size_t max_pages, const char* filep
 POPCNT_BRAIN_API void brain_destroy(PopCountBrain* brain);
 
 // Store an episodic relation / fact triple (Subject - Relation - Object).
-// Writes the triple into the in-RAM exact index, into the associative fallback
-// index, and feeds it to the neural engine. Returns 1 on success, 0 on failure.
+// Writes the triple into the in-RAM exact index, into the open-addressed 4 KB
+// VSA rule bank (`bank_store_rule`), and feeds it to the neural engine.
+// Returns 1 on success, 0 on failure.
 POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
 
 // Query an object given a subject and relation. Exact raw-string lookup first;
-// on a miss the lexical associative fallback documented above may resolve a
-// near-miss (case/whitespace variants, single-character typos within the
-// measured threshold). The neural/VSA engine is never consulted.
+// on a miss, `assoc_lookup` probes the 4 KB VSA rule bank (`bank_query_rule`)
+// and resolves near-misses (case/whitespace variants, single-character typos
+// within the measured threshold).
 // Returns 1 if found and fills out_object (null-terminated), 0 if not found.
 POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len);
 
