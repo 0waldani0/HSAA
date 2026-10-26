@@ -11725,6 +11725,7 @@ int PopCountGenerativeLLM::generate(
     std::vector<int64_t> discourse_reach(tokenizer.id_to_word.size(), 0LL);
     if (!segment_records.empty() && !prompt_toks.empty()) {
         const size_t V_cur = tokenizer.id_to_word.size();
+        std::unordered_set<int> prompt_tok_set(prompt_toks.begin(), prompt_toks.end());
         std::vector<int64_t> seg_act(segment_records.size(), 0LL);
         const size_t tail_cutoff = (prompt_toks.size() >= 3) ? (prompt_toks.size() - 2) : prompt_toks.size();
         for (size_t pi = 0; pi < prompt_toks.size(); ++pi) {
@@ -11738,12 +11739,13 @@ int PopCountGenerativeLLM::generate(
                 }
             }
         }
-        for (int hop = 0; hop < 2; ++hop) {
+        for (int hop = 0; hop < 3; ++hop) {
             std::vector<int64_t> next_seg_act = seg_act;
             for (size_t si = 0; si < segment_records.size(); ++si) {
                 if (seg_act[si] <= 0) continue;
                 for (int bridge_tok : segment_records[si].unique_content_tokens) {
                     if (bridge_tok < 0 || static_cast<size_t>(bridge_tok) >= tok_to_segments.size()) continue;
+                    if (prompt_tok_set.count(bridge_tok)) continue; // Query tokens do not bridge intermediate reasoning hops
                     // Only bridge across specific entity/concept tokens (df <= 4)
                     uint32_t df = (static_cast<size_t>(bridge_tok) < tok_doc_freq.size()) ? tok_doc_freq[bridge_tok] : 99U;
                     if (df < 2 || df > 4) continue;
@@ -11751,7 +11753,7 @@ int PopCountGenerativeLLM::generate(
                     int64_t prop = (seg_act[si] * idf_w) / (2LL * static_cast<int64_t>(df));
                     for (int sj : tok_to_segments[bridge_tok]) {
                         if (static_cast<size_t>(sj) != si) {
-                            next_seg_act[sj] = std::min<int64_t>(32768LL, next_seg_act[sj] + prop);
+                            next_seg_act[sj] = std::min<int64_t>(131072LL, next_seg_act[sj] + prop);
                         }
                     }
                 }
@@ -12250,7 +12252,7 @@ int PopCountGenerativeLLM::generate(
                 for (size_t ci = 0; ci < cands.size(); ++ci) {
                     int ct = cands.toks[ci];
                     if (ct >= 0 && static_cast<size_t>(ct) < discourse_reach.size() && discourse_reach[ct] > 0) {
-                        cands.scores[ci] += std::min<int64_t>(48000LL, discourse_reach[ct] * 16LL);
+                        cands.scores[ci] += (discourse_reach[ct] * 12LL);
                     }
                 }
             }
