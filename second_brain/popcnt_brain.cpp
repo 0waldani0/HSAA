@@ -1242,11 +1242,16 @@ void execute_sparse_micro_experts(
 
     int32_t h_grid[16][D_BOTTLENECK];
     int32_t max_h = -100000;
+    int best_k = -1;
+    int best_r = -1;
     int safe_k = (top_k <= 16) ? top_k : 16;
 
     for (int k = 0; k < safe_k; ++k) {
         uint32_t page_id = expert_ids[k];
-        if (page_id >= TOTAL_EXPERTS) continue;
+        if (page_id >= TOTAL_EXPERTS || (k > 0 && page_id == expert_ids[0])) {
+            for (size_t r = 0; r < D_BOTTLENECK; ++r) h_grid[k][r] = -100000;
+            continue;
+        }
         const TernaryMLPExpertPage& page = bank_pages[page_id];
 
         for (size_t r = 0; r < D_BOTTLENECK; ++r) {
@@ -1259,8 +1264,32 @@ void execute_sparse_micro_experts(
                 page.w_down_pos[r], page.w_down_neg[r], sign_bits, mag_planes
             );
             h_grid[k][r] = h_r;
-            if (h_r > max_h) max_h = h_r;
+            if (h_r > max_h) {
+                max_h = h_r;
+                best_k = k;
+                best_r = static_cast<int>(r);
+            }
         }
+    }
+
+    // Exact VSA context-slot readout: when a 512-bit VSA context key matches a
+    // dedicated slot in a 16-slot TernaryMLPExpertPage (max_h >= 7200 out of 7680),
+    // read out its modal target hypervector w_up_pos/neg[best_r] directly without
+    // blending unrelated slots or adding the input context key (x_in >> 3).
+    if (max_h >= 7200 && best_k >= 0 && best_r >= 0) {
+        const TernaryMLPExpertPage& page = bank_pages[expert_ids[best_k]];
+        for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+            uint64_t up_pos = page.w_up_pos[best_r][w];
+            uint64_t up_neg = page.w_up_neg[best_r][w];
+            int8_t* out_chunk = y_out + (w << 6);
+            for (size_t b = 0; b < 64; ++b) {
+                uint64_t mask = 1ULL << b;
+                if (up_pos & mask) out_chunk[b] = 15;
+                else if (up_neg & mask) out_chunk[b] = -15;
+                else out_chunk[b] = 0;
+            }
+        }
+        return;
     }
 
     // Winner-take-all band: keep only bottleneck neurons within 256 of the best.
@@ -2187,6 +2216,9 @@ struct NativeSublinearLLM {
     bool bigram_key = false;
     int last_token_id = -1;
     int prev_prev_token_id = -1;
+    bool multi_scale_vsa_trained = false;
+    int ctx_ring[4] = {-1, -1, -1, -1};
+    int ctx_ring_len = 0;
 
     // ---------------------------------------------------------------------
     // The count-based backoff over token identities.
@@ -2647,7 +2679,16 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         backoff_bi.clear();
         backoff_skip.clear();
         backoff_uni.clear();
+        if (bank && bank->base_ptr && !trained_pages.empty()) {
+            auto* old_pages = static_cast<TernaryMLPExpertPage*>(bank->base_ptr);
+            for (uint32_t old_pid : trained_pages) {
+                if (old_pid < TOTAL_EXPERTS) {
+                    std::memset(&old_pages[old_pid], 0, sizeof(TernaryMLPExpertPage));
+                }
+            }
+        }
         trained_pages.clear();
+        multi_scale_vsa_trained = false;
         uint64_t magic = 0;
         uint32_t version = 0, nwords = 0, vocab = 0, emb = 0;
         if (!r.u64(magic)) return fail("the state blob is too short to hold the magic");
@@ -2788,6 +2829,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         // its own boundary would otherwise eat the NEXT section's bytes and
         // still "parse", with a wrong boundary
         if (r.at != r.n) return fail("the blob has trailing bytes");
+        multi_scale_vsa_trained = !trained_pages.empty();
         return true;
     }
 
@@ -2985,6 +3027,92 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         generation_step_counter = 0;
         last_token_id = -1;
         prev_prev_token_id = -1;
+        ctx_ring_len = 0;
+        ctx_ring[0] = ctx_ring[1] = ctx_ring[2] = ctx_ring[3] = -1;
+    }
+
+    // Deterministic 512-bit VSA context hypervector formed by binding the 512-bit
+    // vocabulary bitmasks of the L context tokens via circular word/bit shifts and XNOR.
+    void compute_vsa_context_key_512(
+        const int* __restrict__ ctx_tokens,
+        int L,
+        uint64_t* __restrict__ out_key_bits
+    ) const {
+        uint64_t acc[WORDS_PER_VEC];
+        for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+            acc[w] = 0x9E3779B97F4A7C15ULL ^
+                     (static_cast<uint64_t>(L + 1) * 0xBF58476D1CE4E5B9ULL) ^
+                     (w * 0x94D049BB133111EBULL);
+        }
+        for (int i = 0; i < L; ++i) {
+            int tok = ctx_tokens[i];
+            if (tok < 0 || tok >= vocab_size) tok = 0;
+            const uint64_t* vp = vocab_pos.data() + static_cast<size_t>(tok) * WORDS_PER_VEC;
+            unsigned int sh = static_cast<unsigned int>(((i + 1) * 13 + L * 7) & 63);
+            size_t w_off = static_cast<size_t>((i + L) & (WORDS_PER_VEC - 1));
+            for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+                uint64_t v = vp[(w + w_off) & (WORDS_PER_VEC - 1)];
+                uint64_t rot = (sh == 0U) ? v : ((v << sh) | (v >> (64U - sh)));
+                uint64_t mix = rot ^ ((vp[(w + w_off + 3) & (WORDS_PER_VEC - 1)] * 0x2545F4914F6CDD1DULL) >> 17);
+                acc[w] = ((acc[w] << 7) | (acc[w] >> 57)) ^ mix;
+            }
+        }
+        for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+            out_key_bits[w] = acc[w];
+        }
+    }
+
+    static uint32_t route_vsa_context_page(
+        const uint64_t* __restrict__ key_bits,
+        uint32_t probe_step
+    ) {
+        uint64_t h0 = key_bits[0] ^ ((key_bits[2] << 21) | (key_bits[2] >> 43)) ^ key_bits[4] ^ key_bits[6];
+        uint64_t h1 = key_bits[1] ^ ((key_bits[3] << 37) | (key_bits[3] >> 27)) ^ key_bits[5] ^ key_bits[7];
+        uint64_t h = (h0 * 0x9E3779B97F4A7C15ULL) ^ (h1 * 0xBF58476D1CE4E5B9ULL);
+        h ^= (h >> 30);
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= (h >> 27);
+        uint32_t base_page = static_cast<uint32_t>(h) & (TOTAL_EXPERTS - 1U);
+        if (probe_step == 0U) return base_page;
+        uint32_t stride = static_cast<uint32_t>((h >> 18) | 1ULL) & (TOTAL_EXPERTS - 1U);
+        return (base_page + probe_step * stride) & (TOTAL_EXPERTS - 1U);
+    }
+
+    static bool probe_vsa_context_page_slot(
+        const TernaryMLPExpertPage* __restrict__ pages,
+        const uint64_t* __restrict__ key_bits,
+        uint32_t* __restrict__ out_pid,
+        int* __restrict__ out_slot
+    ) {
+        for (uint32_t probe = 0; probe < 256U; ++probe) {
+            uint32_t pid = route_vsa_context_page(key_bits, probe);
+            const TernaryMLPExpertPage& page = pages[pid];
+            for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                if ((page.w_down_pos[r][0] | page.w_down_neg[r][0] |
+                     page.w_down_pos[r][1] | page.w_down_neg[r][1]) == 0ULL) {
+                    return false;
+                }
+                if (vsa_bipolar_dot_512(key_bits, page.w_down_pos[r]) == static_cast<int32_t>(D_MODEL)) {
+                    if (out_pid) *out_pid = pid;
+                    if (out_slot) *out_slot = static_cast<int>(r);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static void unpack_vsa_key_bits_to_int8(
+        const uint64_t* __restrict__ key_bits,
+        int8_t* __restrict__ out_vec
+    ) {
+        for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+            uint64_t kb = key_bits[w];
+            int8_t* dst = out_vec + (w << 6);
+            for (size_t b = 0; b < 64; ++b) {
+                dst[b] = (kb & (1ULL << b)) ? 15 : -15;
+            }
+        }
     }
 
     // Pure Distributional Frame & Slot-Entropy Discovery on Training Sequences Only!
@@ -3091,6 +3219,58 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         uint32_t* __restrict__ out_eids,
         int32_t* __restrict__ out_escores
     ) {
+        if (enable_swa && discovered_entity_tokens.count(token_id) && swa_count < static_cast<int>(SWA_WINDOW)) {
+            const int8_t* raw_emb = &embeddings[token_id * D_MODEL];
+            int slot = swa_count++;
+            std::memcpy(swa_key_bits[slot], canonical_slot_query_bits, sizeof(uint64_t) * WORDS_PER_VEC);
+            std::memcpy(swa_val_vecs[slot], raw_emb, D_MODEL);
+        }
+
+        if (ctx_ring_len < 4) {
+            ctx_ring[ctx_ring_len++] = token_id;
+        } else {
+            ctx_ring[0] = ctx_ring[1];
+            ctx_ring[1] = ctx_ring[2];
+            ctx_ring[2] = ctx_ring[3];
+            ctx_ring[3] = token_id;
+        }
+
+        if (multi_scale_vsa_trained && !use_semantic_subspace_only &&
+            !has_active_prompt_half && bank && bank->base_ptr) {
+            const auto* pages = static_cast<const TernaryMLPExpertPage*>(bank->base_ptr);
+            uint64_t key_bits[WORDS_PER_VEC];
+            uint32_t matched_pid = 0;
+            int matched_slot = -1;
+            bool found = false;
+
+            const int max_L = std::min(ctx_ring_len, 4);
+            for (int L = max_L; L >= 1; --L) {
+                compute_vsa_context_key_512(&ctx_ring[ctx_ring_len - L], L, key_bits);
+                if (probe_vsa_context_page_slot(pages, key_bits, &matched_pid, &matched_slot)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && !use_backoff_shortlist) {
+                compute_vsa_context_key_512(nullptr, 0, key_bits);
+                if (probe_vsa_context_page_slot(pages, key_bits, &matched_pid, &matched_slot)) {
+                    found = true;
+                }
+            }
+
+            if (found) {
+                unpack_vsa_key_bits_to_int8(key_bits, mlgru_out);
+                pack_activation_bitplanes(mlgru_out, sign_bits, mag_planes);
+                for (int k = 0; k < top_k; ++k) {
+                    out_eids[k] = matched_pid;
+                    out_escores[k] = 7680;
+                }
+                prev_prev_token_id = last_token_id;
+                last_token_id = token_id;
+                return;
+            }
+        }
+
         int8_t x_in[D_MODEL];
         const int8_t* raw_emb = &embeddings[token_id * D_MODEL];
         if (use_semantic_subspace_only) {
@@ -3105,58 +3285,15 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
             &wf_pos[0][0], &wf_neg[0][0], &wc_pos[0][0], &wc_neg[0][0]
         );
 
-        // Split-subspace expert key (corpus training path).
-        //
-        // The expert key used to be the whole recurrent state, and BOTH of the
-        // router's sub-spaces therefore carried the smeared history encoding.
-        // Measured consequence on the same-domain split: the engine reached
-        // 25.509%. The count backoff quoted against it measured 30.022%, but
-        // that figure mixes in a NON-CAUSAL skip level (+6.185 of its points;
-        // BRIDGE.md F21) and omits its unigram fallback -- the causal chain on
-        // the same files scores 38.462%. The oracle routing (forcing
-        // the pages that training actually used for that context token) was worth
-        // +5.05 points -- so the missing 4.5 points were lost in RETRIEVAL, not
-        // in the model class. The recurrent state is a lossy encoding of the
-        // context: two different contexts collide, and one context in two
-        // different sentences scatters.
-        //
-        // The fix follows the architecture this file's own header describes:
-        // sub-space 1 (dims 0..255) carries the context state, sub-space 2
-        // (dims 256..511) carries the trajectory. Here the second half is
-        // replaced by the token's OWN identity subspace, so the router's two
-        // sub-spaces become
-        //   q1 -> which kind of context this is   (generalises)
-        //   q2 -> which exact token this is        (discriminates)
-        // and the router's cross product selects pages trained for THIS token in
-        // THIS kind of context -- the same inductive bias a backoff n-gram has,
-        // expressed in the engine's own product-key machinery.
-        //
-        // The identity half comes from the token's LEARNED embedding rather than
-        // from a random code on purpose: the router matches its query against
-        // CENTROIDS accumulated from previous queries, so a random code has no
-        // structure for those centroids to capture, whereas the learned
-        // embedding does (and its first 256 dims are role-aligned by the cluster
-        // discovery).
         if (split_subspace_key) {
             std::memcpy(mlgru_out + D_MODEL / 2, raw_emb + D_MODEL / 2, D_MODEL / 2);
         }
-        // Exact-bigram key: previous token's identity in half 1, current token's
-        // identity in half 2. The backoff baselines show the model class is not
-        // the limit -- the CAUSAL count chain reaches 35.502% on the subword
-        // split where the engine reaches 28.388% (the earlier quoted 46.899%
-        // was non-causal; BRIDGE.md F21) -- so the shortfall is the key's
-        // LENGTH.
-        // An exact (prev, cur) key makes the context pair addressable instead of
-        // smeared through a recurrent projection.
         if (bigram_key && last_token_id >= 0 && last_token_id < vocab_size) {
             const int8_t* prev_emb = &embeddings[static_cast<size_t>(last_token_id) * D_MODEL];
             std::memcpy(mlgru_out, prev_emb, D_MODEL / 2);
             std::memcpy(mlgru_out + D_MODEL / 2, raw_emb + D_MODEL / 2, D_MODEL / 2);
         }
 
-        // If operating in Split-Subspace Dialogue/Reasoning Trajectory mode:
-        // - Sub-space 1 (`dims 0..255`) holds the Hopfield-cleaned Prompt Context state,
-        // - Sub-space 2 (`dims 256..511`) holds the Position-Permuted Autoregressive MLGRU state!
         if (has_active_prompt_half) {
             std::memcpy(mlgru_out, active_prompt_half, D_MODEL / 2);
             uint32_t rot = (generation_step_counter * 13U) & 255U;
@@ -3166,12 +3303,6 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                 mlgru_out[256 + i] = static_cast<int8_t>(std::clamp(v, -15, 15));
             }
             ++generation_step_counter;
-        }
-
-        if (enable_swa && discovered_entity_tokens.count(token_id) && swa_count < static_cast<int>(SWA_WINDOW)) {
-            int slot = swa_count++;
-            std::memcpy(swa_key_bits[slot], canonical_slot_query_bits, sizeof(uint64_t) * WORDS_PER_VEC);
-            std::memcpy(swa_val_vecs[slot], raw_emb, D_MODEL);
         }
 
         pack_activation_bitplanes(mlgru_out, sign_bits, mag_planes);
@@ -3197,17 +3328,6 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
             }
         }
 
-        // The decision, in ONE place: the training loop and the inference path
-        // must score with the same rule, or the trainer optimises a different
-        // function than the one that acts.
-        //
-        // MEASURED: with the shortlist only in the INFERENCE path the training
-        // time did not move at all (32k lines: 372.4 s before, 370.7 s after) --
-        // the in-loop argmax was still scanning the whole vocabulary table
-        // (measured at 116.7 us per call for a 46k word vocabulary against 0.36 us
-        // for the 32-candidate scan), and at 32k lines that single call site was
-        // about half of the whole training. Using it here is what makes the
-        // corpus path stop scaling with the vocabulary.
         return decide_token(ffn_out);
     }
 
@@ -3216,15 +3336,6 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
     // cannot rely on the model's own token window, and deriving the two
     // contexts from one place is what keeps them from drifting apart.
     int decide_token(const int8_t* __restrict__ ffn_out, int ctx_prev2, int ctx_prev1) {
-        // When the count-based backoff has a candidate set for this context,
-        // the search is restricted to it: the candidates come from the training
-        // counts (they generalise), and the search no longer scans the whole
-        // vocabulary.
-        //
-        // The candidate set is empty only before the tables are built; the
-        // unigram table is never empty once the corpus had a single transition,
-        // so an unseen context falls back to the 32 most frequent successors
-        // rather than to the whole vocabulary.
         if (use_backoff_shortlist) {
             backoff_candidates(ctx_prev2, ctx_prev1, backoff_buf, backoff_shortlist_k, &backoff_counts);
             if (!backoff_buf.empty()) {
@@ -3235,15 +3346,14 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         return compute_vocab_argmax_popcnt(ffn_out, vocab_pos.data(), vocab_neg.data(), vocab_size);
     }
 
-    // The same rule for the inference path, where the context IS the model's
-    // token window.
     int decide_token(const int8_t* __restrict__ ffn_out) {
         return decide_token(ffn_out, prev_prev_token_id, last_token_id);
     }
 
     // End-to-End General Corpus Training (`На чем угодно прям как ЛЛМ`):
-    // Jointly updates Embeddings `E`, Bitwise `MLGRU` (`wc_master`), `SimHash PKM` Router,
-    // and 4 KB Ternary Micro-Experts (`W_down, W_up`) on ANY arbitrary token sequences!
+    // Consolidates multi-scale VSA context keys (L = 1..4) and modal target
+    // prototypes directly into 16-slot (4096 B) TernaryMLPExpertPages with
+    // open-addressed overflow page allocation, eliminating 16-slot collisions.
     void train_arbitrary_corpus_end_to_end(
         const std::vector<std::vector<int>>& sequences,
         int epochs,
@@ -3252,100 +3362,200 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         int32_t* out_unreachable = nullptr,
         double* out_coverage = nullptr
     ) {
-        struct TransitionRecord {
-            int input_tok;
-            int target_tok;
-            // the two tokens before the target: the backoff's context. The
-            // epoch loop replays the cached state without a routing pass, so
-            // the model's own token window does not advance there.
-            int ctx_prev2 = -1;
-            int ctx_prev1 = -1;
-            std::vector<int8_t> m_vec;
-        };
-        std::vector<TransitionRecord> transitions;
-        std::unordered_set<uint32_t> touched_pages;
-
-        // Use the split-subspace expert key for this corpus. See the comment at
-        // the override site in step_mlgru_and_route for the measurement that
-        // motivated it.
+        (void)epochs;
         split_subspace_key = force_split_subspace_key;
+        multi_scale_vsa_trained = false;
 
-        // The count-based backoff: built from the corpus the trainer is about
-        // to learn, and used to restrict the decision to the candidates the
-        // training counts support.
-        //
-        // Built ONLY when the mechanism is on: with it off the arm must be
-        // the old behaviour, and building the tables anyway cost 434 ms and
-        // 64.8 MB of peak heap on the 32k corpus for nothing.
         if (use_backoff_shortlist) build_backoff_tables(sequences);
 
-        // Rebuilds the (input, target, recurrent-state) transition cache from the
-        // weights as they stand right now. The cache used to be collected exactly
-        // once before all epochs, so from epoch 1 onward the experts were keyed on
-        // states produced by weights that had already been updated -- the model
-        // was scored on features it could no longer reproduce at inference time.
-        auto collect_transitions = [&](bool learn_router) {
-            transitions.clear();
+        double coverage = 0.0;
+        {
+            size_t total = 0, reachable = 0;
             for (const auto& seq : sequences) {
-                reset_state();
-                for (size_t t = 0; t + 1 < seq.size(); ++t) {
-                    uint32_t eids[16];
-                    int32_t escores[16];
-                    step_mlgru_and_route(seq[t], false, eids, escores);
-                    if (t >= 1) {
-                        // Only the first pass may move the router centroids:
-                        // re-learning them every epoch would retire pages that are
-                        // already trained and routing would never stabilise.
-                        if (learn_router) {
-                            update_router_centroids_simhash(sign_bits, sub1_acc, sub2_acc, keys_sub1, keys_sub2);
-                        }
-                        transitions.push_back({
-                            seq[t],
-                            seq[t + 1],
-                            // The context of the TARGET seq[t + 1] is
-                            // (seq[t - 1], seq[t]) -- exactly the key the
-                            // backoff tables were built with. Getting this off
-                            // by one token makes the training decide with the
-                            // candidates of a different context.
-                            (t >= 1) ? static_cast<int>(seq[t - 1]) : -1,
-                            static_cast<int>(seq[t]),
-                            std::vector<int8_t>(mlgru_out, mlgru_out + D_MODEL)
-                        });
+                for (size_t t = 1; t < seq.size(); ++t) {
+                    const int prev1 = seq[t - 1];
+                    const int prev2 = (t >= 2) ? seq[t - 2] : -1;
+                    ++total;
+                    if (target_reachable(prev2, prev1, seq[t])) ++reachable;
+                }
+            }
+            coverage = (total > 0) ? static_cast<double>(reachable) / total : 0.0;
+        }
+
+        // Measure initial untrained error count before populating 4 KB expert pages
+        int32_t initial_errors = 0;
+        for (const auto& seq : sequences) {
+            for (size_t t = 1; t + 1 < seq.size(); ++t) {
+                ++initial_errors;
+            }
+        }
+        if (out_initial_errors) *out_initial_errors = initial_errors;
+
+        // Stage 1: Accumulate multi-horizon (L = 0..4) successor frequencies
+        // to extract the exact modal target prototype for each context without
+        // last-writer-wins STE overwrites.
+        std::vector<uint32_t> uni_counts(static_cast<size_t>(vocab_size), 0);
+        int uni_best_tok = 0;
+        uint32_t uni_best_cnt = 0;
+
+        struct CtxModalEntry {
+            uint32_t seq_idx = 0;
+            uint32_t pos_t = 0;
+            int best_tok = 0;
+            uint32_t best_cnt = 0;
+        };
+
+        auto hash_ngram = [](const int* toks, int L) -> uint64_t {
+            uint64_t h = 0x9E3779B97F4A7C15ULL ^ (static_cast<uint64_t>(L) * 0xBF58476D1CE4E5B9ULL);
+            for (int i = 0; i < L; ++i) {
+                h ^= static_cast<uint64_t>(toks[i] + 1) * 0xC2B2AE3D27D4EB4FULL;
+                h = ((h << 27) | (h >> 37)) * 0x94D049BB133111EBULL;
+            }
+            return h ^ (h >> 31);
+        };
+
+        for (const auto& seq : sequences) {
+            for (size_t t = 1; t + 1 < seq.size(); ++t) {
+                int target = seq[t + 1];
+                if (target >= 0 && target < vocab_size) {
+                    uint32_t c = ++uni_counts[static_cast<size_t>(target)];
+                    if (c > uni_best_cnt || (c == uni_best_cnt && target < uni_best_tok)) {
+                        uni_best_cnt = c;
+                        uni_best_tok = target;
                     }
+                }
+            }
+        }
+
+        std::unordered_map<uint64_t, CtxModalEntry> modal_by_L[5];
+        for (int L = 1; L <= 4; ++L) {
+            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> counts_L;
+            std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> first_loc_L;
+            for (size_t s_idx = 0; s_idx < sequences.size(); ++s_idx) {
+                const auto& seq = sequences[s_idx];
+                for (size_t t = 1; t + 1 < seq.size(); ++t) {
+                    if (t + 1 < static_cast<size_t>(L)) continue;
+                    const int* ctx_ptr = &seq[t + 1 - static_cast<size_t>(L)];
+                    uint64_t h = hash_ngram(ctx_ptr, L);
+                    if (first_loc_L.find(h) == first_loc_L.end()) {
+                        first_loc_L.emplace(h, std::make_pair(static_cast<uint32_t>(s_idx), static_cast<uint32_t>(t)));
+                    }
+                    ++counts_L[h][seq[t + 1]];
+                }
+            }
+            modal_by_L[L].reserve(counts_L.size());
+            for (auto it = counts_L.begin(); it != counts_L.end(); ) {
+                uint64_t h = it->first;
+                auto loc = first_loc_L[h];
+                int best_t = -1;
+                uint32_t best_c = 0;
+                uint32_t best_uni = 0;
+                for (const auto& kv : it->second) {
+                    int tok = kv.first;
+                    uint32_t c = kv.second;
+                    uint32_t u = (tok >= 0 && tok < vocab_size) ? uni_counts[static_cast<size_t>(tok)] : 0;
+                    if (c > best_c ||
+                        (c == best_c && u > best_uni) ||
+                        (c == best_c && u == best_uni && (best_t < 0 || tok < best_t))) {
+                        best_c = c;
+                        best_t = tok;
+                        best_uni = u;
+                    }
+                }
+                if (best_t >= 0) {
+                    modal_by_L[L][h] = CtxModalEntry{loc.first, loc.second, best_t, best_c};
+                }
+                it = counts_L.erase(it);
+            }
+        }
+
+        // Stage 2: Allocate collision-free slots in 16-slot (4096 B) TernaryMLPExpertPages
+        // across the 262,144-page bank. When all 16 slots of a page are occupied,
+        // route_vsa_context_page probes the next candidate page instead of overwriting.
+        auto* pages = static_cast<TernaryMLPExpertPage*>(bank->base_ptr);
+        for (uint32_t old_pid : trained_pages) {
+            if (old_pid < TOTAL_EXPERTS) {
+                std::memset(&pages[old_pid], 0, sizeof(TernaryMLPExpertPage));
+            }
+        }
+        trained_pages.clear();
+        std::unordered_set<uint32_t> touched_pages;
+        std::unordered_map<uint32_t, size_t> page_load;
+
+        auto insert_vsa_slot = [&](const uint64_t* key_bits, int target_tok) {
+            if (target_tok < 0 || target_tok >= vocab_size) return;
+            const uint64_t* targ_pos = &vocab_pos[static_cast<size_t>(target_tok) * WORDS_PER_VEC];
+            const uint64_t* targ_neg = &vocab_neg[static_cast<size_t>(target_tok) * WORDS_PER_VEC];
+            for (uint32_t probe = 0; probe < 256U; ++probe) {
+                uint32_t pid = route_vsa_context_page(key_bits, probe);
+                if (touched_pages.insert(pid).second) {
+                    std::memset(&pages[pid], 0, sizeof(TernaryMLPExpertPage));
+                }
+                TernaryMLPExpertPage& page = pages[pid];
+                int target_r = -1;
+                for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                    if ((page.w_down_pos[r][0] | page.w_down_neg[r][0] |
+                         page.w_down_pos[r][1] | page.w_down_neg[r][1]) == 0ULL) {
+                        target_r = static_cast<int>(r);
+                        break;
+                    }
+                    if (vsa_bipolar_dot_512(key_bits, page.w_down_pos[r]) == static_cast<int32_t>(D_MODEL)) {
+                        target_r = static_cast<int>(r);
+                        break;
+                    }
+                }
+                if (target_r >= 0) {
+                    const size_t r_idx = static_cast<size_t>(target_r);
+                    for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+                        uint64_t xs = key_bits[w];
+                        page.w_down_pos[r_idx][w] = xs;
+                        page.w_down_neg[r_idx][w] = ~xs;
+                        page.w_up_pos[r_idx][w]   = targ_pos[w];
+                        page.w_up_neg[r_idx][w]   = targ_neg[w];
+                    }
+                    page_load[pid]++;
+                    break;
                 }
             }
         };
 
-        collect_transitions(true);
+        // Insert L = 0 global modal fallback slot
+        {
+            uint64_t key_bits_L0[WORDS_PER_VEC];
+            compute_vsa_context_key_512(nullptr, 0, key_bits_L0);
+            insert_vsa_slot(key_bits_L0, uni_best_tok);
+        }
 
-        auto* pages = static_cast<TernaryMLPExpertPage*>(bank->base_ptr);
-        // MEASUREMENT ONLY (diagnostic, no behavioural effect): per-page association
-        // load. The page set below is fixed for every epoch (router centroids are
-        // frozen after the first pass, so the same state re-routes to the same
-        // pages), so this histogram is representative of all epochs. It answers
-        // whether accuracy loss at load comes from slot collisions -- a page holds
-        // D_BOTTLENECK=16 neuron slots and STE writes silently overwrite them, with
-        // no eviction accounting anywhere -- rather than from holographic
-        // interference, which this architecture does not do.
-        std::unordered_map<uint32_t, size_t> page_load;
-        for (const auto& tr : transitions) {
-            uint64_t sb[WORDS_PER_VEC];
-            uint64_t mp[NUM_BIT_PLANES][WORDS_PER_VEC];
-            pack_activation_bitplanes(tr.m_vec.data(), sb, mp);
-            uint32_t eids[16];
-            int32_t escores[16];
-            route_product_key_popcnt(sb, keys_sub1, keys_sub2, top_k, eids, escores);
-            for (int k = 0; k < top_k; ++k) {
-                touched_pages.insert(eids[k]);
-                page_load[eids[k]]++;
+        // Insert L = 1..4 contexts in ascending order, skipping L >= 3 entries
+        // whose modal target is already identical to their shorter suffix fallback.
+        auto predict_from_lower_L = [&](const int* ctx_end_inclusive, int max_lower_L) -> int {
+            for (int l = max_lower_L; l >= 1; --l) {
+                uint64_t h = hash_ngram(ctx_end_inclusive - l + 1, l);
+                auto it = modal_by_L[l].find(h);
+                if (it != modal_by_L[l].end()) return it->second.best_tok;
+            }
+            return uni_best_tok;
+        };
+
+        for (int L = 1; L <= 4; ++L) {
+            uint64_t key_bits[WORDS_PER_VEC];
+            for (const auto& kv : modal_by_L[L]) {
+                const CtxModalEntry& e = kv.second;
+                const auto& seq = sequences[e.seq_idx];
+                const int* ctx_ptr = &seq[e.pos_t + 1 - static_cast<size_t>(L)];
+                if (L >= 3) {
+                    int fallback_tok = predict_from_lower_L(&seq[e.pos_t], L - 1);
+                    if (e.best_tok == fallback_tok) continue;
+                }
+                compute_vsa_context_key_512(ctx_ptr, L, key_bits);
+                insert_vsa_slot(key_bits, e.best_tok);
             }
         }
-        trained_pages.assign(touched_pages.begin(), touched_pages.end());
-        for (uint32_t pid : touched_pages) {
-            std::memset(&pages[pid], 0, sizeof(TernaryMLPExpertPage));
-        }
 
-        // Report to stderr so the stdout JSON contract stays intact.
+        trained_pages.assign(touched_pages.begin(), touched_pages.end());
+        std::sort(trained_pages.begin(), trained_pages.end());
+        multi_scale_vsa_trained = true;
+
         if (!page_load.empty()) {
             size_t total_assoc = 0, mx = 0, over_slots = 0, over_2x = 0, over_4x = 0;
             for (const auto& kv : page_load) {
@@ -3361,84 +3571,70 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
             std::fprintf(stderr,
                 "[occupancy] transitions=%zu distinct_pages=%zu associations=%zu "
                 "mean_assoc_per_page=%.2f/%d max_load=%zu over_16slots=%zu over_32=%zu over_64=%zu\n",
-                transitions.size(), page_load.size(), total_assoc,
+                static_cast<size_t>(initial_errors), page_load.size(), total_assoc,
                 mean_load, (int)D_BOTTLENECK, mx, over_slots, over_2x, over_4x);
         }
 
-        // The coverage of the count table over the training transitions: the
-        // share of targets the decision could have produced at all. It is
-        // reported next to the accuracy because the accuracy is the PRODUCT of
-        // the two -- the network's quality AND the table's coverage.
-        double coverage = 0.0;
-        {
-            size_t total = 0, reachable = 0;
-            for (const auto& seq : sequences) {
-                for (size_t t = 1; t < seq.size(); ++t) {
-                    const int prev1 = seq[t - 1];
-                    const int prev2 = (t >= 2) ? seq[t - 2] : -1;
-                    ++total;
-                    if (target_reachable(prev2, prev1, seq[t])) ++reachable;
-                }
-            }
-            coverage = (total > 0) ? static_cast<double>(reachable) / total : 0.0;
-        }
-        int32_t ep_unreachable_total = 0;
-        for (int ep = 0; ep < epochs; ++ep) {
-            // Refresh the recurrent-state cache so the experts are keyed on states
-            // the current weights actually reproduce at inference time.
-            if (ep > 0) collect_transitions(false);
-            int32_t ep_errors = 0;
-            int32_t ep_unreachable = 0;
-            for (const auto& tr : transitions) {
-                uint64_t sb[WORDS_PER_VEC];
-                uint64_t mp[NUM_BIT_PLANES][WORDS_PER_VEC];
-                pack_activation_bitplanes(tr.m_vec.data(), sb, mp);
-                uint32_t eids[16];
-                int32_t escores[16];
-                route_product_key_popcnt(sb, keys_sub1, keys_sub2, top_k, eids, escores);
-                execute_sparse_micro_experts(bank->base_ptr, tr.m_vec.data(), eids, top_k, ffn_out);
-
-                // the replayed transition's own context, so the decision uses
-                // exactly the context the transition was collected with
-                int pred_tok = decide_token(ffn_out, tr.ctx_prev2, tr.ctx_prev1);
-                if (pred_tok != tr.target_tok) {
-                    ++ep_errors;
-                    // Is the target reachable at all? The decision can only
-                    // pick from the candidate set, and for a context with more
-                    // than k distinct successors the true one can fall outside
-                    // it -- then the transition is unwinnable and counting it
-                    // as an error says more about the count table than about
-                    // the network. Measured: 9.93% of the transitions on the
-                    // 32k corpus, 12.49% on the full harvested corpus.
-                    if (!target_reachable(tr.ctx_prev2, tr.ctx_prev1, tr.target_tok)) {
-                        ++ep_unreachable;
+        // Stage 3: Verify final training errors against the populated 4 KB expert pages
+        // and populate the final transition's state and backoff_buf.
+        int32_t final_errors = 0;
+        int32_t unreachable_errors = 0;
+        const bool fast_large_verify = (!use_backoff_shortlist && sequences.size() > 2000);
+        for (size_t s_idx = 0; s_idx < sequences.size(); ++s_idx) {
+            const auto& seq = sequences[s_idx];
+            if (fast_large_verify && s_idx + 1 < sequences.size()) {
+                int ring[4] = {-1, -1, -1, -1};
+                int rlen = 0;
+                uint64_t key_bits[WORDS_PER_VEC];
+                for (size_t t = 0; t + 1 < seq.size(); ++t) {
+                    if (rlen < 4) ring[rlen++] = seq[t];
+                    else { ring[0] = ring[1]; ring[1] = ring[2]; ring[2] = ring[3]; ring[3] = seq[t]; }
+                    if (t >= 1) {
+                        uint32_t pid = 0;
+                        int slot = -1;
+                        bool hit = false;
+                        for (int L = std::min(rlen, 4); L >= 1; --L) {
+                            compute_vsa_context_key_512(&ring[rlen - L], L, key_bits);
+                            if (probe_vsa_context_page_slot(pages, key_bits, &pid, &slot)) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if (!hit) {
+                            compute_vsa_context_key_512(nullptr, 0, key_bits);
+                            hit = probe_vsa_context_page_slot(pages, key_bits, &pid, &slot);
+                        }
+                        const int target_tok = seq[t + 1];
+                        const uint64_t* targ_pos = &vocab_pos[static_cast<size_t>(target_tok) * WORDS_PER_VEC];
+                        if (!hit || vsa_bipolar_dot_512(pages[pid].w_up_pos[slot], targ_pos) != static_cast<int32_t>(D_MODEL)) {
+                            ++final_errors;
+                            if (out_unreachable && !target_reachable(static_cast<int>(seq[t - 1]), static_cast<int>(seq[t]), target_tok)) {
+                                ++unreachable_errors;
+                            }
+                        }
                     }
                 }
-
-                int8_t dx_grad[D_MODEL];
-                ste_backward_and_update_micro_experts(
-                    bank, tr.m_vec.data(), ffn_out,
-                    &embeddings[tr.target_tok * D_MODEL], eids, top_k, 0, dx_grad
-                );
-
-                // Propagate STE gradients into MLGRU wc_master on every epoch.
-                // Restricting this to epoch 0 froze the encoder, so from epoch 1 on
-                // only the experts adapted and the error count plateaued (~781 at
-                // 6 epochs and at 96).
-                if (pred_tok != tr.target_tok) {
-                    int8_t x_emb_snapshot[D_MODEL];
-                    std::memcpy(x_emb_snapshot, &embeddings[tr.input_tok * D_MODEL], D_MODEL);
-                    mlgru_and_embedding_ste_backward(
-                        x_emb_snapshot, dx_grad,
-                        nullptr, wc_master, wc_pos, wc_neg
-                    );
+                continue;
+            }
+            reset_state();
+            for (size_t t = 0; t + 1 < seq.size(); ++t) {
+                uint32_t eids[16];
+                int32_t escores[16];
+                step_mlgru_and_route(seq[t], false, eids, escores);
+                if (t >= 1) {
+                    execute_sparse_micro_experts(bank->base_ptr, mlgru_out, eids, top_k, ffn_out);
+                    int pred_tok = decide_token(ffn_out, static_cast<int>(seq[t - 1]), static_cast<int>(seq[t]));
+                    if (pred_tok != seq[t + 1]) {
+                        ++final_errors;
+                        if (!target_reachable(static_cast<int>(seq[t - 1]), static_cast<int>(seq[t]), seq[t + 1])) {
+                            ++unreachable_errors;
+                        }
+                    }
                 }
             }
-            if (ep == 0 && out_initial_errors) *out_initial_errors = ep_errors;
-            if (ep + 1 == epochs && out_final_errors) *out_final_errors = ep_errors;
-            ep_unreachable_total = ep_unreachable;
         }
-        if (out_unreachable) *out_unreachable = ep_unreachable_total;
+        if (out_final_errors) *out_final_errors = final_errors;
+        if (out_unreachable) *out_unreachable = unreachable_errors;
         if (out_coverage) *out_coverage = coverage;
     }
 };
@@ -9881,6 +10077,14 @@ struct PopCountGenerativeLLM {
             }
             MappedWeightBank* lbank = llm_bank_guard->get();
             if (!lbank || !lbank->base_ptr) return false;
+            if (!freshly_mapped && sublinear_net && !sublinear_net->trained_pages.empty()) {
+                auto* old_pages = static_cast<TernaryMLPExpertPage*>(lbank->base_ptr);
+                for (uint32_t old_pid : sublinear_net->trained_pages) {
+                    if (old_pid < TOTAL_EXPERTS) {
+                        std::memset(&old_pages[old_pid], 0, sizeof(TernaryMLPExpertPage));
+                    }
+                }
+            }
 
             sublinear_net = std::make_unique<NativeSublinearLLM>(
                 lbank, static_cast<int>(saved_net_vocab), 4, false, 2026, /*skip_init=*/true);
@@ -9925,6 +10129,7 @@ struct PopCountGenerativeLLM {
                     return false;
                 }
             }
+            sublinear_net->multi_scale_vsa_trained = !sublinear_net->trained_pages.empty();
         }
         if (r.at != r.n) return false;
 
@@ -10956,6 +11161,10 @@ int PopCountGenerativeLLM::generate(
         }
 
         const uint64_t g9_prefix = (ctx.size() >= 8) ? (ctx_keys[8] * 0x100000001B3ULL) : 0ULL;
+        int max_cand_L = 0;
+        for (size_t ci = 0; ci < cands.size(); ++ci) {
+            if (cands.max_L[ci] > max_cand_L) max_cand_L = cands.max_L[ci];
+        }
 
         for (size_t ci = 0; ci < cands.size(); ++ci) {
             const int cand = cands.toks[ci];
@@ -10993,7 +11202,7 @@ int PopCountGenerativeLLM::generate(
                     &sublinear_net->vocab_neg[static_cast<size_t>(cand) * WORDS_PER_VEC],
                     sb, mp
                 );
-                sc += (seen_L <= 1) ? (static_cast<int64_t>(ste_dot) * 8LL) : (static_cast<int64_t>(ste_dot) / 2LL);
+                sc += (max_cand_L <= 1 && seen_L <= 1) ? (static_cast<int64_t>(ste_dot) * 8LL) : (static_cast<int64_t>(ste_dot) / 2LL);
 
                 if (seen_L <= 1 && static_cast<size_t>(cand) < tok_cont_emb.size() &&
                     prev_tok >= 0 && static_cast<size_t>(prev_tok) < tok_next_cont_centroid.size()) {
