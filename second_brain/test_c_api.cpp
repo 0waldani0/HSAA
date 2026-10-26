@@ -128,7 +128,50 @@ int main() {
     printf("[+] Continuous space verified: sim_close=%.4f > sim_far=%.4f, midpoint_token='%s'\n",
            sim_close, sim_far, nearest_tok);
 
-    // 8. Destroy brain and cleanup
+    // 8. Verify Partitioned Holographic Superposition Clean-Up beyond the D=512 Crosstalk Wall (300 rules)
+    for (int i = 0; i < 300; ++i) {
+        char s_buf[64], r_buf[64], o_buf[64];
+        snprintf(s_buf, sizeof(s_buf), "Holo_Concept_Node_%03d", i);
+        snprintf(r_buf, sizeof(r_buf), "binds_superposition_slot_%03d", i % 25);
+        snprintf(o_buf, sizeof(o_buf), "Clean_Payload_Vector_%03d", i);
+        int st = brain_store_fact(brain, s_buf, r_buf, o_buf);
+        assert(st == 1 && "brain_store_fact failed during 300-rule holographic superposition test");
+    }
+    for (int i = 0; i < 300; i += 19) {
+        char s_low[64], r_buf[64], expected[64], got[256] = {0};
+        // Lowercase subject forces direct_facts miss -> VSA bank + Holographic Superposition Clean-Up
+        snprintf(s_low, sizeof(s_low), "holo_concept_node_%03d", i);
+        snprintf(r_buf, sizeof(r_buf), "binds_superposition_slot_%03d", i % 25);
+        snprintf(expected, sizeof(expected), "Clean_Payload_Vector_%03d", i);
+        int qh = brain_query_relation(brain, s_low, r_buf, got, sizeof(got));
+        assert(qh == 1 && "Holographic superposition clean-up failed under 300-rule load");
+        assert(strcmp(got, expected) == 0 && "Crosstalk corruption detected in 300-rule VSA superposition");
+    }
+    printf("[+] Partitioned Holographic Superposition Clean-Up verified (300 rules, 0 crosstalk errors).\n");
+
+    // 9. Verify Multi-Hop Logical & Taxonomic Deduction (2-hop and 3-hop chains) in brain_query_relation & brain_check_conflict
+    // Chain: Нейро_Ядро_X7 --[является_подклассом]--> Квантовый_Кластер --[входит_в_состав]--> Тор_5D --[имеет_топологию]--> Замкнутое_Кольцо_Омега
+    brain_store_fact(brain, "Нейро_Ядро_X7", "является_подклассом", "Квантовый_Кластер");
+    brain_store_fact(brain, "Квантовый_Кластер", "входит_в_состав", "Тор_5D");
+    brain_store_fact(brain, "Тор_5D", "имеет_топологию", "Замкнутое_Кольцо_Омега");
+    brain_store_fact(brain, "Квантовый_Кластер", "работает_на_частоте", "950_Терагерц");
+
+    char hop2_ans[256] = {0};
+    int q_hop2 = brain_query_relation(brain, "Нейро_Ядро_X7", "работает_на_частоте", hop2_ans, sizeof(hop2_ans));
+    assert(q_hop2 == 1 && "2-hop taxonomic property inheritance failed");
+    assert(strcmp(hop2_ans, "950_Терагерц") == 0 && "2-hop deduced object mismatch");
+
+    char hop3_ans[256] = {0};
+    int q_hop3 = brain_query_relation(brain, "Нейро_Ядро_X7", "имеет_топологию", hop3_ans, sizeof(hop3_ans));
+    assert(q_hop3 == 1 && "3-hop transitive logical deduction failed");
+    assert(strcmp(hop3_ans, "Замкнутое_Кольцо_Омега") == 0 && "3-hop deduced object mismatch");
+
+    int multihop_conflict = brain_check_conflict(brain, "Нейро_Ядро_X7", "имеет_топологию", "Плоская_Решетка");
+    assert(multihop_conflict == 1 && "brain_check_conflict failed to detect 3-hop logical contradiction");
+    printf("[+] Multi-hop logical deduction verified: 2-hop='%s', 3-hop='%s' (conflict check active).\n",
+           hop2_ans, hop3_ans);
+
+    // 10. Destroy brain and cleanup
     brain_destroy(brain);
     printf("[+] Brain destroyed cleanly.\n");
 

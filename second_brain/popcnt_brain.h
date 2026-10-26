@@ -216,17 +216,26 @@ POPCNT_BRAIN_API int brain_generate(
 );
 
 // =============================================================================
-// Adapted Continuous Representation Spaces & Deep Interpolation (512-D Manifold)
+// Adapted Continuous Representation Spaces, 32-Layer Non-Linear Hierarchy &
+// Contrastive Riemannian SGD Manifold (512-D Manifold)
 //
 // Projects tokens, phrases, and multi-layer recurrent context trajectories into
 // a 512-dimensional continuous representation manifold coupled with the engine's
 // 4-bitplane INT8 + sign POPCNT hardware representation:
-//   * Fuses multi-scale morphological/subword features, RMS-normalized
-//     distributional topic co-occurrence, bidirectional syntactic frames, and
-//     role-cluster centroids into a smooth unit-hypersphere manifold S^{511}.
-//   * Performs deep multi-depth interpolation across fast lexical state,
-//     mid-depth recurrent MLGRU state, and deep 4 KB ternary micro-expert state,
-//     plus geodesic Spherical Linear Interpolation (SLERP) between representations.
+//   * 32-Layer Hierarchical Non-Linear Residual Stack (NUM_DEEP_LAYERS = 32):
+//     Layers 0..7 encode morpho-syntactic features, Layers 8..19 bind semantic
+//     roles and entities, and Layers 20..31 perform abstract multi-hop world-model
+//     composition with SwiGLU-style non-linear gating and RMSNorm.
+//   * Multi-Epoch Contrastive & Predictive Riemannian SGD in R^512 on S^{511}
+//     (SGD_MANIFOLD_EPOCHS = 6): optimizes analytical cosine-margin gradients
+//     across functional equivalence frames and diagonal transition operators.
+//   * Partitioned Holographic Superposition (HolographicSuperpositionBank, 64
+//     orthogonal cells) with Iterative Explaining-Away Clean-Up (Successive
+//     Interference Cancellation) + IDF-Whitened Zero-Mean VSA Bundling: eliminates
+//     D=512 superposition crosstalk noise (C <= D / (2 ln N)).
+//   * Multi-Hop Transitive & Taxonomic Deduction (2..3 hops): resolves chained
+//     relational and taxonomic queries in brain_query_relation, brain_check_conflict,
+//     and brain_generate via deductive closure and 3-hop discourse propagation.
 // =============================================================================
 
 // Project a UTF-8 text or code snippet into the adapted 512-dimensional unit-L2

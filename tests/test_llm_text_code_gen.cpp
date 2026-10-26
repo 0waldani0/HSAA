@@ -756,6 +756,65 @@ int main() {
 
     brain_destroy(brain_long);
 
+    // -------------------------------------------------------------------------
+    // TEST 13: 32-Layer Non-Linear Hierarchy, Contrastive Riemannian SGD Manifold,
+    //          Partitioned Holographic Superposition & Multi-Hop Logical Deduction
+    // -------------------------------------------------------------------------
+    PopCountBrain* brain_deep = brain_create(4096, "build/test_llm_deep_32layer.bin");
+    const char* deep_reasoning_corpus =
+        "Квантовый фотон переносит спиновую энергию сквозь вакуумный волновод.\n"
+        "Квантовый гравитон переносит спиновую энергию сквозь вакуумный волновод.\n"
+        "Фотон ускоряет плазменный солитон в магнитной ловушке.\n"
+        "Гравитон ускоряет плазменный солитон в магнитной ловушке.\n"
+        "Кулинарный рецепт требует свежих овощей и оливкового масла.\n"
+        "Модуль_Орион подключается к шине Квантовый_Кластер.\n"
+        "Шина Квантовый_Кластер маршрутизирует пакеты через Тор_5D.\n"
+        "Топология Тор_5D гарантирует задержку Субнаносекундный_Отклик.\n"
+        "Топология Плоский_Меш гарантирует задержку Миллисекундный_Отклик.\n";
+
+    BrainTrainStats deep_stats{};
+    int deep_tr_ok = brain_train_corpus(brain_deep, deep_reasoning_corpus, 6, &deep_stats);
+    check(deep_tr_ok == 1, "T13.0: 32-layer non-linear & Contrastive SGD corpus training succeeds");
+
+    // T13.1: Contrastive Riemannian SGD aligns lexically disjoint functional equivalents ("фотон" vs "гравитон")
+    // that have completely different character stems but identical syntactic/functional frames in the corpus.
+    float sim_func_equiv = brain_continuous_similarity(brain_deep, "фотон", "гравитон");
+    float sim_func_unrel = brain_continuous_similarity(brain_deep, "фотон", "масла");
+    std::printf("[T13.1 32-Layer + Contrastive SGD Disjoint Lexical Alignment]:\n"
+                "  sim('фотон', 'гравитон') = %.4f vs sim('фотон', 'масла') = %.4f\n\n",
+                sim_func_equiv, sim_func_unrel);
+    check(sim_func_equiv > 0.45f && sim_func_equiv > sim_func_unrel + 0.30f,
+          "T13.1: Contrastive Riemannian SGD + 32-layer stack aligns lexically disjoint functional equivalents ('фотон' vs 'гравитон' > 0.45)");
+
+    // T13.2: Multi-hop logical deduction across 3 relational hops in brain_query_relation & brain_generate
+    brain_store_fact(brain_deep, "Модуль_Орион", "является_подклассом", "Квантовый_Кластер");
+    brain_store_fact(brain_deep, "Квантовый_Кластер", "входит_в_состав", "Тор_5D");
+    brain_store_fact(brain_deep, "Тор_5D", "обеспечивает_режим", "Сверхпроводящий_Резонанс_5D");
+
+    char deduced_obj[256] = {0};
+    int ded_ok = brain_query_relation(brain_deep, "Модуль_Орион", "обеспечивает_режим", deduced_obj, sizeof(deduced_obj));
+    std::printf("[T13.2 3-Hop Relational Deduction]: Модуль_Орион -> Квантовый_Кластер -> Тор_5D -> %s\n\n", deduced_obj);
+    check(ded_ok == 1 && std::string(deduced_obj) == "Сверхпроводящий_Резонанс_5D",
+          "T13.2: 3-hop transitive & taxonomic deduction resolves 'Модуль_Орион' -> 'Сверхпроводящий_Резонанс_5D'");
+
+    // T13.3: Generative multi-hop deduction (Deductive Live-Fact Closure + 3-Hop Discourse Graph Propagation)
+    std::memset(buf, 0, sizeof(buf));
+    int n_gen_ded = brain_generate(brain_deep, "Модуль_Орион обеспечивает_режим", buf, sizeof(buf), 6, 0.0f);
+    std::string s_gen_ded(buf);
+    std::printf("[T13.3 Generative Multi-Hop Fact Deduction]:\n  %s\n\n", s_gen_ded.c_str());
+    check(n_gen_ded >= 1 && s_gen_ded.find("Сверхпроводящий_Резонанс_5D") != std::string::npos,
+          "T13.3: brain_generate synthesizes 2/3-hop deduced object 'Сверхпроводящий_Резонанс_5D' for 'Модуль_Орион обеспечивает_режим'");
+
+    // T13.4: 3-Hop Discourse Graph Propagation across prose segments disambiguates unseen cross-segment prompt
+    std::memset(buf, 0, sizeof(buf));
+    int n_gen_disc = brain_generate(brain_deep, "Модуль_Орион гарантирует задержку", buf, sizeof(buf), 4, 0.0f);
+    std::string s_gen_disc(buf);
+    std::printf("[T13.4 3-Hop Prose Discourse Propagation]:\n  %s\n\n", s_gen_disc.c_str());
+    check(n_gen_disc >= 1 && s_gen_disc.find("Субнаносекундный_Отклик") != std::string::npos,
+          "T13.4: 3-hop discourse propagation (Модуль_Орион -> Квантовый_Кластер -> Тор_5D -> Субнаносекундный_Отклик) disambiguates target property");
+
+    brain_destroy(brain_deep);
+
     std::printf("================================================================\n");
     std::printf("  SUMMARY: %d Passed, %d Failed\n", g_passed, g_failed);
     std::printf("================================================================\n");
