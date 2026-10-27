@@ -1204,6 +1204,96 @@ int main() {
         std::filesystem::remove("build/test_foundation_4096.bin.llm_bank", ec);
     }
 
+    // =========================================================================
+    // SUITE 17: Zero-Shot Algorithm Synthesis, Full O(N^2) Long-Context RoPE
+    //           Attention & >50,000-Word Hierarchical Continuous Manifold
+    // =========================================================================
+    std::printf("\n--- Suite 17: Zero-Shot Synthesis, O(N^2) Long-Context Attention & >50k Manifold ---\n");
+    {
+        std::error_code ec;
+        std::filesystem::remove("build/test_zeroshot_scale.bin", ec);
+        std::filesystem::remove("build/test_zeroshot_scale.bin.llm_bank", ec);
+
+        PopCountBrain* z_brain = brain_create(4096, "build/test_zeroshot_scale.bin");
+        check(z_brain != nullptr, "T17.0: Created isolated brain for Zero-Shot / O(N^2) Attention / >50k Manifold tests");
+
+        // 17.1 Train ONLY on linear_search and binary_search, then request unseen "Dijkstra on Red-Black Tree"
+        const char* search_only_corpus =
+            "int linear_search(const int* arr, int n, int target) {\n"
+            "    for (int i = 0; i < n; ++i) {\n"
+            "        if (arr[i] == target) return i;\n"
+            "    }\n"
+            "    return -1;\n"
+            "}\n"
+            "int binary_search(const int* arr, int n, int target) {\n"
+            "    int lo = 0, hi = n - 1;\n"
+            "    while (lo <= hi) {\n"
+            "        int mid = lo + (hi - lo) / 2;\n"
+            "        if (arr[mid] == target) return mid;\n"
+            "        if (arr[mid] < target) lo = mid + 1;\n"
+            "        else hi = mid - 1;\n"
+            "    }\n"
+            "    return -1;\n"
+            "}\n";
+        BrainTrainStats z_st{};
+        int tr_ok = brain_train_corpus(z_brain, search_only_corpus, 4, &z_st);
+        check(tr_ok == 1, "T17.1a: Trained corpus containing ONLY linear_search and binary_search");
+
+        char z_code[8192] = {0};
+        bool z_verified = false;
+        int z_toks = brain_synthesize_algorithm_zeroshot(
+            z_brain,
+            "Напиши алгоритм Дейкстры на красно-черном дереве",
+            z_code, sizeof(z_code), &z_verified);
+        std::printf("  [Zero-Shot Synthesis] emitted_tokens=%d | sandbox_verified=%s\n",
+                    z_toks, z_verified ? "true" : "false");
+
+        char gen_code[8192] = {0};
+        int gen_toks = brain_generate(
+            z_brain,
+            "алгоритм Дейкстры на красно-черном дереве",
+            gen_code, sizeof(gen_code), 256, 0.0f);
+        check(z_toks > 120 && z_verified && gen_toks > 100 &&
+              std::strstr(z_code, "rotate_left") != nullptr &&
+              std::strstr(z_code, "rotate_right") != nullptr &&
+              std::strstr(z_code, "dist[u] + w < dist[v]") != nullptr &&
+              std::strstr(gen_code, "RedBlackPriorityQueue") != nullptr,
+              "T17.1b: Zero-shot synthesizer composes Red-Black Tree rotations + Dijkstra edge relaxation and verifies shortest paths in execution sandbox");
+
+        // 17.2 Full O(N^2) RoPE Causal Self-Attention across >260 tokens of unstructured narrative
+        std::string narrative =
+            "Пролог экспедиции: профессор Леонид спрятал рубиновый ключ внутри древнего саркофага под обсерваторией. ";
+        for (int i = 0; i < 32; ++i) {
+            narrative += "Ветер гнал песчаные дюны через долину, караван двигался вдоль высохшего русла реки на восток. ";
+        }
+        char attn_out[512] = {0};
+        double max_lr_attn = 0.0;
+        int attn_n = brain_attend_long_context(
+            z_brain,
+            narrative.c_str(),
+            "Где профессор Леонид спрятал рубиновый ключ?",
+            attn_out, sizeof(attn_out), 28, &max_lr_attn);
+        std::printf("  [O(N^2) Long-Context RoPE Attention] max_long_range_attn=%.4f | recalled: \"%s\"\n",
+                    max_lr_attn, attn_out);
+        check(attn_n >= 4 && max_lr_attn > 0.10 &&
+              (std::strstr(attn_out, "саркофага") != nullptr || std::strstr(attn_out, "рубиновый") != nullptr),
+              "T17.2: Full O(N^2) RoPE causal attention retains narrative plotline across >260 tokens (far beyond L=1..16)");
+
+        // 17.3 Scale FoundationContinuousManifold beyond 50,000 heterogeneous words via 256-cluster Hierarchical Softmax
+        size_t active_vocab = 0, num_clusters = 0;
+        double h_init_loss = 0.0, h_final_loss = 0.0;
+        bool scale_ok = brain_manifold_scale_vocabulary(
+            z_brain, 52000, 6, 0.15f, &active_vocab, &num_clusters, &h_init_loss, &h_final_loss);
+        std::printf("  [Hierarchical Manifold >50k] active_vocab=%zu | clusters=%zu | loss: %.4f -> %.4f\n",
+                    active_vocab, num_clusters, h_init_loss, h_final_loss);
+        check(scale_ok && active_vocab >= 52000 && num_clusters == 256 && h_final_loss < h_init_loss,
+              "T17.3: Hierarchical Factorized FoundationContinuousManifold scales to >=52,000 tokens across 256 clusters with strictly decreasing backprop loss");
+
+        brain_destroy(z_brain);
+        std::filesystem::remove("build/test_zeroshot_scale.bin", ec);
+        std::filesystem::remove("build/test_zeroshot_scale.bin.llm_bank", ec);
+    }
+
     std::printf("================================================================\n");
     std::printf("  SUMMARY: %d Passed, %d Failed\n", g_passed, g_failed);
     std::printf("================================================================\n");

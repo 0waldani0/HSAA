@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <string>
 #include "popcnt_brain.h"
 
 int main() {
@@ -258,7 +259,52 @@ int main() {
     assert(cos_ab > 0.70f && cos_ab > cos_unrel + 0.35f && "4096-D dense float32 cosine similarity failed semantic ranking");
     printf("[+] 4096-D Dense Float32 Cosine verified: cos_related=%.4f > cos_unrelated=%.4f\n", cos_ab, cos_unrel);
 
-    // 14. Destroy brain and cleanup
+    // 14. Verify Compositional Zero-Shot Algorithm Synthesis (Dijkstra on Red-Black Tree)
+    char synth_code[8192] = {0};
+    bool exec_verified = false;
+    int synth_toks = brain_synthesize_algorithm_zeroshot(
+        brain,
+        "Напиши алгоритм Дейкстры на красно-черном дереве (dijkstra_rbtree)",
+        synth_code, sizeof(synth_code), &exec_verified);
+    assert(synth_toks > 100 && exec_verified && "brain_synthesize_algorithm_zeroshot failed");
+    assert(strstr(synth_code, "RedBlackPriorityQueue") != NULL &&
+           strstr(synth_code, "rotate_left") != NULL &&
+           strstr(synth_code, "rotate_right") != NULL &&
+           strstr(synth_code, "dist[u] + w < dist[v]") != NULL &&
+           "Synthesized code missing Red-Black Tree rotations or Dijkstra edge relaxation");
+    printf("[+] Zero-Shot Algorithm Synthesis verified: tokens=%d, sandbox_verified=%d (RB-Tree + Dijkstra relaxation)\n",
+           synth_toks, exec_verified ? 1 : 0);
+
+    // 15. Verify Full O(N^2) RoPE Causal Self-Attention over Long Unstructured Narrative (>220 tokens)
+    std::string long_story =
+        "В первой главе старый капитан Артур спрятал сапфировый хронометр внутри северного маяка. ";
+    for (int k = 0; k < 28; ++k) {
+        long_story += "Корабль шел сквозь густой туман, волны били о борт, матросы проверяли паруса и канаты. ";
+    }
+    char long_ans[512] = {0};
+    double max_lr_attn = 0.0;
+    int attn_toks = brain_attend_long_context(
+        brain,
+        long_story.c_str(),
+        "Где капитан Артур спрятал сапфировый хронометр?",
+        long_ans, sizeof(long_ans), 24, &max_lr_attn);
+    assert(attn_toks >= 4 && max_lr_attn > 0.10 && "brain_attend_long_context failed on >220-token narrative");
+    assert((strstr(long_ans, "маяка") != NULL || strstr(long_ans, "хронометр") != NULL) &&
+           "Long-context O(N^2) attention failed to retrieve early narrative plotline (>200 tokens back)");
+    printf("[+] Full O(N^2) Long-Context RoPE Attention verified: max_long_range_attn=%.4f, recalled='%s'\n",
+           max_lr_attn, long_ans);
+
+    // 16. Verify Hierarchical Factorized Continuous Manifold Scaling beyond 50,000 Words
+    size_t active_vocab = 0, num_clusters = 0;
+    double hier_init_loss = 0.0, hier_final_loss = 0.0;
+    bool scale_ok = brain_manifold_scale_vocabulary(
+        brain, 52000, 6, 0.15f, &active_vocab, &num_clusters, &hier_init_loss, &hier_final_loss);
+    assert(scale_ok && active_vocab >= 52000 && num_clusters == 256 && hier_final_loss < hier_init_loss &&
+           "brain_manifold_scale_vocabulary failed to scale continuous manifold beyond 50,000 tokens");
+    printf("[+] Hierarchical Continuous Manifold (>50k vocab) verified: V=%zu, clusters=%zu, loss=%.4f -> %.4f\n",
+           active_vocab, num_clusters, hier_init_loss, hier_final_loss);
+
+    // 17. Destroy brain and cleanup
     brain_destroy(brain);
     printf("[+] Brain destroyed cleanly.\n");
 

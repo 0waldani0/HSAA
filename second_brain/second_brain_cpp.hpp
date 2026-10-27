@@ -196,6 +196,53 @@ public:
         return prof;
     }
 
+    std::pair<std::string, bool> synthesize_algorithm_zeroshot(
+        const std::string& spec_prompt,
+        size_t buffer_size = 16384
+    ) {
+        std::vector<char> buf(buffer_size, 0);
+        bool verified = false;
+        int n = brain_synthesize_algorithm_zeroshot(handle_, spec_prompt.c_str(), buf.data(), buf.size(), &verified);
+        if (n <= 0) return {{}, false};
+        return {std::string(buf.data()), verified};
+    }
+
+    std::pair<std::string, double> attend_long_context(
+        const std::string& long_text,
+        const std::string& query_prompt,
+        int max_tokens = 32,
+        size_t buffer_size = 8192
+    ) {
+        std::vector<char> buf(buffer_size, 0);
+        double max_attn = 0.0;
+        int n = brain_attend_long_context(
+            handle_, long_text.c_str(), query_prompt.c_str(), buf.data(), buf.size(), max_tokens, &max_attn
+        );
+        if (n <= 0) return {{}, 0.0};
+        return {std::string(buf.data()), max_attn};
+    }
+
+    struct ManifoldScaleResult {
+        size_t active_vocab = 0;
+        size_t num_clusters = 0;
+        double initial_loss = 0.0;
+        double final_loss = 0.0;
+    };
+
+    ManifoldScaleResult scale_manifold_vocabulary(
+        size_t target_vocab_size,
+        int backprop_epochs = 6,
+        float learning_rate = 0.12f
+    ) {
+        ManifoldScaleResult res{};
+        if (!brain_manifold_scale_vocabulary(
+                handle_, target_vocab_size, backprop_epochs, learning_rate,
+                &res.active_vocab, &res.num_clusters, &res.initial_loss, &res.final_loss)) {
+            throw std::runtime_error("brain_manifold_scale_vocabulary failed");
+        }
+        return res;
+    }
+
     PopCountBrain* native_handle() const noexcept { return handle_; }
 
 private:

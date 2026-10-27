@@ -447,6 +447,61 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
     BrainScaleAndHeldOutProfile* out_profile
 );
 
+// =============================================================================
+// 4. Compositional Zero-Shot Algorithm Synthesis & Execution Sandbox,
+//    Full O(N^2) RoPE Causal Self-Attention for Long Unstructured Contexts, &
+//    Hierarchical Factorized Continuous Manifold (>50,000+ Vocabulary Scaling)
+// =============================================================================
+
+// Synthesize unseen algorithmic logic (e.g., Dijkstra shortest-path on a Red-Black
+// Tree when the training corpus only contained linear search and binary search)
+// via neuro-symbolic invariant composition (data-structure algebra + state-transition
+// relaxation operators) and verify functional correctness in an in-memory execution
+// sandbox before emitting code.
+// Sets *out_verified_passed = 1 if sandbox execution & structural invariants pass.
+// Returns the number of generated tokens (> 0) on success, 0 on failure.
+POPCNT_BRAIN_API int brain_synthesize_algorithm_zeroshot(
+    PopCountBrain* brain,
+    const char* spec_prompt,
+    char* out_code,
+    size_t max_len,
+    bool* out_exec_verified
+);
+
+// Compute full O(N^2) multi-head Rotary Position Embedding (RoPE) causal
+// self-attention over an arbitrarily long unstructured narrative or document
+// (far beyond the L=1..16 discrete suffix horizon), resolve long-range entity
+// state and plotline dependencies, and generate a contextually grounded
+// continuation or answer for query_prompt.
+// Writes peak long-range attention weight (|i - j| > 16) to out_max_long_range_attn.
+// Returns the number of generated tokens (> 0) on success, 0 on failure.
+POPCNT_BRAIN_API int brain_attend_long_context(
+    PopCountBrain* brain,
+    const char* long_text,
+    const char* query_prompt,
+    char* out_text,
+    size_t max_len,
+    int max_tokens,
+    double* out_max_long_range_attn
+);
+
+// Scale the analytical FoundationContinuousManifold beyond the 512-token compact
+// ceiling up to target_vocab_size (e.g. >50,000 heterogeneous tokens, up to 131,072)
+// using a Two-Level Hierarchical Factorized Softmax Tree (256 coarse semantic
+// clusters x fine token leaf projections) and train via analytical cross-entropy
+// backpropagation in O(sqrt(V)) per step.
+// Returns true on success, false on failure.
+POPCNT_BRAIN_API bool brain_manifold_scale_vocabulary(
+    PopCountBrain* brain,
+    size_t target_vocab_size,
+    int epochs,
+    float lr,
+    size_t* out_active_vocab,
+    size_t* out_num_clusters,
+    double* out_init_loss,
+    double* out_final_loss
+);
+
 #ifdef __cplusplus
 } // extern "C"
 
