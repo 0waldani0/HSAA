@@ -4,23 +4,21 @@
 
 ```
 project upgrade/
-├── second_brain/       # [НОВОЕ] PopCount VSA Ассоциативная Память («Второй Мозг» для LLM)
+├── include/            # Заголовки HSSA, VSA DB, ModelMod, Bridge и BenchRunner (C11/C++20 ABI)
+├── src/                # Реализация HSSA (Gated DeltaNet + Hopfield), VSA DB, Bridge, CLI Lab
+├── second_brain/       # PopCount VSA Ассоциативная Память и Генеративный Контур
 │   ├── popcnt_brain.h  # Публичный чистый C-ABI интерфейс
-│   ├── popcnt_brain.cpp# Ядро движка (AVX-512 VPOPCNTDQ, SimHash, FFF, 4KB Demand-Paged VSA)
-│   ├── test_c_api.cpp  # Интеграционный C-тест
-│   ├── build.bat       # Сборка движка, тестов и статической библиотеки
-│   ├── CMakeLists.txt  # Сборка через CMake (exe, static lib, shared dll)
-│   └── README.md       # Подробная документация и примеры связки с LLM / Python
-│
-├── legacy_ptq/         # Исходный PTQ CUDA-движок квантованного инференса
-│   ├── engine.c        # Хостовый пайплайн
-│   ├── kernel.cu       # CUDA-ядра инференса
-│   └── core.h          # Заголовочный файл
-│
-├── build.bat           # Главный оркестратор сборки проекта
-├── CMakeLists.txt      # Корневой CMake-конфиг
-├── BRIDGE.md           # Архитектурный мост и протокол взаимодействия
-└── .gitignore          # Исключения бинарных артефактов и временных файлов
+│   ├── second_brain_cpp.hpp # C++20 RAII-обёртка (hsaa::SecondBrain / hssa::SecondBrain)
+│   ├── popcnt_brain.cpp# Ядро движка (AVX-512 VPOPCNTDQ, 4KB Demand-Paged VSA, Causal OOV Priors)
+│   ├── test_c_api.cpp  # Интеграционный C-ABI тест
+│   └── measur/         # Нативные бенчмарки и калибровочные стенды
+├── legacy_ptq/         # PTQ CUDA-движок 2-битного квантованного инференса (bsl_lut_gemv_sm86)
+├── tests/              # Модульные, стресс- и E2E-тесты (M1–M3, LLM/Code, Tier-5 Adversarial)
+├── docs/               # Архитектурная спецификация HSSA
+├── build.bat           # Главный оркестратор сборки проекта (MSVC + NVCC)
+├── CMakeLists.txt      # Корневой CMake-конфиг (Windows / Linux)
+├── PROJECT.md          # Полная техническая карта модулей и инвариантов
+└── BRIDGE.md           # Архитектурный мост и протокол верификации
 ```
 
 ---

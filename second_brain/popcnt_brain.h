@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -277,44 +278,75 @@ POPCNT_BRAIN_API int brain_interpolate_continuous(
 // Large-Scale 1.0 GB Sparse Bank Fragmentation / AVX-512 Cache-Miss Profiler
 // =============================================================================
 typedef struct BrainScaleAndHeldOutProfile {
-    // Held-out OOV / Unseen Target Reachability Metrics
+    // Held-out OOV / Unseen Target Reachability Metrics (Strictly Causal Left-to-Right)
     size_t heldout_total_transitions;
+    size_t heldout_oov_targets;
     size_t heldout_unseen_target_tokens;
-    double raw_ngram_unreachable_percent;       // Unreachable % without Distributional OOV Output Priors (the 20.6-28.1% wall)
-    double prior_unreachable_percent;           // Unreachable % WITH Distributional OOV Output Priors + Role-Cluster Backoff
-    double heldout_shortlist_coverage_percent;  // Reachable target coverage % on held-out text (100 - prior_unreachable_percent)
-    double heldout_top1_accuracy_percent;       // End-to-end top-1 prediction accuracy on held-out text
+    size_t heldout_unreachable_without_prior;
+    size_t heldout_unreachable_with_prior;
+    double heldout_unreachable_before_pct;      // Unreachable % without Distributional OOV Output Priors (the 20.6-28.1% wall)
+    double heldout_unreachable_after_pct;       // Unreachable % WITH Distributional OOV Output Priors + Role-Cluster Backoff
+    double heldout_reachability_after_pct;      // Reachable target/role coverage % on held-out text (100 - heldout_unreachable_after_pct)
+    double heldout_accuracy_pct;                // End-to-end causal top-1 prediction accuracy on held-out text
+    double raw_ngram_unreachable_percent;       // Alias of heldout_unreachable_before_pct
+    double prior_unreachable_percent;           // Alias of heldout_unreachable_after_pct
+    double heldout_shortlist_coverage_percent;  // Alias of heldout_reachability_after_pct
+    double heldout_top1_accuracy_percent;       // Alias of heldout_accuracy_pct
+
     // Large-Scale 1.0 GB Sparse Bank Fragmentation & Page Load Metrics
+    size_t bank_total_capacity_pages;           // 262,144 pages
     size_t bank_virtual_bytes;                  // 1,073,741,824 bytes (262,144 x 4 KB expert pages)
-    size_t active_expert_pages;                 // Resident non-zero 4 KB expert pages touched
-    size_t active_resident_bytes;               // Physical working-set bytes of active 4 KB pages
-    size_t total_stored_associations;           // Total VSA/STE slot rules stored across active pages
+    size_t bank_active_pages;                   // Resident non-zero 4 KB expert pages touched
+    size_t active_expert_pages;                 // Alias of bank_active_pages
+    size_t bank_resident_bytes;                 // Physical working-set bytes of active 4 KB pages
+    size_t active_resident_bytes;               // Alias of bank_resident_bytes
+    size_t bank_total_stored_slots;             // Total VSA/STE slot rules stored across active pages
+    size_t total_stored_associations;           // Alias of bank_total_stored_slots
     double mean_slots_per_active_page;          // Mean occupancy out of 16 slots per 4 KB page
     size_t max_slots_per_page;                  // Max occupancy (bounded <= 16, over_16slots == 0)
     size_t pages_over_16_slots;                 // Strictly 0 (collision-free open addressing)
-    double mean_open_address_probe_hops;        // Mean open-addressing probe step distance
-    uint32_t max_open_address_probe_hops;       // Max open-addressing probe step distance
-    double sparse_fragmentation_index;          // Non-contiguous page transition ratio across the 1.0 GB space in [0.0, 1.0]
+    double mean_open_address_probes;            // Mean open-addressing probe step distance
+    double mean_open_address_probe_hops;        // Alias of mean_open_address_probes
+    size_t max_open_address_probes;             // Max open-addressing probe step distance
+    uint32_t max_open_address_probe_hops;       // Alias of max_open_address_probes
+    double sparse_page_span_ratio;              // Span ratio across touched pages
+    double fragmentation_index;                 // Non-contiguous page transition ratio across the 1.0 GB space in [0.0, 1.0]
+    double sparse_fragmentation_index;          // Alias of fragmentation_index
+
     // AVX-512 Cache-Hierarchy Sweep (L1D -> L2 -> L3 -> DRAM across 4 KB Expert Pages)
-    double avx512_l1_ns_per_page;               // 8 pages (32 KB, L1D cache resident)
-    double avx512_l2_ns_per_page;               // 128 pages (512 KB, L2 cache resident)
-    double avx512_l3_ns_per_page;               // 4,096 pages (16 MB, L3 cache resident)
-    double avx512_dram_ns_per_page;             // >=16,384 pages (64+ MB, beyond L3 / DRAM sparse bank sweep)
+    double avx512_l1_page_eval_ns;              // 8 pages (32 KB, L1D cache resident)
+    double avx512_l2_page_eval_ns;              // 128 pages (512 KB, L2 cache resident)
+    double avx512_l3_page_eval_ns;              // 4,096 pages (16 MB, L3 cache resident)
+    double avx512_dram_page_eval_ns;            // 16,384 pages (64 MB, beyond L3 / DRAM sparse bank sweep)
+    double avx512_l1_ns_per_page;               // Alias of avx512_l1_page_eval_ns
+    double avx512_l2_ns_per_page;               // Alias of avx512_l2_page_eval_ns
+    double avx512_l3_ns_per_page;               // Alias of avx512_l3_page_eval_ns
+    double avx512_dram_ns_per_page;             // Alias of avx512_dram_page_eval_ns
 } BrainScaleAndHeldOutProfile;
 
 // Evaluate held-out text (containing unseen OOV targets, morphological inflections, and novel
-// contexts) using Distributional & Morphological OOV Output Priors, and profile 1.0 GB sparse
-// bank fragmentation and AVX-512 cache-hierarchy latency from L1D (32 KB) to DRAM (64+ MB).
-// Returns 1 on success, 0 on invalid arguments.
-POPCNT_BRAIN_API int brain_profile_heldout_and_scale(
+// contexts) using strictly causal Distributional & Morphological OOV Output Priors, and profile
+// 1.0 GB sparse bank fragmentation and AVX-512 cache-hierarchy latency from L1D (32 KB) to DRAM (64 MB).
+// Returns true (1) on success, false (0) on invalid arguments.
+POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
     PopCountBrain* brain,
     const char* heldout_text,
-    size_t cache_sweep_pages,
     BrainScaleAndHeldOutProfile* out_profile
 );
 
 #ifdef __cplusplus
+} // extern "C"
+
+static inline int brain_profile_heldout_and_scale(
+    PopCountBrain* brain,
+    const char* heldout_text,
+    size_t cache_sweep_pages,
+    BrainScaleAndHeldOutProfile* out_profile
+) {
+    (void)cache_sweep_pages;
+    return brain_profile_heldout_and_scale(brain, heldout_text, out_profile) ? 1 : 0;
 }
 #endif
+
 
 

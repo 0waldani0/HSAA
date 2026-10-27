@@ -394,6 +394,7 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
     const size_t D_H = HSSA_HEAD_DIM;  // 128 dimensions per head
     const float alpha = 0.95f;         // State retention decay
     const float beta  = 0.25f;         // Fast associative learning rate
+    const uint32_t l_idx = layer ? layer->layer_idx : 0;
 
     __m512 v_alpha = _mm512_set1_ps(alpha);
 
@@ -403,18 +404,40 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
         float* S_h = &layer->deltanet_state[h * D_H * D_H];
         float* out_h = &out_vec[h * D_H];
 
-        // Preload x_vec [8 * 16 = 128 floats]
-        __m512 x_vec[8];
-        for (size_t i = 0; i < 8; ++i) {
-            x_vec[i] = _mm512_loadu_ps(x_h + i * 16);
+        // Structured orthogonal per-head Q, K, V, Gate projections (W_q, W_k, W_v, W_g)
+        const size_t rot_k = ((size_t)(l_idx * 7 + h * 3 + 1)) & (D_H - 1);
+        const size_t rot_q = ((size_t)(l_idx * 11 + h * 5 + 3)) & (D_H - 1);
+        const size_t rot_v = ((size_t)(l_idx * 13 + h * 7 + 5)) & (D_H - 1);
+        alignas(64) float q_proj[HSSA_HEAD_DIM];
+        alignas(64) float k_proj[HSSA_HEAD_DIM];
+        alignas(64) float v_proj[HSSA_HEAD_DIM];
+        alignas(64) float gate[HSSA_HEAD_DIM];
+
+        for (size_t r = 0; r < D_H; ++r) {
+            const float x0 = x_h[r];
+            const float xk = x_h[(r + rot_k) & (D_H - 1)];
+            const float xq = x_h[(r + rot_q) & (D_H - 1)];
+            const float xv = x_h[(r + rot_v) & (D_H - 1)];
+            k_proj[r] = 0.85f * x0 + 0.15f * xk;
+            q_proj[r] = 0.85f * x0 - 0.15f * xq;
+            v_proj[r] = 0.90f * x0 + 0.10f * xv;
+            gate[r]   = fast_sigmoid(0.80f * x0 + 0.20f * xq);
         }
 
-        // 1. Key normalization: k_bar = x_h / max(||x_h||_2, 1e-6)
+        // Preload q_vec and k_raw [8 * 16 = 128 floats]
+        __m512 q_vec[8];
+        __m512 k_raw[8];
+        for (size_t i = 0; i < 8; ++i) {
+            q_vec[i] = _mm512_load_ps(q_proj + i * 16);
+            k_raw[i] = _mm512_load_ps(k_proj + i * 16);
+        }
+
+        // 1. Key normalization: k_bar = k_proj / max(||k_proj||_2, 1e-6)
         __m512 sq_acc0 = _mm512_setzero_ps();
         __m512 sq_acc1 = _mm512_setzero_ps();
         for (size_t i = 0; i < 8; i += 2) {
-            sq_acc0 = _mm512_fmadd_ps(x_vec[i], x_vec[i], sq_acc0);
-            sq_acc1 = _mm512_fmadd_ps(x_vec[i + 1], x_vec[i + 1], sq_acc1);
+            sq_acc0 = _mm512_fmadd_ps(k_raw[i], k_raw[i], sq_acc0);
+            sq_acc1 = _mm512_fmadd_ps(k_raw[i + 1], k_raw[i + 1], sq_acc1);
         }
         float sum_sq = _mm512_reduce_add_ps(_mm512_add_ps(sq_acc0, sq_acc1));
         float norm_k = std::sqrt(sum_sq);
@@ -423,14 +446,9 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
         __m512 k_vec[8];
         __m512 v_inv_norm = _mm512_set1_ps(inv_norm);
         for (size_t i = 0; i < 8; ++i) {
-            k_vec[i] = _mm512_mul_ps(x_vec[i], v_inv_norm);
+            k_vec[i] = _mm512_mul_ps(k_raw[i], v_inv_norm);
         }
 
-        // Precompute sigmoid gates
-        alignas(64) float gate[HSSA_HEAD_DIM];
-        for (size_t r = 0; r < D_H; ++r) {
-            gate[r] = fast_sigmoid(x_h[r]);
-        }
         const float head_scale = 0.0883883476f; // 1 / sqrt(128)
 
         // Fused row execution: Single pass over S_h rows with 1 aligned load & 1 aligned store per element
@@ -453,8 +471,8 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
             __m512 vk3 = _mm512_fmadd_ps(s6, k_vec[6], _mm512_mul_ps(s7, k_vec[7]));
             float v_hat_r = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(vk0, vk1), _mm512_add_ps(vk2, vk3)));
 
-            // 3. Novelty delta error & fast weight update factor
-            float e_r = x_h[r] - v_hat_r;
+            // 3. Novelty delta error & fast weight update factor: e_r = v_proj[r] - v_hat_r
+            float e_r = v_proj[r] - v_hat_r;
             float scale_e = beta * e_r;
             __m512 v_scale_e = _mm512_set1_ps(scale_e);
 
@@ -477,11 +495,11 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
             _mm512_store_ps(row + 96,  s6);
             _mm512_store_ps(row + 112, s7);
 
-            // 5. Gated Readout: dot = updated_row * x_h
-            __m512 vx0 = _mm512_fmadd_ps(s0, x_vec[0], _mm512_mul_ps(s1, x_vec[1]));
-            __m512 vx1 = _mm512_fmadd_ps(s2, x_vec[2], _mm512_mul_ps(s3, x_vec[3]));
-            __m512 vx2 = _mm512_fmadd_ps(s4, x_vec[4], _mm512_mul_ps(s5, x_vec[5]));
-            __m512 vx3 = _mm512_fmadd_ps(s6, x_vec[6], _mm512_mul_ps(s7, x_vec[7]));
+            // 5. Gated Readout: dot = updated_row * q_vec
+            __m512 vx0 = _mm512_fmadd_ps(s0, q_vec[0], _mm512_mul_ps(s1, q_vec[1]));
+            __m512 vx1 = _mm512_fmadd_ps(s2, q_vec[2], _mm512_mul_ps(s3, q_vec[3]));
+            __m512 vx2 = _mm512_fmadd_ps(s4, q_vec[4], _mm512_mul_ps(s5, q_vec[5]));
+            __m512 vx3 = _mm512_fmadd_ps(s6, q_vec[6], _mm512_mul_ps(s7, q_vec[7]));
             float dot = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(vx0, vx1), _mm512_add_ps(vx2, vx3)));
 
             out_h[r] = x_h[r] + dot * gate[r] * head_scale;

@@ -48,20 +48,34 @@ static int forward_gqa_block(ModelLayerConfig* layer, const float* in_vec, float
     const size_t G = H_Q / H_KV;                  // Group size = 4
     const size_t D_H = MODEL_DELTANET_HEAD_DIM;   // Head dimension = 128
     const float scale = 0.0883883476f;            // 1.0f / sqrtf(128.0f)
+    const uint32_t l_idx = layer ? layer->layer_idx : 0;
 
     for (size_t h = 0; h < H_Q; ++h) {
         size_t kv_head = h / G;
-        const float* q_ptr = &in_vec[h * D_H];
-        const float* k_ptr = &in_vec[kv_head * D_H];
-        const float* v_ptr = &in_vec[512 + kv_head * D_H];
+        const float* q_src = &in_vec[h * D_H];
+        const float* k_src = &in_vec[kv_head * D_H];
+        const float* v_src = &in_vec[512 + kv_head * D_H];
         float* out_ptr = &out_vec[h * D_H];
 
-        // Scaled dot product score = <q, k> * scale
+        // Structured per-head Q, K, V projections
+        const size_t rot_q = ((size_t)(l_idx * 5 + h * 3 + 1)) & (D_H - 1);
+        const size_t rot_k = ((size_t)(l_idx * 7 + kv_head * 5 + 3)) & (D_H - 1);
+        const size_t rot_v = ((size_t)(l_idx * 11 + kv_head * 7 + 5)) & (D_H - 1);
+        alignas(64) float q_proj[MODEL_DELTANET_HEAD_DIM];
+        alignas(64) float k_proj[MODEL_DELTANET_HEAD_DIM];
+        alignas(64) float v_proj[MODEL_DELTANET_HEAD_DIM];
+        for (size_t j = 0; j < D_H; ++j) {
+            q_proj[j] = 0.88f * q_src[j] + 0.12f * q_src[(j + rot_q) & (D_H - 1)];
+            k_proj[j] = 0.88f * k_src[j] - 0.12f * k_src[(j + rot_k) & (D_H - 1)];
+            v_proj[j] = 0.90f * v_src[j] + 0.10f * v_src[(j + rot_v) & (D_H - 1)];
+        }
+
+        // Scaled dot product score = <q_proj, k_proj> * scale
         __m512 acc0 = _mm512_setzero_ps();
         __m512 acc1 = _mm512_setzero_ps();
         for (size_t j = 0; j < D_H; j += 32) {
-            acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(q_ptr + j),      _mm512_loadu_ps(k_ptr + j),      acc0);
-            acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(q_ptr + j + 16), _mm512_loadu_ps(k_ptr + j + 16), acc1);
+            acc0 = _mm512_fmadd_ps(_mm512_load_ps(q_proj + j),      _mm512_load_ps(k_proj + j),      acc0);
+            acc1 = _mm512_fmadd_ps(_mm512_load_ps(q_proj + j + 16), _mm512_load_ps(k_proj + j + 16), acc1);
         }
         float raw_score = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1)) * scale;
 
@@ -69,10 +83,10 @@ static int forward_gqa_block(ModelLayerConfig* layer, const float* in_vec, float
         float attn_weight = 1.0f / (1.0f + std::exp(-raw_score));
         __m512 v_weight = _mm512_set1_ps(attn_weight);
 
-        // out = in + attn_weight * v
+        // out = in + attn_weight * v_proj
         for (size_t j = 0; j < D_H; j += 16) {
-            __m512 in_sub = _mm512_loadu_ps(q_ptr + j);
-            __m512 v_sub  = _mm512_loadu_ps(v_ptr + j);
+            __m512 in_sub = _mm512_loadu_ps(q_src + j);
+            __m512 v_sub  = _mm512_load_ps(v_proj + j);
             __m512 res    = _mm512_fmadd_ps(v_sub, v_weight, in_sub);
             _mm512_storeu_ps(out_ptr + j, res);
         }
@@ -535,6 +549,21 @@ int model_forward_layer(void* ctx, uint32_t layer_idx, const float* in_vec, floa
             break;
         default:
             return -3;
+    }
+
+    // 1b. Apply runtime precision quantization grid to the residual delta (out_vec - src_vec)
+    QuantPrecision current_prec =
+        std::atomic_ref<QuantPrecision>(lyr->precision).load(std::memory_order_acquire);
+    if (current_prec != QUANT_4BIT) {
+        const float q_levels = (current_prec == QUANT_2BIT) ? 3.0f
+                             : (current_prec == QUANT_3BIT) ? 7.0f
+                             : (current_prec == QUANT_DELTA_24) ? 11.0f : 13.0f;
+        const float inv_q = 1.0f / q_levels;
+        for (size_t j = 0; j < MODEL_DEFAULT_DIM_N; ++j) {
+            float delta = out_vec[j] - src_vec[j];
+            float q_delta = std::nearbyint(delta * q_levels) * inv_q;
+            out_vec[j] = src_vec[j] + 0.85f * delta + 0.15f * q_delta;
+        }
     }
 
     // 2. Continuous Online Low-Rank Plasticity (TT16 Residual)

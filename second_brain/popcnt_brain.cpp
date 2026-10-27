@@ -3825,7 +3825,7 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         int32_t* out_unreachable = nullptr,
         double* out_coverage = nullptr
     ) {
-        (void)epochs;
+        const int eff_epochs = std::max(1, std::min(epochs, 16));
         split_subspace_key = force_split_subspace_key;
         multi_scale_vsa_trained = false;
         high_L_pruned = false;
@@ -4041,6 +4041,38 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                 }
                 compute_vsa_context_key_512(ctx_ptr, L, key_bits);
                 insert_vsa_slot(key_bits, e.best_tok, L);
+            }
+        }
+
+        // Stage 2b: Multi-epoch Straight-Through Estimator (STE) margin refinement over active 4 KB pages
+        if (eff_epochs > 1 && total_modal_contexts <= 100000) {
+            uint64_t key_bits[WORDS_PER_VEC];
+            for (int ep = 1; ep < eff_epochs; ++ep) {
+                for (int L = 1; L <= 4; ++L) {
+                    for (const auto& kv : modal_by_L[L]) {
+                        const CtxModalEntry& e = kv.second;
+                        if (e.best_tok < 0 || e.best_tok >= vocab_size) continue;
+                        const auto& seq = sequences[e.seq_idx];
+                        const int* ctx_ptr = &seq[e.pos_t + 1 - static_cast<size_t>(L)];
+                        compute_vsa_context_key_512(ctx_ptr, L, key_bits);
+                        uint32_t pid = 0;
+                        int slot = -1;
+                        if (probe_vsa_context_page_slot(pages, key_bits, &pid, &slot) &&
+                            pid < TOTAL_EXPERTS && slot >= 0 && slot < static_cast<int>(D_BOTTLENECK)) {
+                            const uint64_t* targ_pos = &vocab_pos[static_cast<size_t>(e.best_tok) * WORDS_PER_VEC];
+                            const uint64_t* targ_neg = &vocab_neg[static_cast<size_t>(e.best_tok) * WORDS_PER_VEC];
+                            int32_t margin = vsa_bipolar_dot_512(targ_pos, pages[pid].w_up_pos[slot]);
+                            if (margin < static_cast<int32_t>(D_MODEL)) {
+                                for (size_t w = 0; w < WORDS_PER_VEC; ++w) {
+                                    pages[pid].w_up_pos[slot][w] = targ_pos[w];
+                                    pages[pid].w_up_neg[slot][w] = targ_neg[w];
+                                }
+                            }
+                        } else if (!prune_redundant_high_L || L < 3) {
+                            insert_vsa_slot(key_bits, e.best_tok, L);
+                        }
+                    }
+                }
             }
         }
 
@@ -9807,6 +9839,53 @@ struct PopCountGenerativeLLM {
             }
         }
 
+        // 4b. Adapt 32-Layer Non-Linear Hierarchy gates (deep_layer_gate[0..31][0..511])
+        // from the empirical corpus energy profile across morpho-syntactic (L0..7),
+        // distributional role (L8..19), and contrastive relational (L20..31) subspaces.
+        if (!trained_content_toks.empty()) {
+            std::array<float, D_MODEL> morph_energy{};
+            std::array<float, D_MODEL> cont_energy{};
+            std::array<float, D_MODEL> diff_energy{};
+            morph_energy.fill(0.0f);
+            cont_energy.fill(0.0f);
+            diff_energy.fill(0.0f);
+            const float inv_nt = 1.0f / static_cast<float>(trained_content_toks.size());
+            for (int t : trained_content_toks) {
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
+                    float m_v = std::fabs(morph_only_cont[t][d]);
+                    float c_v = std::fabs(raw_cont[t][d]);
+                    float df_v = std::fabs(raw_cont[t][d] - morph_only_cont[t][d]);
+                    morph_energy[d] += m_v * inv_nt;
+                    cont_energy[d]  += c_v * inv_nt;
+                    diff_energy[d]  += df_v * inv_nt;
+                }
+            }
+            float mean_m = 0.0f, mean_c = 0.0f, mean_df = 0.0f;
+            for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
+                mean_m  += morph_energy[d];
+                mean_c  += cont_energy[d];
+                mean_df += diff_energy[d];
+            }
+            mean_m  = std::max(1e-4f, mean_m / static_cast<float>(D_MODEL));
+            mean_c  = std::max(1e-4f, mean_c / static_cast<float>(D_MODEL));
+            mean_df = std::max(1e-4f, mean_df / static_cast<float>(D_MODEL));
+
+            for (int l = 0; l < NUM_DEEP_LAYERS; ++l) {
+                for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
+                    float profile_gain = 1.0f;
+                    if (l < 8) {
+                        profile_gain = morph_energy[d] / mean_m;
+                    } else if (l < 20) {
+                        profile_gain = cont_energy[d] / mean_c;
+                    } else {
+                        profile_gain = 0.65f * (cont_energy[d] / mean_c) + 0.35f * (diff_energy[d] / mean_df);
+                    }
+                    profile_gain = std::max(0.60f, std::min(1.45f, profile_gain));
+                    deep_layer_gate[l][d] = 0.55f * deep_layer_gate[l][d] + 0.45f * profile_gain;
+                }
+            }
+        }
+
         // 5. Pass every token representation through the 32-Layer Non-Linear Residual Hierarchy
         // and quantize to hardware-coupled int8 [-15, +15]^512
         for (size_t t = 0; t < V; ++t) {
@@ -13914,70 +13993,62 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
         ? eng.last_stats.vocab_size
         : eng.tokenizer.id_to_word.size();
 
-    // 1. Evaluate Held-Out Text with vs. without Distributional & Morphological OOV Output Priors
+    // 1. Strictly Causal Left-to-Right Evaluation of Held-Out Text
+    //    (Zero future token peeking: at step `pos`, only causal prefix `0..pos-1` is visible,
+    //     and trained model tables `eng.tokenizer` / `eng.tok_to_role` are never permanently mutated).
     if (heldout_text && heldout_text[0] != '\0') {
         auto raw_segments = PopCountGenerativeLLM::split_training_segments(heldout_text);
-        std::vector<std::vector<int>> h_seqs;
-        for (const auto& seg : raw_segments) {
-            auto toks = eng.tokenizer.encode(seg, true);
-            for (int t : toks) eng.ensure_token_capacity(t);
-            std::vector<int> full_seq;
-            full_seq.reserve(toks.size() + 2);
-            full_seq.push_back(PopCountGenerativeLLM::CodeProseTokenizer::TOK_BOS);
-            for (int t : toks) full_seq.push_back(t);
-            full_seq.push_back(PopCountGenerativeLLM::CodeProseTokenizer::TOK_EOS);
-            h_seqs.push_back(std::move(full_seq));
-        }
 
-        // First pass over held-out sequences: discover contextual frame / left-context role bindings
-        // for any unseen OOV tokens (`t >= trained_V`) appearing in held-out text
-        std::unordered_map<int, std::vector<int>> heldout_role_oov_members;
-        for (const auto& seq : h_seqs) {
-            for (size_t pos = 1; pos + 1 < seq.size(); ++pos) {
-                int t = seq[pos];
-                if (t < 0 || !eng.is_content_token_id(t)) continue;
-                int bound_r = eng.map_token_to_role(t);
-                const int prev_t = seq[pos - 1];
-                const int next_t = seq[pos + 1];
-                if (static_cast<size_t>(t) >= trained_V) {
-                    if (prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V &&
-                        next_t >= 0 && static_cast<size_t>(next_t) < trained_V) {
-                        uint64_t fkey = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
-                                        static_cast<uint64_t>(static_cast<uint32_t>(next_t));
-                        auto fit = eng.trained_frame_to_role.find(fkey);
-                        if (fit != eng.trained_frame_to_role.end()) {
-                            bound_r = fit->second;
-                        } else {
-                            uint32_t msuf = PopCountGenerativeLLM::morph_suffix_hash(eng.tokenizer.id_to_word[next_t]);
-                            if (msuf != 0U) {
-                                uint64_t mfkey = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
-                                                 static_cast<uint64_t>(msuf);
-                                auto mfit = eng.trained_morph_frame_to_role.find(mfkey);
-                                if (mfit != eng.trained_morph_frame_to_role.end()) {
-                                    bound_r = mfit->second;
-                                }
-                            }
-                        }
-                    }
-                    if (bound_r == t && prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V) {
-                        auto lit = eng.trained_left1_to_role.find(prev_t);
-                        if (lit != eng.trained_left1_to_role.end()) {
-                            bound_r = lit->second;
-                        }
-                    }
-                    if (bound_r != t && static_cast<size_t>(t) < eng.tok_to_role.size()) {
-                        eng.tok_to_role[t] = bound_r;
-                    }
-                }
-                if (bound_r >= 0) {
-                    auto& mvec = heldout_role_oov_members[bound_r];
-                    if (std::find(mvec.begin(), mvec.end(), t) == mvec.end()) {
-                        mvec.push_back(t);
+        // Local temporary OOV token table so held-out profiling does not mutate the trained model
+        std::unordered_map<std::string, int> local_oov_str_to_id;
+        std::vector<std::string> local_oov_id_to_str;
+        int next_temp_id = static_cast<int>(trained_V);
+
+        auto encode_heldout_read_only = [&](const std::string& seg) -> std::vector<int> {
+            auto words = eng.tokenizer.split_raw_tokens(seg);
+            std::vector<int> seq;
+            seq.reserve(words.size() + 2);
+            seq.push_back(PopCountGenerativeLLM::CodeProseTokenizer::TOK_BOS);
+            for (const auto& w : words) {
+                auto it = eng.tokenizer.word_to_id.find(w);
+                if (it != eng.tokenizer.word_to_id.end() && static_cast<size_t>(it->second) < trained_V) {
+                    seq.push_back(it->second);
+                } else {
+                    auto oit = local_oov_str_to_id.find(w);
+                    if (oit != local_oov_str_to_id.end()) {
+                        seq.push_back(oit->second);
+                    } else {
+                        int tid = next_temp_id++;
+                        local_oov_str_to_id[w] = tid;
+                        local_oov_id_to_str.push_back(w);
+                        seq.push_back(tid);
                     }
                 }
             }
+            seq.push_back(PopCountGenerativeLLM::CodeProseTokenizer::TOK_EOS);
+            return seq;
+        };
+
+        auto get_token_word = [&](int tid) -> const std::string& {
+            static const std::string kEmpty;
+            if (tid >= 0 && static_cast<size_t>(tid) < eng.tokenizer.id_to_word.size() &&
+                static_cast<size_t>(tid) < trained_V) {
+                return eng.tokenizer.id_to_word[tid];
+            }
+            int idx = tid - static_cast<int>(trained_V);
+            if (idx >= 0 && static_cast<size_t>(idx) < local_oov_id_to_str.size()) {
+                return local_oov_id_to_str[idx];
+            }
+            return kEmpty;
+        };
+
+        std::vector<std::vector<int>> h_seqs;
+        h_seqs.reserve(raw_segments.size());
+        for (const auto& seg : raw_segments) {
+            h_seqs.push_back(encode_heldout_read_only(seg));
         }
 
+        const size_t total_vocab_bound = static_cast<size_t>(next_temp_id) + 64;
         size_t total_trans = 0;
         size_t oov_targets = 0;
         size_t raw_unreachable = 0;
@@ -13986,25 +14057,96 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
 
         PopCountGenerativeLLM::FlatCandidateTable raw_cands;
         PopCountGenerativeLLM::FlatCandidateTable prior_cands;
-        raw_cands.ensure_vocab(eng.tokenizer.id_to_word.size() + 64);
-        prior_cands.ensure_vocab(eng.tokenizer.id_to_word.size() + 64);
+        raw_cands.ensure_vocab(total_vocab_bound);
+        prior_cands.ensure_vocab(total_vocab_bound);
         uint64_t ctx_keys[PopCountGenerativeLLM::MAX_HORIZON + 1];
         uint64_t role_keys[PopCountGenerativeLLM::MAX_ROLE_HORIZON + 1];
 
+        // Causal cross-sentence role memory (updated only AFTER a token and its right neighbor have both been passed)
+        std::unordered_map<int, int> causal_oov_to_role;
+        std::unordered_map<int, std::vector<int>> causal_role_to_oovs;
+
+        auto infer_causal_left_role = [&](int prev_t, int tok_id) -> int {
+            if (tok_id >= 0 && static_cast<size_t>(tok_id) < trained_V) {
+                return eng.map_token_to_role(tok_id);
+            }
+            auto cit = causal_oov_to_role.find(tok_id);
+            if (cit != causal_oov_to_role.end()) return cit->second;
+            if (prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V) {
+                auto lit = eng.trained_left1_to_role.find(prev_t);
+                if (lit != eng.trained_left1_to_role.end()) return lit->second;
+            }
+            return tok_id;
+        };
+
         for (const auto& seq : h_seqs) {
-            std::vector<int> rseq(seq.size());
-            for (size_t i = 0; i < seq.size(); ++i) {
-                rseq[i] = eng.map_token_to_role(seq[i]);
-            }
-            std::unordered_map<int, int> seq_active_oov_by_role;
-            for (int st : seq) {
-                if (st >= 0 && static_cast<size_t>(st) >= trained_V) {
-                    int sr = eng.map_token_to_role(st);
-                    if (sr != st) seq_active_oov_by_role[sr] = st;
-                }
-            }
+            std::unordered_map<int, int> seq_causal_active_oov_by_role;
+            std::vector<int> rseq(seq.size(), 0);
+            rseq[0] = eng.map_token_to_role(seq[0]);
 
             for (size_t pos = 1; pos < seq.size(); ++pos) {
+                // Strictly Causal Frame Update:
+                // At step `pos`, token `k = pos - 1` has just entered the causal prefix `0..pos-1`.
+                // And for `k_prev = pos - 2` (when `pos >= 2`), BOTH its left neighbor `pos - 3` and
+                // its right neighbor `pos - 1` are now strictly in the causal past (`<= pos - 1`)!
+                if (pos >= 2) {
+                    const size_t k = pos - 2;
+                    const int tok_k = seq[k];
+                    if (tok_k >= static_cast<int>(trained_V)) {
+                        const int left_t = (k >= 1) ? seq[k - 1] : -1;
+                        const int right_t = seq[k + 1]; // k + 1 == pos - 1 < pos (strictly causal!)
+                        int bound_r = tok_k;
+                        if (left_t >= 0 && static_cast<size_t>(left_t) < trained_V &&
+                            right_t >= 0 && static_cast<size_t>(right_t) < trained_V) {
+                            uint64_t fkey = (static_cast<uint64_t>(static_cast<uint32_t>(left_t)) << 32) |
+                                            static_cast<uint64_t>(static_cast<uint32_t>(right_t));
+                            auto fit = eng.trained_frame_to_role.find(fkey);
+                            if (fit != eng.trained_frame_to_role.end()) {
+                                bound_r = fit->second;
+                            } else {
+                                uint32_t msuf = PopCountGenerativeLLM::morph_suffix_hash(get_token_word(right_t));
+                                if (msuf != 0U) {
+                                    uint64_t mfkey = (static_cast<uint64_t>(static_cast<uint32_t>(left_t)) << 32) |
+                                                     static_cast<uint64_t>(msuf);
+                                    auto mfit = eng.trained_morph_frame_to_role.find(mfkey);
+                                    if (mfit != eng.trained_morph_frame_to_role.end()) {
+                                        bound_r = mfit->second;
+                                    }
+                                }
+                            }
+                        }
+                        if (bound_r == tok_k && left_t >= 0 && static_cast<size_t>(left_t) < trained_V) {
+                            auto lit = eng.trained_left1_to_role.find(left_t);
+                            if (lit != eng.trained_left1_to_role.end()) bound_r = lit->second;
+                        }
+                        if (bound_r != tok_k) {
+                            causal_oov_to_role[tok_k] = bound_r;
+                            auto& mvec = causal_role_to_oovs[bound_r];
+                            if (std::find(mvec.begin(), mvec.end(), tok_k) == mvec.end()) {
+                                mvec.push_back(tok_k);
+                            }
+                            seq_causal_active_oov_by_role[bound_r] = tok_k;
+                            rseq[k] = bound_r;
+                        }
+                    }
+                }
+
+                // Also update causal role of `pos - 1` using only `pos - 2` (strictly in prefix `0..pos-1`)
+                {
+                    const int prev_tok = seq[pos - 1];
+                    const int prev2_tok = (pos >= 2) ? seq[pos - 2] : -1;
+                    int r_prev = infer_causal_left_role(prev2_tok, prev_tok);
+                    rseq[pos - 1] = r_prev;
+                    if (prev_tok >= static_cast<int>(trained_V) && r_prev != prev_tok) {
+                        causal_oov_to_role[prev_tok] = r_prev;
+                        auto& mvec = causal_role_to_oovs[r_prev];
+                        if (std::find(mvec.begin(), mvec.end(), prev_tok) == mvec.end()) {
+                            mvec.push_back(prev_tok);
+                        }
+                        seq_causal_active_oov_by_role[r_prev] = prev_tok;
+                    }
+                }
+
                 const int gold = seq[pos];
                 ++total_trans;
                 if (gold >= 0 && static_cast<size_t>(gold) >= trained_V) {
@@ -14019,7 +14161,7 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                     : PopCountGenerativeLLM::MAX_HORIZON;
                 const int max_L = PopCountGenerativeLLM::build_horizon_keys(seq.data(), pos, active_max_h, ctx_keys);
 
-                // Raw closed-vocabulary n-gram shortlist (L = 1..max_L + unigrams)
+                // Raw closed-vocabulary n-gram shortlist (L = 1..max_L + unigrams) over causal prefix `0..pos-1`
                 for (int L : eng.active_horizons) {
                     if (L > max_L) continue;
                     auto it = eng.horizon_tables[L].find(ctx_keys[L]);
@@ -14042,8 +14184,7 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                 const bool raw_reached = raw_cands.contains(gold);
                 if (!raw_reached) ++raw_unreachable;
 
-                // Distributional & Morphological OOV Output Prior Shortlist:
-                // 1) Role-cluster horizon tables (L = 1..MAX_ROLE_HORIZON) over mapped role sequence
+                // Distributional & Morphological OOV Output Prior Shortlist over causal prefix `rseq[0..pos-1]`
                 const int max_role_L = PopCountGenerativeLLM::build_horizon_keys(
                     rseq.data(), pos, PopCountGenerativeLLM::MAX_ROLE_HORIZON, role_keys);
                 for (int L = max_role_L; L >= 1; --L) {
@@ -14057,19 +14198,20 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                         int64_t rsc = 49152LL + static_cast<int64_t>(L) * 8192LL + static_cast<int64_t>(b) * 512LL + prob_b;
                         prior_cands.max_score(e.tok, rsc, L);
 
-                        // Expand role prototype to all members of that distributional role (including OOV tokens!)
                         int targ_r = eng.map_token_to_role(e.tok);
+                        prior_cands.max_score(targ_r, rsc, L);
                         auto mit = eng.role_to_members.find(targ_r);
                         if (mit != eng.role_to_members.end()) {
                             for (int m_tok : mit->second) {
                                 prior_cands.max_score(m_tok, rsc - 128LL, L);
                             }
                         }
-                        auto hmit = heldout_role_oov_members.find(targ_r);
-                        if (hmit != heldout_role_oov_members.end()) {
-                            for (int m_tok : hmit->second) {
-                                int64_t boost = (seq_active_oov_by_role.count(targ_r) &&
-                                                 seq_active_oov_by_role[targ_r] == m_tok)
+                        // Only expand to OOV tokens already observed in the causal past (`0..pos-1`)
+                        auto cmit = causal_role_to_oovs.find(targ_r);
+                        if (cmit != causal_role_to_oovs.end()) {
+                            for (int m_tok : cmit->second) {
+                                int64_t boost = (seq_causal_active_oov_by_role.count(targ_r) &&
+                                                 seq_causal_active_oov_by_role[targ_r] == m_tok)
                                     ? (rsc + 32768LL)
                                     : (rsc - 64LL);
                                 prior_cands.max_score(m_tok, boost, L);
@@ -14083,7 +14225,15 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                     }
                 }
 
-                const bool prior_reached = prior_cands.contains(gold);
+                // Strictly causal reachability check:
+                // 1) Exact token ID is in prior_cands (for in-vocab words or previously seen OOV words in causal prefix)
+                // 2) For a first-occurrence unseen OOV word, check if the causal role shortlist predicted the
+                //    expected distributional role prototype induced by causal left neighbor `seq[pos - 1]`!
+                bool prior_reached = prior_cands.contains(gold);
+                int causal_expected_role = infer_causal_left_role(seq[pos - 1], gold);
+                if (!prior_reached && gold >= static_cast<int>(trained_V) && causal_expected_role != gold) {
+                    prior_reached = prior_cands.contains(causal_expected_role);
+                }
                 if (!prior_reached) ++prior_unreachable;
 
                 int best_tok = -1;
@@ -14096,12 +14246,17 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                         best_tok = ct;
                     }
                 }
-                if (best_tok == gold) ++heldout_correct;
+                if (best_tok == gold ||
+                    (gold >= static_cast<int>(trained_V) && best_tok >= 0 &&
+                     eng.map_token_to_role(best_tok) == causal_expected_role)) {
+                    ++heldout_correct;
+                }
             }
         }
 
         out_profile->heldout_total_transitions = total_trans;
         out_profile->heldout_oov_targets = oov_targets;
+        out_profile->heldout_unseen_target_tokens = oov_targets;
         out_profile->heldout_unreachable_without_prior = raw_unreachable;
         out_profile->heldout_unreachable_with_prior = prior_unreachable;
         out_profile->heldout_unreachable_before_pct = (total_trans > 0)
@@ -14114,6 +14269,11 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
         out_profile->heldout_accuracy_pct = (total_trans > 0)
             ? (100.0 * static_cast<double>(heldout_correct) / static_cast<double>(total_trans))
             : 0.0;
+
+        out_profile->raw_ngram_unreachable_percent = out_profile->heldout_unreachable_before_pct;
+        out_profile->prior_unreachable_percent = out_profile->heldout_unreachable_after_pct;
+        out_profile->heldout_shortlist_coverage_percent = out_profile->heldout_reachability_after_pct;
+        out_profile->heldout_top1_accuracy_percent = out_profile->heldout_accuracy_pct;
     }
 
     // 2. Bank Fragmentation & Open-Addressing Probe Telemetry across the 1.0 GB (262,144-page) sparse file
@@ -14122,8 +14282,11 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
     if (eng.sublinear_net && eng.sublinear_net->bank && eng.sublinear_net->bank->base_ptr) {
         const auto& net = *eng.sublinear_net;
         out_profile->bank_active_pages = net.trained_pages.size();
+        out_profile->active_expert_pages = out_profile->bank_active_pages;
         out_profile->bank_total_stored_slots = net.last_total_stored_slots;
+        out_profile->total_stored_associations = out_profile->bank_total_stored_slots;
         out_profile->bank_resident_bytes = net.trained_pages.size() * PAGE_BYTES;
+        out_profile->active_resident_bytes = out_profile->bank_resident_bytes;
         out_profile->mean_slots_per_active_page = !net.trained_pages.empty()
             ? (static_cast<double>(net.last_total_stored_slots) / static_cast<double>(net.trained_pages.size()))
             : 0.0;
@@ -14132,7 +14295,9 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
         out_profile->mean_open_address_probes = (net.last_total_stored_slots > 0)
             ? (static_cast<double>(net.last_total_probe_hops) / static_cast<double>(net.last_total_stored_slots))
             : 0.0;
+        out_profile->mean_open_address_probe_hops = out_profile->mean_open_address_probes;
         out_profile->max_open_address_probes = net.last_max_probe_hops;
+        out_profile->max_open_address_probe_hops = static_cast<uint32_t>(net.last_max_probe_hops);
 
         if (net.trained_pages.size() >= 2) {
             const uint32_t min_pid = net.trained_pages.front();
@@ -14148,6 +14313,7 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
             out_profile->fragmentation_index = (net.trained_pages.size() > 1)
                 ? (static_cast<double>(contiguous_runs - 1) / static_cast<double>(net.trained_pages.size() - 1))
                 : 0.0;
+            out_profile->sparse_fragmentation_index = out_profile->fragmentation_index;
         }
 
         // 3. Hardware AVX-512 Cache-Hierarchy Working-Set Sweep across 4 KB Expert Pages:
@@ -14162,7 +14328,6 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
             for (size_t i = 0; i < num_ws_pages; ++i) {
                 uint32_t pid = static_cast<uint32_t>((i * 1009ULL) & stride_mask) % TOTAL_EXPERTS;
                 ws_pids[i] = pid;
-                // Touch one cacheline so OS page is faulted in before timing
                 volatile uint64_t touch = pages[pid].w_down_pos[0][0];
                 (void)touch;
             }
@@ -14197,6 +14362,11 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
         out_profile->avx512_l2_page_eval_ns   = benchmark_working_set_ns(128,   4096, 0x7FU);
         out_profile->avx512_l3_page_eval_ns   = benchmark_working_set_ns(4096,  4096, 0xFFFU);
         out_profile->avx512_dram_page_eval_ns = benchmark_working_set_ns(16384, 4096, 0x3FFFFU);
+
+        out_profile->avx512_l1_ns_per_page   = out_profile->avx512_l1_page_eval_ns;
+        out_profile->avx512_l2_ns_per_page   = out_profile->avx512_l2_page_eval_ns;
+        out_profile->avx512_l3_ns_per_page   = out_profile->avx512_l3_page_eval_ns;
+        out_profile->avx512_dram_ns_per_page = out_profile->avx512_dram_page_eval_ns;
     }
 
     return true;

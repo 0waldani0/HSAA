@@ -123,6 +123,15 @@ public:
         return res;
     }
 
+    BrainScaleAndHeldOutProfile profile_heldout_and_scale(const std::string& heldout_text = "") const {
+        BrainScaleAndHeldOutProfile prof{};
+        const char* h_ptr = heldout_text.empty() ? nullptr : heldout_text.c_str();
+        if (!brain_profile_heldout_and_scale(handle_, h_ptr, &prof)) {
+            throw std::runtime_error("brain_profile_heldout_and_scale failed");
+        }
+        return prof;
+    }
+
     PopCountBrain* native_handle() const noexcept { return handle_; }
 
 private:
@@ -130,3 +139,6 @@ private:
 };
 
 } // namespace hsaa
+
+namespace hssa = hsaa;
+

@@ -9,14 +9,15 @@
 - LANG: Files/code/bridge = strict concise EN. User chat = concise RU, simple words, high info density.
 - HONESTY: Zero hype, zero slop, zero flattery. Brutal technical critique of project, self, peer agent, and code. Full transparency to U.
 - STACK: Native C++20 / C11 / AVX-512 VPOPCNTDQ / AVX2 / MSVC 2022. Zero bloat dependencies.
-- NO GARBAGE: Zero dead files in root. Root contains ONLY orchestrators (`build.bat`, `CMakeLists.txt`, `BRIDGE.md`, `README.md`, `.gitignore`) and modular subdirectories (`second_brain/`, `legacy_ptq/`).
+- NO GARBAGE: Zero dead files in root. Root contains orchestrators (`build.bat`, `CMakeLists.txt`, `BRIDGE.md`, `PROJECT.md`, `README.md`, `LICENSE`, `.gitignore`) and modular directories (`include/`, `src/`, `second_brain/`, `legacy_ptq/`, `tests/`, `docs/`).
 - METRICS: Every architecture/training claim MUST report hard numbers: `tok/s`, `latency us`, `pages/RAM MB`, and test accuracy. Unmeasured claims = rejected.
 - ISOLATION: PopCount engine completely self-contained in `second_brain/` with its own `build.bat`, `CMakeLists.txt`, `README.md`, and C-ABI `popcnt_brain.h`.
 
 ## STATE
 - O: muse spark (opencode) active | G: gemini (antigravity) active | U: active
-- Doing: Extended `PopCountGenerativeLLM` hard context horizon from `L <= 24` to `MAX_HORIZON = 2048` (`O(1)` incremental rolling suffix hashes, `active_horizons` non-empty index, `FlatCandidateTable`), vectorized `hssa.cpp`/`model_mod.cpp`/`popcnt_brain.cpp` with AVX-512 intrinsics, replaced all Python scripts with native C++20 (`second_brain_cpp.hpp`, `native_measur_runner.cpp`, `stress_concurrent_builds.cpp`), and relocated stray root test scripts into `tests/`.
+- Doing: Completed forensic audit & full repair: (1) synchronized `BrainScaleAndHeldOutProfile` struct fields and `brain_profile_heldout_and_scale` 3-arg/4-arg C11/C++20 ABI across `popcnt_brain.h`, `popcnt_brain.cpp`, `second_brain_cpp.hpp`, `test_c_api.cpp`, and `test_llm_text_code_gen.cpp`; (2) replaced non-causal held-out pre-scan (`seq[pos+1]`) with strictly causal left-to-right evaluation (`0..pos-1`) without mutating trained vocabulary/role tables; (3) restored multi-epoch STE margin refinement in `train_arbitrary_corpus_end_to_end` and added corpus-adapted gates to `deep_layer_gate[32][512]`; (4) added per-head orthogonal `Q/K/V/Gate` projections and active runtime precision quantization in `src/hssa.cpp` and `src/model_mod.cpp`.
 - Blocked: -
+
 
 ## NEXT
 - [->] Revisit GPU offload only if the model scales to `M,N >= 8192` or a `>= 16`-vector batch; until then the CPU path is the fast path.
