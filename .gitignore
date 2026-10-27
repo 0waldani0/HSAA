@@ -97,3 +97,5 @@ server.js
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.pem
+kaggle_session/output/
