@@ -100,6 +100,31 @@ struct VectorEntry {
     uint64_t vec[8];
 };
 
+// 4096-Dimensional Dense Float32 Embedding Entry (Normalized on S^4095 for fast SIMD cosine)
+struct alignas(64) Dense4096Entry {
+    uint64_t key_hash = 0;
+    float inv_norm = 0.0f;
+    alignas(64) float vec[VSA_DENSE_4096_DIM];
+};
+
+// Continuous VSA Function Approximation Model (Fractional Power / Random Fourier Phase Encoding)
+struct VsaContinuousFuncSample {
+    float x = 0.0f;
+    float y = 0.0f;
+    uint64_t phase_sk[8] = {0};
+};
+
+struct VsaContinuousFuncModel {
+    std::vector<VsaContinuousFuncSample> samples;
+    float x_min = 0.0f;
+    float x_max = 1.0f;
+    float bandwidth = 1.0f;
+    alignas(64) float rff_omega[128] = {0.0f};
+    alignas(64) float rff_phase[128] = {0.0f};
+    alignas(64) float rff_weights[128] = {0.0f};
+    bool rff_ready = false;
+};
+
 struct VsaDbHandle {
     VsaDbCapacity capacity;
     size_t total_bytes;
@@ -114,6 +139,11 @@ struct VsaDbHandle {
     // Not persisted: rebuilt from the mmap table on create(reopen) and clone.
     std::vector<VectorEntry> vec_dense;
     std::unordered_map<uint64_t, size_t> vec_pos;
+    // 4096-D dense float32 vector table
+    std::vector<Dense4096Entry> dense_4096_entries;
+    std::unordered_map<uint64_t, size_t> dense_4096_pos;
+    // Continuous VSA function models by relation name
+    std::unordered_map<std::string, VsaContinuousFuncModel> cont_funcs;
 };
 
 // =============================================================================
@@ -472,7 +502,29 @@ VsaDbHandle* vsa_db_create(VsaDbCapacity cap, const char* persist_path) {
             }
         }
 #else
-        int fd = open(persist_path, O_RDWR | O_CREAT, 0644);
+        auto is_valid_utf8_path = [](const char* s) -> bool {
+            if (!s) return false;
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
+            while (*p) {
+                if (*p == '\\') return false;
+                if (*p < 0x80) {
+                    ++p;
+                } else if ((*p & 0xE0) == 0xC0) {
+                    if ((p[1] & 0xC0) != 0x80 || (*p & 0xFE) == 0xC0) return false;
+                    p += 2;
+                } else if ((*p & 0xF0) == 0xE0) {
+                    if ((p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80) return false;
+                    p += 3;
+                } else if ((*p & 0xF8) == 0xF0) {
+                    if ((p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80 || (p[3] & 0xC0) != 0x80) return false;
+                    p += 4;
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        };
+        int fd = is_valid_utf8_path(persist_path) ? open(persist_path, O_RDWR | O_CREAT, 0644) : -1;
         if (fd < 0) {
             use_file = false;
         } else {
@@ -653,6 +705,9 @@ int vsa_db_clone(const VsaDbHandle* src, VsaDbHandle** dst, const char* new_pers
     {
         std::lock_guard<std::mutex> lock(const_cast<VsaDbHandle*>(src)->db_mutex);
         std::memcpy(clone->base_ptr, src->base_ptr, src->total_bytes);
+        clone->dense_4096_entries = src->dense_4096_entries;
+        clone->dense_4096_pos = src->dense_4096_pos;
+        clone->cont_funcs = src->cont_funcs;
     }
     vector_index_rebuild(clone);
 
@@ -934,38 +989,130 @@ int vsa_db_query_relation(VsaDbHandle* db, const char* subj, const char* rel, ch
     if (!db->base_ptr) return 0;
 
     DbHeader* hdr = reinterpret_cast<DbHeader*>(db->base_ptr);
-    if (hdr->fact_count == 0) return 0;
+    if (hdr->fact_count > 0) {
+        uint64_t kh = hash_relation_key(subj, rel);
+        uint32_t mask = hdr->fact_table_capacity - 1;
+        uint32_t idx = static_cast<uint32_t>(kh & mask);
+        uint16_t cur_psl = 0;
 
-    uint64_t kh = hash_relation_key(subj, rel);
-    uint32_t mask = hdr->fact_table_capacity - 1;
-    uint32_t idx = static_cast<uint32_t>(kh & mask);
-    uint16_t cur_psl = 0;
+        VsaFactSlot* table = reinterpret_cast<VsaFactSlot*>(
+            reinterpret_cast<uint8_t*>(db->base_ptr) + hdr->fact_table_offset
+        );
 
-    VsaFactSlot* table = reinterpret_cast<VsaFactSlot*>(
-        reinterpret_cast<uint8_t*>(db->base_ptr) + hdr->fact_table_offset
-    );
+        for (uint32_t probe = 0; probe < hdr->fact_table_capacity; ++probe) {
+            VsaFactSlot* slot = &table[idx];
+            if (!slot->occupied || cur_psl > slot->psl) {
+                break;
+            }
+            if (slot->key_hash == kh && slot_match_key(db, slot, subj, rel)) {
+                const char* stored_obj = slot_get_obj(db, slot);
+                size_t stored_len = std::strlen(stored_obj);
+                size_t copy_len = (stored_len < max_len - 1) ? stored_len : (max_len - 1);
+                std::memcpy(out_obj, stored_obj, copy_len);
+                out_obj[copy_len] = '\0';
 
-    for (uint32_t probe = 0; probe < hdr->fact_table_capacity; ++probe) {
-        VsaFactSlot* slot = &table[idx];
-        if (!slot->occupied || cur_psl > slot->psl) {
-            return 0;
+                // Verify self-inverse unbinding: Obj = XNOR(RelKey, Fact)
+                uint64_t unbound_obj[8];
+                vsa_xnor_512(slot->rel_key, slot->fact_vec, unbound_obj);
+                (void)unbound_obj;
+
+                return 1;
+            }
+            idx = (idx + 1) & mask;
+            cur_psl++;
         }
-        if (slot->key_hash == kh && slot_match_key(db, slot, subj, rel)) {
-            const char* stored_obj = slot_get_obj(db, slot);
-            size_t stored_len = std::strlen(stored_obj);
-            size_t copy_len = (stored_len < max_len - 1) ? stored_len : (max_len - 1);
-            std::memcpy(out_obj, stored_obj, copy_len);
-            out_obj[copy_len] = '\0';
+    }
 
-            // Verify self-inverse unbinding: Obj = XNOR(RelKey, Fact)
-            uint64_t unbound_obj[8];
-            vsa_xnor_512(slot->rel_key, slot->fact_vec, unbound_obj);
-            (void)unbound_obj;
-
-            return 1;
+    // Fallback to Continuous VSA Function Approximation if subj is numeric and rel was learned
+    auto fit = db->cont_funcs.find(rel);
+    if (fit != db->cont_funcs.end() && !fit->second.samples.empty()) {
+        char* end_s = nullptr;
+        float x_val = std::strtof(subj, &end_s);
+        if (end_s && end_s != subj) {
+            while (*end_s == ' ' || *end_s == '\t') ++end_s;
+            if (*end_s == '\0' && std::isfinite(x_val)) {
+                const VsaContinuousFuncModel& m = fit->second;
+                const size_t n = m.samples.size();
+                if (n == 1) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%.4f", static_cast<double>(m.samples[0].y));
+                    size_t cl = std::min(std::strlen(buf), max_len - 1);
+                    std::memcpy(out_obj, buf, cl);
+                    out_obj[cl] = '\0';
+                    return 1;
+                }
+                for (size_t i = 0; i < n; ++i) {
+                    if (std::fabs(x_val - m.samples[i].x) < 1e-6f) {
+                        char buf[64];
+                        std::snprintf(buf, sizeof(buf), "%.4f", static_cast<double>(m.samples[i].y));
+                        size_t cl = std::min(std::strlen(buf), max_len - 1);
+                        std::memcpy(out_obj, buf, cl);
+                        out_obj[cl] = '\0';
+                        return 1;
+                    }
+                }
+                double h = std::max(1e-4, static_cast<double>(m.bandwidth));
+                double inv_2h2 = 1.0 / (2.0 * h * h);
+                double sw = 0.0, swx = 0.0, swx2 = 0.0, swx3 = 0.0, swx4 = 0.0;
+                double swy = 0.0, swxy = 0.0, swx2y = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    double dx = static_cast<double>(m.samples[i].x - x_val);
+                    double dx2 = dx * dx;
+                    double w = std::exp(-dx2 * inv_2h2) + 1e-9 / (1.0 + dx2);
+                    double y = static_cast<double>(m.samples[i].y);
+                    sw += w; swx += w * dx; swx2 += w * dx2;
+                    swx3 += w * dx2 * dx; swx4 += w * dx2 * dx2;
+                    swy += w * y; swxy += w * dx * y; swx2y += w * dx2 * y;
+                }
+                double y_pred = (sw > 1e-15) ? (swy / sw) : 0.0;
+                bool solved_q = false;
+                if (n >= 4 && sw > 1e-15) {
+                    double A[3][3] = {
+                        { sw,   swx,  swx2        },
+                        { swx,  swx2, swx3        },
+                        { swx2, swx3, swx4 + 1e-9 }
+                    };
+                    double B[3] = { swy, swxy, swx2y };
+                    bool ok = true;
+                    for (int col = 0; col < 3; ++col) {
+                        int piv = col;
+                        double mv = std::fabs(A[col][col]);
+                        for (int r = col + 1; r < 3; ++r) {
+                            if (std::fabs(A[r][col]) > mv) { mv = std::fabs(A[r][col]); piv = r; }
+                        }
+                        if (mv < 1e-12) { ok = false; break; }
+                        if (piv != col) {
+                            for (int c = col; c < 3; ++c) std::swap(A[col][c], A[piv][c]);
+                            std::swap(B[col], B[piv]);
+                        }
+                        double inv_d = 1.0 / A[col][col];
+                        for (int r = col + 1; r < 3; ++r) {
+                            double f = A[r][col] * inv_d;
+                            for (int c = col; c < 3; ++c) A[r][c] -= f * A[col][c];
+                            B[r] -= f * B[col];
+                        }
+                    }
+                    if (ok) {
+                        double c2 = B[2] / A[2][2];
+                        double c1 = (B[1] - A[1][2] * c2) / A[1][1];
+                        y_pred = (B[0] - A[0][1] * c1 - A[0][2] * c2) / A[0][0];
+                        solved_q = true;
+                    }
+                }
+                if (!solved_q) {
+                    double det = sw * swx2 - swx * swx;
+                    if (sw > 1e-15 && std::fabs(det) > 1e-12 * sw * sw) {
+                        y_pred = (swx2 * swy - swx * swxy) / det;
+                    }
+                }
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%.4f", y_pred);
+                size_t cl = std::min(std::strlen(buf), max_len - 1);
+                std::memcpy(out_obj, buf, cl);
+                out_obj[cl] = '\0';
+                return 1;
+            }
         }
-        idx = (idx + 1) & mask;
-        cur_psl++;
     }
 
     return 0;
@@ -1204,6 +1351,342 @@ int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* ou
     }
     std::memcpy(out_best_vec, best_vec, sizeof(uint64_t) * 8);
     *out_sim = std::clamp(raw_sim, -1.0f, 1.0f);
+    return 1;
+}
+
+// =============================================================================
+// 4096-Dimensional Dense Float32 Cosine Similarity & Vector Index
+// =============================================================================
+
+float vsa_cosine_sim_4096_f32(const float* a_4096, const float* b_4096) {
+    if (!a_4096 || !b_4096) return 0.0f;
+#if defined(__AVX512F__)
+    __m512 vdot = _mm512_setzero_ps();
+    __m512 vna  = _mm512_setzero_ps();
+    __m512 vnb  = _mm512_setzero_ps();
+    for (int d = 0; d < VSA_DENSE_4096_DIM; d += 16) {
+        __m512 va = _mm512_loadu_ps(a_4096 + d);
+        __m512 vb = _mm512_loadu_ps(b_4096 + d);
+        vdot = _mm512_fmadd_ps(va, vb, vdot);
+        vna  = _mm512_fmadd_ps(va, va, vna);
+        vnb  = _mm512_fmadd_ps(vb, vb, vnb);
+    }
+    float dot = _mm512_reduce_add_ps(vdot);
+    float na  = _mm512_reduce_add_ps(vna);
+    float nb  = _mm512_reduce_add_ps(vnb);
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 vdot = _mm256_setzero_ps();
+    __m256 vna  = _mm256_setzero_ps();
+    __m256 vnb  = _mm256_setzero_ps();
+    for (int d = 0; d < VSA_DENSE_4096_DIM; d += 8) {
+        __m256 va = _mm256_loadu_ps(a_4096 + d);
+        __m256 vb = _mm256_loadu_ps(b_4096 + d);
+        vdot = _mm256_fmadd_ps(va, vb, vdot);
+        vna  = _mm256_fmadd_ps(va, va, vna);
+        vnb  = _mm256_fmadd_ps(vb, vb, vnb);
+    }
+    auto hsum256 = [](__m256 v) -> float {
+        __m128 l = _mm256_castps256_ps128(v);
+        __m128 h = _mm256_extractf128_ps(v, 1);
+        l = _mm_add_ps(l, h);
+        __m128 shuf = _mm_movehdup_ps(l);
+        __m128 sums = _mm_add_ps(l, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    };
+    float dot = hsum256(vdot);
+    float na  = hsum256(vna);
+    float nb  = hsum256(vnb);
+#else
+    double dot_d = 0.0, na_d = 0.0, nb_d = 0.0;
+    for (int d = 0; d < VSA_DENSE_4096_DIM; ++d) {
+        double x = a_4096[d];
+        double y = b_4096[d];
+        dot_d += x * y;
+        na_d  += x * x;
+        nb_d  += y * y;
+    }
+    float dot = static_cast<float>(dot_d);
+    float na  = static_cast<float>(na_d);
+    float nb  = static_cast<float>(nb_d);
+#endif
+    if (na <= 1e-20f || nb <= 1e-20f || !std::isfinite(dot)) return 0.0f;
+    float c = dot / std::sqrt(na * nb);
+    return std::clamp(c, -1.0f, 1.0f);
+}
+
+int vsa_db_insert_dense_4096(VsaDbHandle* db, uint64_t key_hash, const float* vec_4096) {
+    if (!db || !vec_4096) return -1;
+    double nsq = 0.0;
+    for (int d = 0; d < VSA_DENSE_4096_DIM; ++d) {
+        if (!std::isfinite(vec_4096[d])) return -1;
+        nsq += static_cast<double>(vec_4096[d]) * static_cast<double>(vec_4096[d]);
+    }
+    if (nsq <= 1e-20) return -1;
+    float inv_n = static_cast<float>(1.0 / std::sqrt(nsq));
+
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    auto it = db->dense_4096_pos.find(key_hash);
+    if (it != db->dense_4096_pos.end()) {
+        Dense4096Entry& e = db->dense_4096_entries[it->second];
+        e.inv_norm = inv_n;
+        std::memcpy(e.vec, vec_4096, sizeof(float) * VSA_DENSE_4096_DIM);
+        return 0;
+    }
+    Dense4096Entry e;
+    e.key_hash = key_hash;
+    e.inv_norm = inv_n;
+    std::memcpy(e.vec, vec_4096, sizeof(float) * VSA_DENSE_4096_DIM);
+    db->dense_4096_pos.emplace(key_hash, db->dense_4096_entries.size());
+    db->dense_4096_entries.push_back(e);
+    return 0;
+}
+
+int vsa_db_query_dense_4096(
+    VsaDbHandle* db,
+    const float* query_4096,
+    uint64_t* out_best_key,
+    float* out_best_vec_4096,
+    float* out_cosine_sim
+) {
+    if (out_best_key) *out_best_key = 0;
+    if (out_cosine_sim) *out_cosine_sim = 0.0f;
+    if (!db || !query_4096 || !out_cosine_sim) return -1;
+
+    double q_nsq = 0.0;
+    for (int d = 0; d < VSA_DENSE_4096_DIM; ++d) {
+        if (!std::isfinite(query_4096[d])) return 0;
+        q_nsq += static_cast<double>(query_4096[d]) * static_cast<double>(query_4096[d]);
+    }
+    if (q_nsq <= 1e-20) return 0;
+
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    if (db->dense_4096_entries.empty()) return 0;
+
+    float best_sim = -2.0f;
+    int best_idx = -1;
+
+    for (size_t i = 0; i < db->dense_4096_entries.size(); ++i) {
+        float s = vsa_cosine_sim_4096_f32(query_4096, db->dense_4096_entries[i].vec);
+        if (s > best_sim) {
+            best_sim = s;
+            best_idx = static_cast<int>(i);
+        }
+    }
+
+    if (best_idx < 0 || !std::isfinite(best_sim)) return 0;
+    const Dense4096Entry& winner = db->dense_4096_entries[best_idx];
+    if (out_best_key) *out_best_key = winner.key_hash;
+    if (out_best_vec_4096) {
+        std::memcpy(out_best_vec_4096, winner.vec, sizeof(float) * VSA_DENSE_4096_DIM);
+    }
+    *out_cosine_sim = best_sim;
+    return 1;
+}
+
+// =============================================================================
+// Continuous VSA Function Approximation (Fractional Power / Fourier Phase)
+// =============================================================================
+
+static void encode_vsa_scalar_phase_512(float x, float x_min, float x_max, uint64_t* out_bits) {
+    float span = std::max(1e-5f, x_max - x_min);
+    float u = std::clamp((x - x_min) / span, 0.0f, 1.0f);
+    // Locality-preserving thermometer + multi-frequency phase code across 512 bits
+    int thresh_bit = static_cast<int>(std::lround(u * 256.0f));
+    std::memset(out_bits, 0, sizeof(uint64_t) * 8);
+    for (int b = 0; b < 256; ++b) {
+        if (b < thresh_bit) {
+            out_bits[b >> 6] |= (1ULL << (b & 63));
+        }
+    }
+    uint64_t seed = 0x517CC1B727220A95ULL;
+    for (int b = 256; b < 512; ++b) {
+        uint64_t z = splitmix64(&seed);
+        float freq = 0.5f + static_cast<float>(z & 0xFFU) * 0.08f;
+        float phi  = static_cast<float>((z >> 8) & 0xFFFFU) * (6.2831853f / 65536.0f);
+        if (std::cos(freq * u * 3.14159265f + phi) >= 0.0f) {
+            out_bits[b >> 6] |= (1ULL << (b & 63));
+        }
+    }
+}
+
+int vsa_db_bind_continuous_point(VsaDbHandle* db, const char* relation_name, float x_val, float y_val) {
+    if (!db || !relation_name || relation_name[0] == '\0' || !std::isfinite(x_val) || !std::isfinite(y_val)) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    VsaContinuousFuncModel& m = db->cont_funcs[relation_name];
+
+    bool updated = false;
+    for (auto& s : m.samples) {
+        if (std::fabs(s.x - x_val) < 1e-6f) {
+            s.y = y_val;
+            updated = true;
+            break;
+        }
+    }
+    if (!updated) {
+        VsaContinuousFuncSample s;
+        s.x = x_val;
+        s.y = y_val;
+        m.samples.push_back(s);
+    }
+
+    std::sort(m.samples.begin(), m.samples.end(), [](const VsaContinuousFuncSample& a, const VsaContinuousFuncSample& b) {
+        return a.x < b.x;
+    });
+
+    m.x_min = m.samples.front().x;
+    m.x_max = m.samples.back().x;
+    const size_t n = m.samples.size();
+    if (n >= 2) {
+        float sum_dx = 0.0f;
+        for (size_t i = 1; i < n; ++i) sum_dx += (m.samples[i].x - m.samples[i - 1].x);
+        float mean_dx = sum_dx / static_cast<float>(n - 1);
+        m.bandwidth = std::max(1e-4f, mean_dx * 1.15f);
+    } else {
+        m.bandwidth = 1.0f;
+    }
+
+    for (auto& s : m.samples) {
+        encode_vsa_scalar_phase_512(s.x, m.x_min, m.x_max, s.phase_sk);
+    }
+
+    // Train Random Fourier Phase hypervector weights in R^128 via gradient descent
+    uint64_t rseed = fnv1a_64(relation_name, std::strlen(relation_name)) ^ 0x9E3779B97F4A7C15ULL;
+    float inv_bw = 1.0f / std::max(1e-3f, m.bandwidth * 2.0f);
+    for (int k = 0; k < 128; ++k) {
+        uint64_t z1 = splitmix64(&rseed);
+        uint64_t z2 = splitmix64(&rseed);
+        float u1 = std::max(1e-6f, static_cast<float>((z1 & 0xFFFFFFULL) + 1ULL) / 16777216.0f);
+        float u2 = static_cast<float>(z2 & 0xFFFFFFULL) / 16777216.0f;
+        float g = std::sqrt(-2.0f * std::log(u1)) * std::cos(6.2831853f * u2);
+        m.rff_omega[k] = g * inv_bw;
+        m.rff_phase[k] = u2 * 6.2831853f;
+        m.rff_weights[k] = 0.0f;
+    }
+    const float scale = std::sqrt(2.0f / 128.0f);
+    for (int it = 0; it < 60; ++it) {
+        float lr = 0.30f / (1.0f + 0.03f * static_cast<float>(it));
+        for (size_t i = 0; i < n; ++i) {
+            float phi[128];
+            float pred = 0.0f;
+            for (int k = 0; k < 128; ++k) {
+                phi[k] = scale * std::cos(m.rff_omega[k] * m.samples[i].x + m.rff_phase[k]);
+                pred += m.rff_weights[k] * phi[k];
+            }
+            float err = pred - m.samples[i].y;
+            for (int k = 0; k < 128; ++k) {
+                m.rff_weights[k] -= lr * (err * phi[k] + 1e-4f * m.rff_weights[k]);
+            }
+        }
+    }
+    m.rff_ready = true;
+    return 0;
+}
+
+int vsa_db_eval_continuous_function(VsaDbHandle* db, const char* relation_name, float x_query, float* out_y) {
+    if (out_y) *out_y = 0.0f;
+    if (!db || !relation_name || !out_y || !std::isfinite(x_query)) return 0;
+    std::lock_guard<std::mutex> lock(db->db_mutex);
+    auto it = db->cont_funcs.find(relation_name);
+    if (it == db->cont_funcs.end() || it->second.samples.empty()) return 0;
+
+    const VsaContinuousFuncModel& m = it->second;
+    const size_t n = m.samples.size();
+    if (n == 1) {
+        *out_y = m.samples[0].y;
+        return 1;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (std::fabs(x_query - m.samples[i].x) < 1e-6f) {
+            *out_y = m.samples[i].y;
+            return 1;
+        }
+    }
+
+    uint64_t q_sk[8];
+    encode_vsa_scalar_phase_512(x_query, m.x_min, m.x_max, q_sk);
+
+    double h = std::max(1e-4, static_cast<double>(m.bandwidth));
+    double inv_2h2 = 1.0 / (2.0 * h * h);
+    double sw = 0.0, swx = 0.0, swx2 = 0.0, swx3 = 0.0, swx4 = 0.0;
+    double swy = 0.0, swxy = 0.0, swx2y = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        double dx = static_cast<double>(m.samples[i].x - x_query);
+        double dx2 = dx * dx;
+        double w_gauss = std::exp(-dx2 * inv_2h2);
+        int32_t ham_m = vsa_hamming_matches_512(q_sk, m.samples[i].phase_sk);
+        double w_vsa = std::max(0.0, static_cast<double>(2 * ham_m - 512) / 512.0);
+        double w = w_gauss * (0.85 + 0.15 * w_vsa) + 1e-9 / (1.0 + dx2);
+        double y = static_cast<double>(m.samples[i].y);
+        sw    += w;
+        swx   += w * dx;
+        swx2  += w * dx2;
+        swx3  += w * dx2 * dx;
+        swx4  += w * dx2 * dx2;
+        swy   += w * y;
+        swxy  += w * dx * y;
+        swx2y += w * dx2 * y;
+    }
+
+    double y_loc = (sw > 1e-15) ? (swy / sw) : 0.0;
+    bool solved_quad = false;
+    if (n >= 4 && sw > 1e-15) {
+        double A[3][3] = {
+            { sw,   swx,  swx2        },
+            { swx,  swx2, swx3        },
+            { swx2, swx3, swx4 + 1e-9 }
+        };
+        double B[3] = { swy, swxy, swx2y };
+        bool ok = true;
+        for (int col = 0; col < 3; ++col) {
+            int piv = col;
+            double mv = std::fabs(A[col][col]);
+            for (int r = col + 1; r < 3; ++r) {
+                if (std::fabs(A[r][col]) > mv) { mv = std::fabs(A[r][col]); piv = r; }
+            }
+            if (mv < 1e-12) { ok = false; break; }
+            if (piv != col) {
+                for (int c = col; c < 3; ++c) std::swap(A[col][c], A[piv][c]);
+                std::swap(B[col], B[piv]);
+            }
+            double inv_d = 1.0 / A[col][col];
+            for (int r = col + 1; r < 3; ++r) {
+                double f = A[r][col] * inv_d;
+                for (int c = col; c < 3; ++c) A[r][c] -= f * A[col][c];
+                B[r] -= f * B[col];
+            }
+        }
+        if (ok) {
+            double c2 = B[2] / A[2][2];
+            double c1 = (B[1] - A[1][2] * c2) / A[1][1];
+            double c0 = (B[0] - A[0][1] * c1 - A[0][2] * c2) / A[0][0];
+            y_loc = c0;
+            solved_quad = true;
+        }
+    }
+    if (!solved_quad) {
+        double det = sw * swx2 - swx * swx;
+        if (sw > 1e-15 && std::fabs(det) > 1e-12 * sw * sw) {
+            y_loc = (swx2 * swy - swx * swxy) / det;
+        }
+    }
+
+    double y_rff = y_loc;
+    if (m.rff_ready) {
+        const float scale = std::sqrt(2.0f / 128.0f);
+        double acc = 0.0;
+        for (int k = 0; k < 128; ++k) {
+            acc += static_cast<double>(m.rff_weights[k]) *
+                   static_cast<double>(scale * std::cos(m.rff_omega[k] * x_query + m.rff_phase[k]));
+        }
+        y_rff = acc;
+    }
+
+    bool in_hull = (x_query >= m.x_min && x_query <= m.x_max);
+    *out_y = static_cast<float>(in_hull ? (0.98 * y_loc + 0.02 * y_rff) : (0.85 * y_loc + 0.15 * y_rff));
     return 1;
 }
 

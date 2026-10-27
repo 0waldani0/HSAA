@@ -9820,9 +9820,11 @@ struct PopCountGenerativeLLM {
     // directly compatible with 4-bitplane + sign POPCNT units and AVX-512BW int8 MADD kernels.
     static constexpr int NUM_DEEP_LAYERS = 32;
     static constexpr int SGD_MANIFOLD_EPOCHS = 6;
+    static constexpr int D_DENSE_4096 = 4096;
     mutable std::vector<std::array<int8_t, D_MODEL>> tok_cont_emb;
     mutable std::vector<std::array<int8_t, D_MODEL>> tok_next_cont_centroid;
     mutable std::vector<std::array<int8_t, D_MODEL>> seg_cont_centroid;
+    mutable std::vector<std::array<float, D_DENSE_4096>> tok_dense_emb_4096;
     mutable std::vector<int32_t> tok_cont_norm_sq;
     mutable std::vector<float> tok_cont_inv_norm;
     mutable std::vector<uint32_t> tok_doc_freq;
@@ -9833,6 +9835,273 @@ struct PopCountGenerativeLLM {
     mutable FlatCandidateTable step_cands;
     mutable bool cont_space_ready = false;
     mutable bool cont_emb_synced = false;
+    mutable double last_backprop_initial_loss = 0.0;
+    mutable double last_backprop_final_loss = 0.0;
+
+    // AVX-512 / AVX2+FMA 4096-Dimensional Dense Float32 Cosine Similarity & L2 Normalization
+    static inline float dense_cosine_f32_4096(const float* a, const float* b) {
+        if (!a || !b) return 0.0f;
+#if defined(__AVX512F__)
+        __m512 vdot = _mm512_setzero_ps();
+        __m512 vna  = _mm512_setzero_ps();
+        __m512 vnb  = _mm512_setzero_ps();
+        for (int d = 0; d < D_DENSE_4096; d += 16) {
+            __m512 va = _mm512_loadu_ps(a + d);
+            __m512 vb = _mm512_loadu_ps(b + d);
+            vdot = _mm512_fmadd_ps(va, vb, vdot);
+            vna  = _mm512_fmadd_ps(va, va, vna);
+            vnb  = _mm512_fmadd_ps(vb, vb, vnb);
+        }
+        float dot = _mm512_reduce_add_ps(vdot);
+        float na  = _mm512_reduce_add_ps(vna);
+        float nb  = _mm512_reduce_add_ps(vnb);
+#elif defined(__AVX2__) && defined(__FMA__)
+        __m256 vdot = _mm256_setzero_ps();
+        __m256 vna  = _mm256_setzero_ps();
+        __m256 vnb  = _mm256_setzero_ps();
+        for (int d = 0; d < D_DENSE_4096; d += 8) {
+            __m256 va = _mm256_loadu_ps(a + d);
+            __m256 vb = _mm256_loadu_ps(b + d);
+            vdot = _mm256_fmadd_ps(va, vb, vdot);
+            vna  = _mm256_fmadd_ps(va, va, vna);
+            vnb  = _mm256_fmadd_ps(vb, vb, vnb);
+        }
+        auto hsum256 = [](__m256 v) -> float {
+            __m128 lo = _mm256_castps256_ps128(v);
+            __m128 hi = _mm256_extractf128_ps(v, 1);
+            __m128 s = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            return _mm_cvtss_f32(s);
+        };
+        float dot = hsum256(vdot);
+        float na  = hsum256(vna);
+        float nb  = hsum256(vnb);
+#else
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (int d = 0; d < D_DENSE_4096; ++d) {
+            dot += static_cast<double>(a[d]) * static_cast<double>(b[d]);
+            na  += static_cast<double>(a[d]) * static_cast<double>(a[d]);
+            nb  += static_cast<double>(b[d]) * static_cast<double>(b[d]);
+        }
+#endif
+        double denom = std::sqrt(static_cast<double>(na) * static_cast<double>(nb));
+        if (denom < 1e-12) return 0.0f;
+        float res = static_cast<float>(static_cast<double>(dot) / denom);
+        return std::max(-1.0f, std::min(1.0f, res));
+    }
+
+    static inline void dense_l2_normalize_4096(float* v) {
+        if (!v) return;
+#if defined(__AVX512F__)
+        __m512 vnsq = _mm512_setzero_ps();
+        for (int d = 0; d < D_DENSE_4096; d += 16) {
+            __m512 x = _mm512_loadu_ps(v + d);
+            vnsq = _mm512_fmadd_ps(x, x, vnsq);
+        }
+        double nsq = static_cast<double>(_mm512_reduce_add_ps(vnsq));
+        if (nsq < 1e-12) return;
+        __m512 vinv = _mm512_set1_ps(static_cast<float>(1.0 / std::sqrt(nsq)));
+        for (int d = 0; d < D_DENSE_4096; d += 16) {
+            _mm512_storeu_ps(v + d, _mm512_mul_ps(_mm512_loadu_ps(v + d), vinv));
+        }
+#elif defined(__AVX2__) && defined(__FMA__)
+        __m256 vnsq = _mm256_setzero_ps();
+        for (int d = 0; d < D_DENSE_4096; d += 8) {
+            __m256 x = _mm256_loadu_ps(v + d);
+            vnsq = _mm256_fmadd_ps(x, x, vnsq);
+        }
+        __m128 lo = _mm256_castps256_ps128(vnsq);
+        __m128 hi = _mm256_extractf128_ps(vnsq, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        double nsq = static_cast<double>(_mm_cvtss_f32(s));
+        if (nsq < 1e-12) return;
+        __m256 vinv = _mm256_set1_ps(static_cast<float>(1.0 / std::sqrt(nsq)));
+        for (int d = 0; d < D_DENSE_4096; d += 8) {
+            _mm256_storeu_ps(v + d, _mm256_mul_ps(_mm256_loadu_ps(v + d), vinv));
+        }
+#else
+        double nsq = 0.0;
+        for (int d = 0; d < D_DENSE_4096; ++d) nsq += static_cast<double>(v[d]) * static_cast<double>(v[d]);
+        if (nsq < 1e-12) return;
+        float inv = static_cast<float>(1.0 / std::sqrt(nsq));
+        for (int d = 0; d < D_DENSE_4096; ++d) v[d] *= inv;
+#endif
+    }
+
+    // End-to-End Analytical Backpropagation Continuous Foundation Manifold
+    struct FoundationContinuousManifold {
+        static constexpr int D_LAT   = 64;
+        static constexpr int D_HID   = 128;
+        static constexpr int CTX_WIN = 6;
+        static constexpr int MAX_COMPACT_V = 512;
+
+        bool initialized = false;
+        size_t vocab_size = 0;
+        std::vector<int> compact_to_vocab;
+        std::vector<int> vocab_to_compact;
+
+        // Trainable continuous parameters (updated via exact analytical backpropagation)
+        std::vector<std::array<float, D_LAT>> E_tok;
+        std::array<float, CTX_WIN> pos_w{};
+        std::array<float, D_HID * D_LAT> W1{};
+        std::array<float, D_HID> b1{};
+        std::array<float, D_LAT * D_HID> W1_proj{};
+        std::array<float, D_LAT> b1_proj{};
+        std::array<float, D_HID * D_LAT> W2{};
+        std::array<float, D_HID> b2{};
+        std::array<float, D_LAT * D_HID> W2_proj{};
+        std::array<float, D_LAT> b2_proj{};
+        std::vector<std::array<float, D_LAT>> W_out;
+        std::vector<float> b_out;
+
+        static inline float silu(float x) {
+            float sig = 1.0f / (1.0f + std::exp(-std::max(-20.0f, std::min(20.0f, x))));
+            return x * sig;
+        }
+        static inline float dsilu(float x) {
+            float sig = 1.0f / (1.0f + std::exp(-std::max(-20.0f, std::min(20.0f, x))));
+            return sig * (1.0f + x * (1.0f - sig));
+        }
+
+        void init_weights(
+            size_t V,
+            const std::vector<int>& active_toks,
+            const std::vector<std::array<int8_t, D_MODEL>>& cont_emb
+        ) {
+            vocab_size = V;
+            compact_to_vocab = active_toks;
+            if (compact_to_vocab.size() > static_cast<size_t>(MAX_COMPACT_V)) {
+                compact_to_vocab.resize(MAX_COMPACT_V);
+            }
+            vocab_to_compact.assign(V, -1);
+            for (size_t ci = 0; ci < compact_to_vocab.size(); ++ci) {
+                int vt = compact_to_vocab[ci];
+                if (vt >= 0 && static_cast<size_t>(vt) < V) {
+                    vocab_to_compact[vt] = static_cast<int>(ci);
+                }
+            }
+
+            E_tok.resize(V);
+            for (size_t t = 0; t < V; ++t) {
+                float nsq = 0.0f;
+                for (int d = 0; d < D_LAT; ++d) {
+                    float sum = 0.0f;
+                    if (t < cont_emb.size()) {
+                        for (int k = 0; k < 8; ++k) {
+                            sum += static_cast<float>(cont_emb[t][d * 8 + k]) * ((k & 1) ? -0.04f : 0.04f);
+                        }
+                    } else {
+                        uint64_t h = hsaa_assoc::mix64(0x9E3779B97F4A7C15ULL ^ (t * 1315423911ULL + d));
+                        sum = (static_cast<float>(h & 0xFFFFU) / 32768.0f - 1.0f) * 0.25f;
+                    }
+                    E_tok[t][d] = sum;
+                    nsq += sum * sum;
+                }
+                if (nsq > 1e-8f) {
+                    float inv = 1.0f / std::sqrt(nsq);
+                    for (int d = 0; d < D_LAT; ++d) E_tok[t][d] *= inv;
+                }
+            }
+
+            const float base_pw[CTX_WIN] = {0.46f, 0.24f, 0.13f, 0.08f, 0.05f, 0.04f};
+            for (int k = 0; k < CTX_WIN; ++k) pos_w[k] = base_pw[k];
+
+            auto rand_w = [](uint64_t seed, float scale) -> float {
+                uint64_t h = hsaa_assoc::mix64(seed);
+                return (static_cast<float>(h & 0xFFFFU) / 32768.0f - 1.0f) * scale;
+            };
+            const float s1 = std::sqrt(2.0f / static_cast<float>(D_LAT + D_HID));
+            for (size_t i = 0; i < W1.size(); ++i) W1[i] = rand_w(0xA1B2C3D400000000ULL + i, s1);
+            b1.fill(0.0f);
+            for (size_t i = 0; i < W1_proj.size(); ++i) W1_proj[i] = rand_w(0xB2C3D4E500000000ULL + i, s1 * 0.5f);
+            b1_proj.fill(0.0f);
+            for (size_t i = 0; i < W2.size(); ++i) W2[i] = rand_w(0xC3D4E5F600000000ULL + i, s1);
+            b2.fill(0.0f);
+            for (size_t i = 0; i < W2_proj.size(); ++i) W2_proj[i] = rand_w(0xD4E5F60700000000ULL + i, s1 * 0.5f);
+            b2_proj.fill(0.0f);
+
+            const size_t CV = compact_to_vocab.size();
+            W_out.resize(CV);
+            b_out.assign(CV, 0.0f);
+            for (size_t c = 0; c < CV; ++c) {
+                int vt = compact_to_vocab[c];
+                if (vt >= 0 && static_cast<size_t>(vt) < V) {
+                    W_out[c] = E_tok[vt];
+                } else {
+                    W_out[c].fill(0.0f);
+                }
+            }
+            initialized = (CV > 1);
+        }
+
+        // Forward pass through the 2-layer SwiGLU/SiLU residual manifold
+        void forward_hidden(
+            const int* ctx_toks,
+            size_t ctx_len,
+            std::array<float, D_LAT>& x_ctx,
+            std::array<float, D_HID>& z1,
+            std::array<float, D_HID>& a1,
+            std::array<float, D_LAT>& u1,
+            std::array<float, D_HID>& z2,
+            std::array<float, D_HID>& a2,
+            std::array<float, D_LAT>& h_out
+        ) const {
+            x_ctx.fill(0.0f);
+            const size_t win = std::min<size_t>(ctx_len, CTX_WIN);
+            float w_sum = 0.0f;
+            for (size_t k = 0; k < win; ++k) {
+                int t = ctx_toks[ctx_len - 1 - k];
+                if (t >= 0 && static_cast<size_t>(t) < E_tok.size()) {
+                    float w = pos_w[k];
+                    w_sum += w;
+                    for (int d = 0; d < D_LAT; ++d) {
+                        x_ctx[d] += w * E_tok[t][d];
+                    }
+                }
+            }
+            if (w_sum > 1e-6f) {
+                float inv_w = 1.0f / w_sum;
+                for (int d = 0; d < D_LAT; ++d) x_ctx[d] *= inv_w;
+            }
+
+            for (int i = 0; i < D_HID; ++i) {
+                float s = b1[i];
+                const float* row = &W1[i * D_LAT];
+                for (int j = 0; j < D_LAT; ++j) s += row[j] * x_ctx[j];
+                z1[i] = s;
+                a1[i] = silu(s);
+            }
+            for (int d = 0; d < D_LAT; ++d) {
+                float s = x_ctx[d] + b1_proj[d];
+                const float* row = &W1_proj[d * D_HID];
+                for (int i = 0; i < D_HID; ++i) s += row[i] * a1[i];
+                u1[d] = s;
+            }
+            for (int i = 0; i < D_HID; ++i) {
+                float s = b2[i];
+                const float* row = &W2[i * D_LAT];
+                for (int j = 0; j < D_LAT; ++j) s += row[j] * u1[j];
+                z2[i] = s;
+                a2[i] = silu(s);
+            }
+            float h_nsq = 0.0f;
+            for (int d = 0; d < D_LAT; ++d) {
+                float s = u1[d] + b2_proj[d];
+                const float* row = &W2_proj[d * D_HID];
+                for (int i = 0; i < D_HID; ++i) s += row[i] * a2[i];
+                h_out[d] = s;
+                h_nsq += s * s;
+            }
+            if (h_nsq > 16.0f) {
+                float scale = 4.0f / std::sqrt(h_nsq);
+                for (int d = 0; d < D_LAT; ++d) h_out[d] *= scale;
+            }
+        }
+    };
+    mutable FoundationContinuousManifold foundation_net;
 
     // Morpho-Syntactic Agreement & Inflectional Synthesis Engine
     enum PosCategory : uint8_t {
@@ -10703,6 +10972,378 @@ struct PopCountGenerativeLLM {
                 if (vec.size() < 16) vec.push_back(static_cast<int>(t));
             }
         }
+
+        // 9. Build 4096-Dimensional Dense Float32 Embeddings (8 Orthogonal 512-D Subspaces)
+        tok_dense_emb_4096.resize(V);
+        for (size_t t = 0; t < V; ++t) {
+            compute_token_dense_4096_single(t, tok_dense_emb_4096[t]);
+        }
+
+        // 10. Train Foundation Continuous Manifold via Analytical Backpropagation (when corpus is present)
+        if (!segment_records.empty() && V <= 8192) {
+            double init_l = 0.0, final_l = 0.0;
+            train_foundation_backprop_internal(5, 0.12f, &init_l, &final_l);
+            last_backprop_initial_loss = init_l;
+            last_backprop_final_loss = final_l;
+        }
+    }
+
+    void compute_token_dense_4096_single(size_t t, std::array<float, D_DENSE_4096>& out) const {
+        out.fill(0.0f);
+        const size_t V = tokenizer.id_to_word.size();
+        if (t >= V) return;
+        const std::string& raw_w = tokenizer.id_to_word[t];
+        const std::string nw = hsaa_assoc::normalize(raw_w.c_str());
+        const int role_t = (t < tok_to_role.size() && tok_to_role[t] >= 0 &&
+                            static_cast<size_t>(tok_to_role[t]) < tok_cont_emb.size())
+            ? tok_to_role[t] : static_cast<int>(t);
+
+        // Band 0 (0..511): 512-D Riemannian token embedding + deep layer gate modulation
+        if (t < tok_cont_emb.size()) {
+            for (int d = 0; d < 512; ++d) {
+                out[d] = static_cast<float>(tok_cont_emb[t][d]) * (1.0f / 15.0f) * deep_layer_gate[0][d];
+            }
+        }
+        // Band 1 (512..1023): Forward predictive transition centroid
+        if (t < tok_next_cont_centroid.size()) {
+            for (int d = 0; d < 512; ++d) {
+                out[512 + d] = static_cast<float>(tok_next_cont_centroid[t][d]) * (0.85f / 15.0f);
+            }
+        }
+        // Band 2 (1024..1535): Functional & syntactic role manifold prototype
+        if (role_t >= 0 && static_cast<size_t>(role_t) < tok_cont_emb.size()) {
+            for (int d = 0; d < 512; ++d) {
+                float rv = static_cast<float>(tok_cont_emb[role_t][d]) * (0.75f / 15.0f);
+                if (static_cast<size_t>(role_t) < tok_next_cont_centroid.size()) {
+                    rv += static_cast<float>(tok_next_cont_centroid[role_t][d]) * (0.25f / 15.0f);
+                }
+                out[1024 + d] = rv;
+            }
+        }
+        // Band 3 (1536..2047): Morphological stem & subword sketch spectrum
+        if (t < vocab_morph_sketch.size()) {
+            const uint64_t* sk = vocab_morph_sketch[t].data();
+            uint64_t sh = (t < tok_morph_sig.size() && tok_morph_sig[t].stem_hash != 0ULL)
+                ? tok_morph_sig[t].stem_hash : hsaa_assoc::mix64(t + 0x517CC1B727220A95ULL);
+            for (int d = 0; d < 512; ++d) {
+                float bit_v = ((sk[d >> 6] >> (d & 63)) & 1ULL) ? 0.65f : -0.65f;
+                uint64_t mh = hsaa_assoc::mix64(sh ^ (static_cast<uint64_t>(d) * 0x9E3779B97F4A7C15ULL));
+                float stem_v = (static_cast<float>(mh & 0xFFFFU) / 32768.0f - 1.0f) * 0.35f;
+                out[1536 + d] = bit_v + stem_v;
+            }
+        }
+        // Band 4 (2048..2559): Continuous character-position Fourier phase & numeric value spectrum
+        {
+            const std::string& s_ref = nw.empty() ? raw_w : nw;
+            const size_t slen = s_ref.size();
+            for (size_t i = 0; i < slen; ++i) {
+                unsigned char c = static_cast<unsigned char>(s_ref[i]);
+                float pos_phase = static_cast<float>(i + 1) / static_cast<float>(slen + 1);
+                for (int k = 0; k < 16; ++k) {
+                    int idx = static_cast<int>((c * 131U + k * 31U + i * 17U) & 511U);
+                    float freq = 0.05f * static_cast<float>(k + 1);
+                    out[2048 + idx] += 0.35f * std::cos(freq * static_cast<float>(c) + 3.14159265f * pos_phase);
+                    out[2048 + ((idx + 256) & 511)] += 0.35f * std::sin(freq * static_cast<float>(c) + 3.14159265f * pos_phase);
+                }
+            }
+        }
+        // Band 5 (2560..3071): Discourse segment centroid covariance
+        if (t < tok_to_segments.size() && !tok_to_segments[t].empty()) {
+            const auto& seg_list = tok_to_segments[t];
+            const size_t lim = std::min<size_t>(seg_list.size(), 8);
+            float inv_s = 0.80f / static_cast<float>(lim * 15);
+            for (size_t si = 0; si < lim; ++si) {
+                int seg_id = seg_list[si];
+                if (seg_id >= 0 && static_cast<size_t>(seg_id) < seg_cont_centroid.size()) {
+                    const auto& sc = seg_cont_centroid[seg_id];
+                    for (int d = 0; d < 512; ++d) {
+                        out[2560 + d] += static_cast<float>(sc[d]) * inv_s;
+                    }
+                }
+            }
+        } else if (t < token_topic_sketch.size()) {
+            const uint64_t* tsk = token_topic_sketch[t].data();
+            for (int d = 0; d < 512; ++d) {
+                out[2560 + d] = ((tsk[d >> 6] >> (d & 63)) & 1ULL) ? 0.50f : -0.50f;
+            }
+        }
+        // Band 6 (3072..3583): Non-linear interaction cross-features (Band 0 * Band 2 / Band 1)
+        for (int d = 0; d < 512; ++d) {
+            float a = out[d];
+            float b = out[512 + ((d + 7) & 511)];
+            float c = out[1024 + ((d + 19) & 511)];
+            out[3072 + d] = 0.60f * (a + c) + 0.40f * std::tanh(a * b * 2.5f);
+        }
+        // Band 7 (3584..4095): Analytical Backprop Latent Projection (updated after backprop)
+        if (foundation_net.initialized && t < foundation_net.E_tok.size()) {
+            const auto& et = foundation_net.E_tok[t];
+            for (int d = 0; d < 512; ++d) {
+                int ld = d & (FoundationContinuousManifold::D_LAT - 1);
+                int hd = d & (FoundationContinuousManifold::D_HID - 1);
+                float w_val = foundation_net.W1[hd * FoundationContinuousManifold::D_LAT + ld];
+                out[3584 + d] = 0.75f * et[ld] + 0.25f * FoundationContinuousManifold::silu(et[ld] * w_val * 4.0f);
+            }
+        } else {
+            for (int d = 0; d < 512; ++d) {
+                out[3584 + d] = 0.55f * out[d] + 0.45f * out[1536 + d];
+            }
+        }
+        dense_l2_normalize_4096(out.data());
+    }
+
+    // End-to-End Analytical Backpropagation Training over the Continuous Manifold
+    bool train_foundation_backprop_internal(
+        int epochs,
+        float lr,
+        double* out_init_loss,
+        double* out_final_loss
+    ) const {
+        const size_t V = tokenizer.id_to_word.size();
+        if (V <= 2 || segment_records.empty()) return false;
+        if (epochs <= 0) epochs = 5;
+        if (lr <= 0.0f) lr = 0.10f;
+
+        // Collect transitions and frequency-ranked active vocabulary
+        std::vector<uint32_t> freq(V, 0);
+        struct BackpropSample {
+            int ctx[FoundationContinuousManifold::CTX_WIN];
+            uint8_t ctx_len;
+            int target_vocab_id;
+            int target_compact_id;
+        };
+        for (const auto& seg : segment_records) {
+            for (size_t pos = 1; pos < seg.tokens.size(); ++pos) {
+                int gold = seg.tokens[pos];
+                if (gold >= 0 && static_cast<size_t>(gold) < V &&
+                    gold != CodeProseTokenizer::TOK_PAD && gold != CodeProseTokenizer::TOK_BOS) {
+                    freq[gold]++;
+                }
+            }
+        }
+        std::vector<int> active_toks;
+        active_toks.reserve(V);
+        for (size_t t = 0; t < V; ++t) {
+            if (freq[t] > 0) active_toks.push_back(static_cast<int>(t));
+        }
+        std::sort(active_toks.begin(), active_toks.end(), [&](int a, int b) {
+            return (freq[a] != freq[b]) ? (freq[a] > freq[b]) : (a < b);
+        });
+        if (active_toks.size() < 2) return false;
+
+        if (!foundation_net.initialized || foundation_net.vocab_size != V ||
+            foundation_net.compact_to_vocab != active_toks) {
+            foundation_net.init_weights(V, active_toks, tok_cont_emb);
+        }
+        const size_t CV = foundation_net.compact_to_vocab.size();
+
+        std::vector<BackpropSample> samples;
+        samples.reserve(2048);
+        for (const auto& seg : segment_records) {
+            for (size_t pos = 1; pos < seg.tokens.size(); ++pos) {
+                int gold = seg.tokens[pos];
+                if (gold < 0 || static_cast<size_t>(gold) >= V) continue;
+                int cid = foundation_net.vocab_to_compact[gold];
+                if (cid < 0) continue;
+                BackpropSample smp{};
+                size_t win = std::min<size_t>(pos, FoundationContinuousManifold::CTX_WIN);
+                smp.ctx_len = static_cast<uint8_t>(win);
+                for (size_t k = 0; k < win; ++k) {
+                    smp.ctx[win - 1 - k] = seg.tokens[pos - 1 - k];
+                }
+                smp.target_vocab_id = gold;
+                smp.target_compact_id = cid;
+                samples.push_back(smp);
+                if (samples.size() >= 2048) break;
+            }
+            if (samples.size() >= 2048) break;
+        }
+        if (samples.empty()) return false;
+
+        constexpr int D_LAT = FoundationContinuousManifold::D_LAT;
+        constexpr int D_HID = FoundationContinuousManifold::D_HID;
+
+        std::array<float, D_LAT> x_ctx, u1, h_out, g_hout, g_u1, g_xctx;
+        std::array<float, D_HID> z1, a1, z2, a2, g_a2, g_z2, g_a1, g_z1;
+        std::vector<float> logits(CV, 0.0f);
+        std::vector<float> probs(CV, 0.0f);
+
+        auto clip_vec = [](float* v, int dim, float max_norm) {
+            float nsq = 0.0f;
+            for (int i = 0; i < dim; ++i) {
+                if (!std::isfinite(v[i])) v[i] = 0.0f;
+                nsq += v[i] * v[i];
+            }
+            if (nsq > max_norm * max_norm) {
+                float sc = max_norm / std::sqrt(nsq);
+                for (int i = 0; i < dim; ++i) v[i] *= sc;
+            }
+        };
+
+        auto eval_corpus_loss = [&]() -> double {
+            double total_ce = 0.0;
+            for (const auto& smp : samples) {
+                foundation_net.forward_hidden(smp.ctx, smp.ctx_len, x_ctx, z1, a1, u1, z2, a2, h_out);
+                float max_l = -1e30f;
+                for (size_t c = 0; c < CV; ++c) {
+                    float l = foundation_net.b_out[c];
+                    const auto& wc = foundation_net.W_out[c];
+                    for (int d = 0; d < D_LAT; ++d) l += wc[d] * h_out[d];
+                    logits[c] = l;
+                    if (l > max_l) max_l = l;
+                }
+                double sum_exp = 0.0;
+                for (size_t c = 0; c < CV; ++c) {
+                    sum_exp += std::exp(static_cast<double>(logits[c] - max_l));
+                }
+                double log_p = static_cast<double>(logits[smp.target_compact_id] - max_l) - std::log(std::max(1e-12, sum_exp));
+                total_ce += -log_p;
+            }
+            return total_ce / static_cast<double>(samples.size());
+        };
+
+        const double initial_loss = eval_corpus_loss();
+        const float eff_lr = std::min(0.18f, lr);
+
+        for (int ep = 0; ep < epochs; ++ep) {
+            const float cur_lr = eff_lr / (1.0f + 0.15f * static_cast<float>(ep));
+            for (const auto& smp : samples) {
+                foundation_net.forward_hidden(smp.ctx, smp.ctx_len, x_ctx, z1, a1, u1, z2, a2, h_out);
+
+                float max_l = -1e30f;
+                for (size_t c = 0; c < CV; ++c) {
+                    float l = foundation_net.b_out[c];
+                    const auto& wc = foundation_net.W_out[c];
+                    for (int d = 0; d < D_LAT; ++d) l += wc[d] * h_out[d];
+                    logits[c] = l;
+                    if (l > max_l) max_l = l;
+                }
+                float sum_exp = 0.0f;
+                for (size_t c = 0; c < CV; ++c) {
+                    probs[c] = std::exp(std::max(-25.0f, logits[c] - max_l));
+                    sum_exp += probs[c];
+                }
+                const float inv_sum = 1.0f / std::max(1e-12f, sum_exp);
+                for (size_t c = 0; c < CV; ++c) probs[c] *= inv_sum;
+
+                // Analytical gradient of Cross-Entropy wrt logits: dL/dl_c = p_c - 1_{c == target}
+                g_hout.fill(0.0f);
+                for (size_t c = 0; c < CV; ++c) {
+                    float gl = probs[c] - ((static_cast<int>(c) == smp.target_compact_id) ? 1.0f : 0.0f);
+                    if (std::fabs(gl) < 1e-6f) continue;
+                    auto& wc = foundation_net.W_out[c];
+                    for (int d = 0; d < D_LAT; ++d) {
+                        g_hout[d] += gl * wc[d];
+                        wc[d] -= cur_lr * (gl * h_out[d] + 1e-4f * wc[d]);
+                    }
+                    foundation_net.b_out[c] -= cur_lr * gl;
+                }
+                clip_vec(g_hout.data(), D_LAT, 1.5f);
+
+                // Backprop through Layer 2 (u1 -> z2 -> a2 -> h_out)
+                g_a2.fill(0.0f);
+                for (int d = 0; d < D_LAT; ++d) {
+                    const float gh = g_hout[d];
+                    float* row = &foundation_net.W2_proj[d * D_HID];
+                    for (int i = 0; i < D_HID; ++i) {
+                        g_a2[i] += gh * row[i];
+                        row[i] -= cur_lr * 0.35f * (gh * a2[i] + 1e-4f * row[i]);
+                    }
+                    foundation_net.b2_proj[d] -= cur_lr * 0.35f * gh;
+                }
+                for (int i = 0; i < D_HID; ++i) {
+                    g_z2[i] = g_a2[i] * FoundationContinuousManifold::dsilu(z2[i]);
+                }
+                clip_vec(g_z2.data(), D_HID, 1.5f);
+
+                g_u1 = g_hout; // residual highway gradient
+                for (int i = 0; i < D_HID; ++i) {
+                    const float gz = g_z2[i];
+                    float* row = &foundation_net.W2[i * D_LAT];
+                    for (int d = 0; d < D_LAT; ++d) {
+                        g_u1[d] += gz * row[d];
+                        row[d] -= cur_lr * 0.35f * (gz * u1[d] + 1e-4f * row[d]);
+                    }
+                    foundation_net.b2[i] -= cur_lr * 0.35f * gz;
+                }
+                clip_vec(g_u1.data(), D_LAT, 1.5f);
+
+                // Backprop through Layer 1 (x_ctx -> z1 -> a1 -> u1)
+                g_a1.fill(0.0f);
+                for (int d = 0; d < D_LAT; ++d) {
+                    const float gu = g_u1[d];
+                    float* row = &foundation_net.W1_proj[d * D_HID];
+                    for (int i = 0; i < D_HID; ++i) {
+                        g_a1[i] += gu * row[i];
+                        row[i] -= cur_lr * 0.35f * (gu * a1[i] + 1e-4f * row[i]);
+                    }
+                    foundation_net.b1_proj[d] -= cur_lr * 0.35f * gu;
+                }
+                for (int i = 0; i < D_HID; ++i) {
+                    g_z1[i] = g_a1[i] * FoundationContinuousManifold::dsilu(z1[i]);
+                }
+                clip_vec(g_z1.data(), D_HID, 1.5f);
+
+                g_xctx = g_u1; // residual highway gradient
+                for (int i = 0; i < D_HID; ++i) {
+                    const float gz = g_z1[i];
+                    float* row = &foundation_net.W1[i * D_LAT];
+                    for (int d = 0; d < D_LAT; ++d) {
+                        g_xctx[d] += gz * row[d];
+                        row[d] -= cur_lr * 0.35f * (gz * x_ctx[d] + 1e-4f * row[d]);
+                    }
+                    foundation_net.b1[i] -= cur_lr * 0.35f * gz;
+                }
+                clip_vec(g_xctx.data(), D_LAT, 1.5f);
+
+                // Backprop into continuous context token embeddings E_tok
+                float w_sum = 0.0f;
+                for (size_t k = 0; k < smp.ctx_len; ++k) w_sum += foundation_net.pos_w[k];
+                const float inv_w = (w_sum > 1e-6f) ? (1.0f / w_sum) : 1.0f;
+                for (size_t k = 0; k < smp.ctx_len; ++k) {
+                    int ct = smp.ctx[smp.ctx_len - 1 - k];
+                    if (ct >= 0 && static_cast<size_t>(ct) < foundation_net.E_tok.size()) {
+                        float step_e = cur_lr * 0.50f * foundation_net.pos_w[k] * inv_w;
+                        for (int d = 0; d < D_LAT; ++d) {
+                            foundation_net.E_tok[ct][d] -= step_e * g_xctx[d];
+                        }
+                        clip_vec(foundation_net.E_tok[ct].data(), D_LAT, 2.5f);
+                    }
+                }
+                // Continuous predictive alignment on target token embedding E_tok[gold]
+                if (smp.target_vocab_id >= 0 && static_cast<size_t>(smp.target_vocab_id) < foundation_net.E_tok.size()) {
+                    auto& et = foundation_net.E_tok[smp.target_vocab_id];
+                    for (int d = 0; d < D_LAT; ++d) {
+                        et[d] += cur_lr * 0.12f * (h_out[d] - et[d]);
+                    }
+                    clip_vec(et.data(), D_LAT, 2.5f);
+                }
+            }
+        }
+
+        const double final_loss = eval_corpus_loss();
+        if (out_init_loss) *out_init_loss = initial_loss;
+        if (out_final_loss) *out_final_loss = final_loss;
+
+        // Synchronize backprop-refined continuous representations into Band 7 (3584..4095) of tok_dense_emb_4096
+        if (tok_dense_emb_4096.size() == V) {
+            for (size_t t = 0; t < V; ++t) {
+                auto& dv = tok_dense_emb_4096[t];
+                const auto& et = foundation_net.E_tok[t];
+                int r_t = (t < tok_to_role.size() && tok_to_role[t] >= 0 &&
+                           static_cast<size_t>(tok_to_role[t]) < foundation_net.E_tok.size())
+                    ? tok_to_role[t] : static_cast<int>(t);
+                const auto& er = foundation_net.E_tok[r_t];
+                for (int d = 0; d < 512; ++d) {
+                    int ld = d & (D_LAT - 1);
+                    int hd = d & (D_HID - 1);
+                    float w_val = foundation_net.W1[hd * D_LAT + ld];
+                    dv[3584 + d] = 0.65f * et[ld] + 0.20f * er[ld] +
+                                   0.15f * FoundationContinuousManifold::silu(et[ld] * w_val * 4.0f);
+                }
+                dense_l2_normalize_4096(dv.data());
+            }
+        }
+        return true;
     }
 
     static MorphSignature classify_morph_signature(const std::string& raw_w) {
@@ -10931,7 +11572,8 @@ struct PopCountGenerativeLLM {
     }
 
     inline void ensure_continuous_representation_space() const {
-        if (!cont_space_ready || tok_cont_emb.size() != tokenizer.id_to_word.size()) {
+        if (!cont_space_ready || tok_cont_emb.size() != tokenizer.id_to_word.size() ||
+            tok_dense_emb_4096.size() != tokenizer.id_to_word.size()) {
             rebuild_continuous_representation_space();
         }
     }
@@ -11776,6 +12418,10 @@ struct PopCountGenerativeLLM {
             }
         }
 
+        if (total_tokens <= 25000) {
+            ensure_continuous_representation_space();
+        }
+
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_start
         ).count();
@@ -11801,6 +12447,8 @@ struct PopCountGenerativeLLM {
         last_stats.tokens_per_sec = (elapsed_ms > 0.0)
             ? (static_cast<double>(total_tokens * epochs) * 1000.0 / elapsed_ms)
             : 0.0;
+        last_stats.backprop_initial_loss = last_backprop_initial_loss;
+        last_stats.backprop_final_loss = last_backprop_final_loss;
 
         if (out_stats) *out_stats = last_stats;
         return true;
@@ -11961,6 +12609,25 @@ struct PopCountGenerativeLLM {
                 tok_doc_freq.push_back(0U);
                 tok_idf_weight.push_back(tok_is_content[idx] ? 8 : 1);
                 tok_to_segments.emplace_back();
+                if (tok_morph_sig.size() <= idx) {
+                    tok_morph_sig.push_back(classify_morph_signature(tokenizer.id_to_word[idx]));
+                }
+                if (foundation_net.initialized && foundation_net.E_tok.size() <= idx) {
+                    if (r_prior >= 0 && static_cast<size_t>(r_prior) < foundation_net.E_tok.size()) {
+                        foundation_net.E_tok.push_back(foundation_net.E_tok[r_prior]);
+                    } else {
+                        std::array<float, FoundationContinuousManifold::D_LAT> e_oov{};
+                        for (int d = 0; d < FoundationContinuousManifold::D_LAT; ++d) {
+                            e_oov[d] = static_cast<float>(cemb[d * 8]) * 0.05f;
+                        }
+                        foundation_net.E_tok.push_back(e_oov);
+                    }
+                    foundation_net.vocab_to_compact.push_back(-1);
+                    foundation_net.vocab_size = foundation_net.E_tok.size();
+                }
+                std::array<float, D_DENSE_4096> d4096{};
+                compute_token_dense_4096_single(idx, d4096);
+                tok_dense_emb_4096.push_back(d4096);
             }
         }
         if (sublinear_net && static_cast<size_t>(tok_id) >= static_cast<size_t>(sublinear_net->vocab_size)) {
@@ -12358,6 +13025,12 @@ struct PopCountGenerativeLLM {
         float* out_vec512
     ) const;
 
+    bool embed_dense_4096_text(
+        const PopCountBrain* brain,
+        const char* text,
+        float* out_vec4096
+    ) const;
+
     int interpolate_continuous_manifold(
         const PopCountBrain* brain,
         const char* text_a,
@@ -12367,6 +13040,14 @@ struct PopCountGenerativeLLM {
         char* out_nearest_token,
         size_t max_len
     ) const;
+
+    int paraphrase_continuous(
+        const PopCountBrain* brain,
+        const char* input_text,
+        char* out_text,
+        size_t max_len,
+        float temperature
+    );
 
     int generate(
         const PopCountBrain* brain,
@@ -12557,6 +13238,326 @@ struct HolographicSuperpositionBank {
     }
 };
 
+// =============================================================================
+// Locality-Preserving Fractional Power Encoding (Random Fourier Phase VSA) &
+// Continuous Operator Resonance for Non-Linear Function Approximation y = f(x)
+// =============================================================================
+struct ContinuousVsaFunctionApproximator {
+    static constexpr size_t D_PHASE_4096 = 4096;
+    static constexpr size_t WORDS_512 = 8;
+
+    struct ContinuousFunctionModel {
+        size_t x_dim = 1;
+        size_t y_dim = 1;
+        size_t num_samples = 0;
+        std::vector<float> x_mean;
+        std::vector<float> x_scale;
+        std::vector<float> x_raw;   // [num_samples * x_dim]
+        std::vector<float> x_norm;  // [num_samples * x_dim]
+        std::vector<float> y_raw;   // [num_samples * y_dim]
+        std::vector<std::array<float, D_PHASE_4096>> phase_vecs;
+        std::vector<std::array<uint64_t, WORDS_512>> vsa_sketches;
+        std::vector<std::array<float, D_PHASE_4096>> holo_operator_trace; // [y_dim x 4096]
+    };
+
+    std::unordered_map<std::string, ContinuousFunctionModel> models;
+    std::unordered_map<std::string, std::vector<std::pair<float, float>>> incremental_scalar_pts;
+
+    static void encode_fpe_hypervector_4096(
+        const float* x_norm,
+        size_t x_dim,
+        float* out_phase_4096,
+        uint64_t* out_sketch_512
+    ) {
+        static const float kBandScales[8] = {0.20f, 0.45f, 0.90f, 1.80f, 3.50f, 6.50f, 12.0f, 22.0f};
+        const float norm_factor = 1.0f / std::sqrt(2048.0f);
+        if (out_sketch_512) {
+            for (size_t w = 0; w < WORDS_512; ++w) out_sketch_512[w] = 0ULL;
+        }
+        for (size_t k = 0; k < D_PHASE_4096; ++k) {
+            const float gamma = kBandScales[k >> 9];
+            float proj = 0.0f;
+            for (size_t j = 0; j < x_dim; ++j) {
+                uint64_t h = hsaa_assoc::mix64(0x9E3779B97F4A7C15ULL ^ (k * 2654435761ULL + j * 1099511628211ULL));
+                // Quasi-Gaussian projection weight via Irwin-Hall sum of 4 uniform chunks
+                float u1 = static_cast<float>((h >>  0) & 0xFFFFU) * (1.0f / 65535.0f) - 0.5f;
+                float u2 = static_cast<float>((h >> 16) & 0xFFFFU) * (1.0f / 65535.0f) - 0.5f;
+                float u3 = static_cast<float>((h >> 32) & 0xFFFFU) * (1.0f / 65535.0f) - 0.5f;
+                float u4 = static_cast<float>((h >> 48) & 0xFFFFU) * (1.0f / 65535.0f) - 0.5f;
+                float omega_kj = (u1 + u2 + u3 + u4) * 1.7320508f;
+                proj += omega_kj * x_norm[j];
+            }
+            uint64_t hp = hsaa_assoc::mix64(0x517CC1B727220A95ULL ^ k);
+            float phi_k = static_cast<float>(hp & 0xFFFFU) * (6.283185307f / 65536.0f);
+            float val = std::cos(gamma * proj + phi_k) * norm_factor;
+            out_phase_4096[k] = val;
+            if (out_sketch_512 && (k & 7U) == 0U) {
+                size_t bit_idx = k >> 3;
+                if (val >= 0.0f) {
+                    out_sketch_512[bit_idx >> 6] |= (1ULL << (bit_idx & 63U));
+                }
+            }
+        }
+    }
+
+    bool learn_function(
+        const std::string& func_name,
+        const float* x_samples,
+        const float* y_samples,
+        size_t num_samples,
+        size_t x_dim,
+        size_t y_dim
+    ) {
+        if (func_name.empty() || !x_samples || !y_samples || num_samples == 0 || x_dim == 0 || y_dim == 0) {
+            return false;
+        }
+        std::string key = hsaa_assoc::normalize(func_name.c_str());
+        if (key.empty()) key = func_name;
+
+        ContinuousFunctionModel mdl{};
+        mdl.x_dim = x_dim;
+        mdl.y_dim = y_dim;
+        mdl.num_samples = num_samples;
+        mdl.x_mean.assign(x_dim, 0.0f);
+        mdl.x_scale.assign(x_dim, 1.0f);
+        mdl.x_raw.assign(x_samples, x_samples + num_samples * x_dim);
+        mdl.y_raw.assign(y_samples, y_samples + num_samples * y_dim);
+        mdl.x_norm.resize(num_samples * x_dim, 0.0f);
+
+        for (size_t j = 0; j < x_dim; ++j) {
+            double sum = 0.0;
+            for (size_t i = 0; i < num_samples; ++i) sum += mdl.x_raw[i * x_dim + j];
+            float mean = static_cast<float>(sum / static_cast<double>(num_samples));
+            mdl.x_mean[j] = mean;
+            double var = 0.0;
+            for (size_t i = 0; i < num_samples; ++i) {
+                double d = static_cast<double>(mdl.x_raw[i * x_dim + j] - mean);
+                var += d * d;
+            }
+            float std_dev = static_cast<float>(std::sqrt(var / static_cast<double>(std::max<size_t>(1, num_samples))));
+            mdl.x_scale[j] = (std_dev > 1e-5f) ? std_dev : 1.0f;
+            for (size_t i = 0; i < num_samples; ++i) {
+                mdl.x_norm[i * x_dim + j] = (mdl.x_raw[i * x_dim + j] - mean) / mdl.x_scale[j];
+            }
+        }
+
+        mdl.phase_vecs.resize(num_samples);
+        mdl.vsa_sketches.resize(num_samples);
+        mdl.holo_operator_trace.resize(y_dim);
+        for (size_t od = 0; od < y_dim; ++od) mdl.holo_operator_trace[od].fill(0.0f);
+
+        for (size_t i = 0; i < num_samples; ++i) {
+            encode_fpe_hypervector_4096(
+                &mdl.x_norm[i * x_dim],
+                x_dim,
+                mdl.phase_vecs[i].data(),
+                mdl.vsa_sketches[i].data()
+            );
+            for (size_t od = 0; od < y_dim; ++od) {
+                const float y_val = mdl.y_raw[i * y_dim + od];
+                auto& trace = mdl.holo_operator_trace[od];
+                const auto& pv = mdl.phase_vecs[i];
+                for (size_t k = 0; k < D_PHASE_4096; ++k) {
+                    trace[k] += y_val * pv[k];
+                }
+            }
+        }
+
+        models[key] = std::move(mdl);
+        return true;
+    }
+
+    bool eval_function(
+        const std::string& func_name,
+        const float* x_query,
+        size_t x_dim,
+        float* out_y,
+        size_t y_dim
+    ) const {
+        if (func_name.empty() || !x_query || !out_y || x_dim == 0 || y_dim == 0) return false;
+        std::string key = hsaa_assoc::normalize(func_name.c_str());
+        if (key.empty()) key = func_name;
+        auto it = models.find(key);
+        if (it == models.end()) return false;
+        const ContinuousFunctionModel& mdl = it->second;
+        if (mdl.x_dim != x_dim || mdl.y_dim != y_dim || mdl.num_samples == 0) return false;
+
+        std::vector<float> q_norm(x_dim, 0.0f);
+        for (size_t j = 0; j < x_dim; ++j) {
+            q_norm[j] = (x_query[j] - mdl.x_mean[j]) / mdl.x_scale[j];
+        }
+
+        alignas(64) float q_phase[D_PHASE_4096];
+        uint64_t q_sk[WORDS_512];
+        encode_fpe_hypervector_4096(q_norm.data(), x_dim, q_phase, q_sk);
+
+        const size_t N = mdl.num_samples;
+        std::vector<float> dist_sq(N, 0.0f);
+        std::vector<float> phase_res(N, 0.0f);
+
+        for (size_t i = 0; i < N; ++i) {
+            float dsq = 0.0f;
+            const float* xn = &mdl.x_norm[i * x_dim];
+            for (size_t j = 0; j < x_dim; ++j) {
+                float d = q_norm[j] - xn[j];
+                dsq += d * d;
+            }
+            dist_sq[i] = dsq;
+            float cos_p = PopCountGenerativeLLM::dense_cosine_f32_4096(q_phase, mdl.phase_vecs[i].data());
+            int32_t ham_dot = hsaa_assoc::dot512(q_sk, mdl.vsa_sketches[i].data());
+            float vsa_r = 0.75f * cos_p + 0.25f * (static_cast<float>(ham_dot) / 512.0f);
+            phase_res[i] = std::max(0.05f, 1.0f + vsa_r);
+        }
+
+        // Exact sample match fast-path
+        for (size_t i = 0; i < N; ++i) {
+            if (dist_sq[i] < 1e-10f) {
+                for (size_t od = 0; od < y_dim; ++od) out_y[od] = mdl.y_raw[i * y_dim + od];
+                return true;
+            }
+        }
+
+        // Adaptive local bandwidth from k-th nearest neighbor in normalized space
+        std::vector<float> sorted_dsq = dist_sq;
+        size_t k_nn = std::min<size_t>(N - 1, std::max<size_t>(1, x_dim + 1));
+        std::nth_element(sorted_dsq.begin(), sorted_dsq.begin() + k_nn, sorted_dsq.end());
+        float h_sq = std::max(1e-4f, sorted_dsq[k_nn] * 0.85f);
+
+        std::vector<double> weights(N, 0.0);
+        double w_sum = 0.0;
+        for (size_t i = 0; i < N; ++i) {
+            double w = std::exp(-static_cast<double>(dist_sq[i]) / (2.0 * static_cast<double>(h_sq))) *
+                       static_cast<double>(phase_res[i]) / (static_cast<double>(dist_sq[i]) + 1e-3);
+            weights[i] = w;
+            w_sum += w;
+        }
+
+        // Solve VSA-weighted local 2nd-order Taylor polynomial system (quadratic LOESS in hypervector kernel space)
+        if (N >= x_dim + 2 && x_dim <= 8 && w_sum > 1e-12) {
+            const bool use_quad = (N >= 2 * x_dim + 2);
+            const size_t P = use_quad ? (1 + 2 * x_dim) : (1 + x_dim);
+            std::vector<double> A(P * P, 0.0);
+            std::vector<double> B(P * y_dim, 0.0);
+            for (size_t i = 0; i < N; ++i) {
+                const double w = weights[i] / w_sum;
+                if (w < 1e-9) continue;
+                double phi[17];
+                phi[0] = 1.0;
+                for (size_t j = 0; j < x_dim; ++j) {
+                    double dj = static_cast<double>(q_norm[j] - mdl.x_norm[i * x_dim + j]);
+                    phi[j + 1] = dj;
+                    if (use_quad) {
+                        phi[1 + x_dim + j] = 0.5 * dj * dj;
+                    }
+                }
+                for (size_t r = 0; r < P; ++r) {
+                    for (size_t c = 0; c < P; ++c) {
+                        A[r * P + c] += w * phi[r] * phi[c];
+                    }
+                    for (size_t od = 0; od < y_dim; ++od) {
+                        B[r * y_dim + od] += w * phi[r] * static_cast<double>(mdl.y_raw[i * y_dim + od]);
+                    }
+                }
+            }
+            for (size_t r = 1; r < P; ++r) A[r * P + r] += 1e-6;
+            A[0] += 1e-9;
+
+            // Gaussian elimination with partial pivoting
+            bool ok = true;
+            for (size_t col = 0; col < P; ++col) {
+                size_t piv = col;
+                double max_v = std::fabs(A[col * P + col]);
+                for (size_t row = col + 1; row < P; ++row) {
+                    double v = std::fabs(A[row * P + col]);
+                    if (v > max_v) { max_v = v; piv = row; }
+                }
+                if (max_v < 1e-11) { ok = false; break; }
+                if (piv != col) {
+                    for (size_t c = col; c < P; ++c) std::swap(A[col * P + c], A[piv * P + c]);
+                    for (size_t od = 0; od < y_dim; ++od) std::swap(B[col * y_dim + od], B[piv * y_dim + od]);
+                }
+                const double inv_d = 1.0 / A[col * P + col];
+                for (size_t row = col + 1; row < P; ++row) {
+                    const double factor = A[row * P + col] * inv_d;
+                    for (size_t c = col; c < P; ++c) A[row * P + c] -= factor * A[col * P + c];
+                    for (size_t od = 0; od < y_dim; ++od) B[row * y_dim + od] -= factor * B[col * y_dim + od];
+                }
+            }
+            if (ok) {
+                std::vector<double> sol(P * y_dim, 0.0);
+                for (int row = static_cast<int>(P) - 1; row >= 0; --row) {
+                    const double inv_d = 1.0 / A[row * P + row];
+                    for (size_t od = 0; od < y_dim; ++od) {
+                        double s = B[row * y_dim + od];
+                        for (size_t c = static_cast<size_t>(row + 1); c < P; ++c) {
+                            s -= A[row * P + c] * sol[c * y_dim + od];
+                        }
+                        sol[row * y_dim + od] = s * inv_d;
+                    }
+                }
+                for (size_t od = 0; od < y_dim; ++od) {
+                    out_y[od] = static_cast<float>(sol[od]); // intercept beta_0 at x == x_query
+                }
+                return true;
+            }
+        }
+
+        // Fallback Nadaraya-Watson VSA phase-kernel estimator
+        if (w_sum > 1e-12) {
+            for (size_t od = 0; od < y_dim; ++od) {
+                double acc = 0.0;
+                for (size_t i = 0; i < N; ++i) {
+                    acc += weights[i] * static_cast<double>(mdl.y_raw[i * y_dim + od]);
+                }
+                out_y[od] = static_cast<float>(acc / w_sum);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    static bool try_parse_first_float(const char* s, float* out_val) {
+        if (!s || !out_val) return false;
+        while (*s != '\0') {
+            if ((*s >= '0' && *s <= '9') ||
+                ((*s == '-' || *s == '+') && (s[1] >= '0' && s[1] <= '9'))) {
+                char* endp = nullptr;
+                float v = std::strtof(s, &endp);
+                if (endp != s) {
+                    *out_val = v;
+                    return true;
+                }
+            }
+            ++s;
+        }
+        return false;
+    }
+
+    void add_incremental_fact_if_numeric(const char* subj, const char* rel, const char* obj) {
+        if (!subj || !rel || !obj) return;
+        float xv = 0.0f, yv = 0.0f;
+        if (!try_parse_first_float(subj, &xv) || !try_parse_first_float(obj, &yv)) return;
+        std::string rkey = hsaa_assoc::normalize(rel);
+        if (rkey.empty()) rkey = rel;
+        auto& pts = incremental_scalar_pts[rkey];
+        for (auto& p : pts) {
+            if (std::fabs(p.first - xv) < 1e-6f) {
+                p.second = yv;
+                break;
+            }
+        }
+        pts.push_back({xv, yv});
+        if (pts.size() >= 3) {
+            std::vector<float> xs(pts.size()), ys(pts.size());
+            for (size_t i = 0; i < pts.size(); ++i) {
+                xs[i] = pts[i].first;
+                ys[i] = pts[i].second;
+            }
+            learn_function(rkey, xs.data(), ys.data(), pts.size(), 1, 1);
+        }
+    }
+};
+
 struct PopCountBrain {
     std::string bank_path;
     std::unique_ptr<AutoMappedWeightBank> bank_guard;
@@ -12566,6 +13567,7 @@ struct PopCountBrain {
     size_t active_rules;
     uint32_t assoc_fact_count = 0;
     HolographicSuperpositionBank holo_bank;
+    ContinuousVsaFunctionApproximator cont_vsa_func;
     mutable AssocFact resolved_fact_cache;
     mutable AssocFact synthesized_multihop_fact;
     mutable std::recursive_mutex brain_mutex;
@@ -14054,12 +15056,20 @@ int PopCountGenerativeLLM::generate(
                     if (last_t >= 0 && static_cast<size_t>(last_t) < tok_cont_emb.size()) {
                         const int8_t* q_vec = tok_cont_emb[last_t].data();
                         const int32_t q_nsq = tok_cont_norm_sq[last_t];
+                        const float* q_dense4096 = (static_cast<size_t>(last_t) < tok_dense_emb_4096.size())
+                            ? tok_dense_emb_4096[last_t].data() : nullptr;
                         int best_nn = -1;
-                        int32_t best_cos = 550;
+                        int32_t best_cos = 450;
                         const size_t first_dyn = static_cast<size_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS);
                         for (size_t tid = first_dyn; tid < tok_cont_emb.size(); ++tid) {
                             if (static_cast<int>(tid) == last_t) continue;
+                            if (horizon_tables[1].find(static_cast<uint64_t>(tid)) == horizon_tables[1].end()) continue;
                             int32_t cos_q10 = continuous_cosine_q10_512(q_vec, q_nsq, tok_cont_emb[tid].data(), tok_cont_norm_sq[tid]);
+                            if (q_dense4096 && tid < tok_dense_emb_4096.size()) {
+                                float c4096 = dense_cosine_f32_4096(q_dense4096, tok_dense_emb_4096[tid].data());
+                                int32_t c4096_q10 = static_cast<int32_t>(std::lround(c4096 * 1024.0f));
+                                cos_q10 = std::max(cos_q10, c4096_q10);
+                            }
                             if (cos_q10 > best_cos) {
                                 best_cos = cos_q10;
                                 best_nn = static_cast<int>(tid);
@@ -14074,6 +15084,31 @@ int PopCountGenerativeLLM::generate(
                                     cands.max_score(e.tok, interp_sc);
                                 }
                             }
+                        }
+                    }
+                    // Open-ended extrapolation via analytical backprop continuous manifold when discrete horizons miss
+                    if (cands.empty() && foundation_net.initialized) {
+                        constexpr int D_LAT = FoundationContinuousManifold::D_LAT;
+                        constexpr int D_HID = FoundationContinuousManifold::D_HID;
+                        std::array<float, D_LAT> x_ctx, u1, bp_hout;
+                        std::array<float, D_HID> z1, a1, z2, a2;
+                        foundation_net.forward_hidden(ctx.data(), ctx.size(), x_ctx, z1, a1, u1, z2, a2, bp_hout);
+                        std::vector<std::pair<float, int>> bp_top;
+                        bp_top.reserve(foundation_net.compact_to_vocab.size());
+                        for (size_t c = 0; c < foundation_net.compact_to_vocab.size(); ++c) {
+                            int vt = foundation_net.compact_to_vocab[c];
+                            if (vt == CodeProseTokenizer::TOK_EOS || vt == CodeProseTokenizer::TOK_PAD ||
+                                vt == CodeProseTokenizer::TOK_BOS || vt == ctx.back()) continue;
+                            float l = foundation_net.b_out[c];
+                            for (int d = 0; d < D_LAT; ++d) l += foundation_net.W_out[c][d] * bp_hout[d];
+                            bp_top.push_back({l, vt});
+                        }
+                        std::sort(bp_top.begin(), bp_top.end(), [](const auto& a, const auto& b) {
+                            return a.first > b.first;
+                        });
+                        for (size_t k = 0; k < std::min<size_t>(8, bp_top.size()); ++k) {
+                            int64_t bpsc = 16384LL + static_cast<int64_t>(std::lround(bp_top[k].first * 1024.0f));
+                            cands.max_score(bp_top[k].second, bpsc, 1);
                         }
                     }
                 }
@@ -14324,6 +15359,15 @@ int PopCountGenerativeLLM::generate(
             if (cands.max_L[ci] > max_cand_L) max_cand_L = cands.max_L[ci];
         }
 
+        std::array<float, FoundationContinuousManifold::D_LAT> bp_hout{};
+        bool has_bp_hout = false;
+        if (max_cand_L <= 1 && foundation_net.initialized && !ctx.empty()) {
+            std::array<float, FoundationContinuousManifold::D_LAT> x_ctx, u1;
+            std::array<float, FoundationContinuousManifold::D_HID> z1, a1, z2, a2;
+            foundation_net.forward_hidden(ctx.data(), ctx.size(), x_ctx, z1, a1, u1, z2, a2, bp_hout);
+            has_bp_hout = true;
+        }
+
         // Morpho-Syntactic Inflectional Expansion:
         // When in low-horizon regime (max_cand_L <= 2) after a Russian Adjective or Preposition,
         // expand candidate roots via `stem_to_inflected_toks` so inflected forms agreeing in
@@ -14401,6 +15445,17 @@ int PopCountGenerativeLLM::generate(
                         tok_next_cont_centroid[prev_tok].data()
                     );
                     sc += static_cast<int64_t>(cont_dot) / 16LL;
+                }
+            }
+
+            if (has_bp_hout && seen_L <= 1 && cand >= 0 && static_cast<size_t>(cand) < foundation_net.vocab_to_compact.size()) {
+                int cid = foundation_net.vocab_to_compact[cand];
+                if (cid >= 0 && static_cast<size_t>(cid) < foundation_net.W_out.size()) {
+                    float l = foundation_net.b_out[cid];
+                    for (int d = 0; d < FoundationContinuousManifold::D_LAT; ++d) {
+                        l += foundation_net.W_out[cid][d] * bp_hout[d];
+                    }
+                    sc += static_cast<int64_t>(std::lround(l * 256.0f));
                 }
             }
 
@@ -14783,6 +15838,8 @@ POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject,
         ++brain->active_rules;
     }
 
+    brain->cont_vsa_func.add_incremental_fact_if_numeric(subject, relation, object);
+
     if (brain->engine) {
         std::string stmt = std::string(subject) + " " + relation + " " + object + " .";
         brain->engine->store_declarative_statement_fast(stmt);
@@ -14796,6 +15853,21 @@ POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subj
     if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
         strncpy_s(out_object, max_len, f->object.c_str(), _TRUNCATE);
         return 1;
+    }
+    // Fallback to Continuous VSA Function Approximation if subject is numeric and relation was learned
+    char* end_s = nullptr;
+    float x_val = std::strtof(subject, &end_s);
+    if (end_s && end_s != subject) {
+        while (*end_s == ' ' || *end_s == '\t') ++end_s;
+        if (*end_s == '\0') {
+            float y_val = 0.0f;
+            if (brain->cont_vsa_func.eval_function(relation, &x_val, 1, &y_val, 1)) {
+                char num_buf[64];
+                std::snprintf(num_buf, sizeof(num_buf), "%.4f", static_cast<double>(y_val));
+                strncpy_s(out_object, max_len, num_buf, _TRUNCATE);
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -15457,6 +16529,598 @@ POPCNT_BRAIN_API int brain_interpolate_continuous(
     );
 }
 
+bool PopCountGenerativeLLM::embed_dense_4096_text(
+    const PopCountBrain* brain,
+    const char* text,
+    float* out_vec4096
+) const {
+    if (!text || !out_vec4096) return false;
+    std::memset(out_vec4096, 0, D_DENSE_4096 * sizeof(float));
+
+    std::string raw(text);
+    if (raw.empty()) return false;
+
+    ensure_continuous_representation_space();
+    auto toks = const_cast<CodeProseTokenizer&>(tokenizer).tokenize_segment(raw, false, false);
+
+    alignas(64) float vec512[D_MODEL];
+    if (!embed_continuous_text(brain, text, vec512)) {
+        std::memset(vec512, 0, sizeof(vec512));
+    }
+
+    // 1. Accumulate trained 4096-D token embeddings (which incorporate backprop-trained
+    //    FoundationContinuousManifold weights + distributional SVD + morphological n-grams)
+    const float inv_n_toks = 1.0f / static_cast<float>(std::max<size_t>(1, toks.size()));
+    int in_vocab_count = 0;
+    for (size_t i = 0; i < toks.size(); ++i) {
+        int tid = toks[i];
+        float pos_w = 1.0f + 0.35f * (static_cast<float>(i + 1) * inv_n_toks);
+        if (tid >= 0 && static_cast<size_t>(tid) < tok_dense_emb_4096.size()) {
+            float content_w = is_content_token_id(tid) ? 2.5f : 0.45f;
+            float w = pos_w * content_w;
+            const float* td = tok_dense_emb_4096[tid].data();
+            for (int d = 0; d < D_DENSE_4096; ++d) {
+                out_vec4096[d] += w * td[d];
+            }
+            ++in_vocab_count;
+        }
+    }
+
+    // 2. Band 0..511: Inject 32-layer non-linear continuous manifold state
+    for (int d = 0; d < D_MODEL; ++d) {
+        out_vec4096[d] += 1.45f * vec512[d];
+    }
+
+    // 3. Band 512..1023: If FoundationContinuousManifold is trained via backprop, run a forward pass
+    //    on the token sequence and inject its continuous hidden representations (a1, a2, h_out, x_ctx)
+    if (foundation_net.initialized && !toks.empty()) {
+        std::vector<int> valid_seq;
+        valid_seq.reserve(toks.size());
+        for (int t : toks) {
+            if (t >= 0 && static_cast<size_t>(t) < foundation_net.vocab_size) {
+                valid_seq.push_back(t);
+            }
+        }
+        if (!valid_seq.empty()) {
+            std::array<float, FoundationContinuousManifold::D_LAT> x_ctx{}, u1{}, h_out{};
+            std::array<float, FoundationContinuousManifold::D_HID> z1{}, a1{}, z2{}, a2{};
+            foundation_net.forward_hidden(valid_seq.data(), valid_seq.size(), x_ctx, z1, a1, u1, z2, a2, h_out);
+            for (int j = 0; j < FoundationContinuousManifold::D_HID; ++j) {
+                out_vec4096[512 + j] += 2.2f * a2[j];
+                out_vec4096[640 + j] += 1.6f * a1[j];
+            }
+            for (int d = 0; d < FoundationContinuousManifold::D_LAT; ++d) {
+                out_vec4096[768 + d] += 2.4f * h_out[d];
+                out_vec4096[832 + d] += 1.5f * u1[d];
+                out_vec4096[896 + d] += 1.2f * x_ctx[d];
+                out_vec4096[960 + d] += 1.2f * (h_out[d] - x_ctx[d]);
+            }
+        }
+    }
+
+    // 4. Bands 1024..4095: Fine-grained character/morphological/syntactic float32 projection
+    //    for OOV inflections, numerical continuity, and sub-token semantic nuance
+    auto fnv1a_bytes = [](const char* data, size_t len, uint64_t seed = 0xCBF29CE484222325ULL) -> uint64_t {
+        uint64_t h = seed;
+        for (size_t i = 0; i < len; ++i) {
+            h ^= static_cast<uint8_t>(data[i]);
+            h *= 0x100000001B3ULL;
+        }
+        return h;
+    };
+    std::string norm_all = hsaa_assoc::normalize(raw.c_str());
+    if (!norm_all.empty()) {
+        std::vector<std::string> words;
+        {
+            std::string cur;
+            for (size_t i = 0; i <= norm_all.size(); ++i) {
+                char c = (i < norm_all.size()) ? norm_all[i] : ' ';
+                if (c == ' ') {
+                    if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+                } else {
+                    cur.push_back(c);
+                }
+            }
+        }
+        float morph_scale = (in_vocab_count > 0) ? 0.85f : 2.20f;
+        for (size_t wi = 0; wi < words.size(); ++wi) {
+            const std::string& w = words[wi];
+            std::vector<size_t> offs;
+            for (size_t i = 0; i < w.size(); ) {
+                offs.push_back(i);
+                unsigned char c = static_cast<unsigned char>(w[i]);
+                size_t step = ((c & 0x80u) == 0u) ? 1 : (((c & 0xE0u) == 0xC0u) ? 2 : (((c & 0xF0u) == 0xE0u) ? 3 : 4));
+                i += std::min(step, w.size() - i);
+            }
+            offs.push_back(w.size());
+            size_t n_cp = offs.size() - 1;
+
+            // Prefix/stem profile (1024..2047)
+            for (size_t p = 1; p <= std::min<size_t>(n_cp, 7); ++p) {
+                std::string pref = w.substr(0, offs[p]);
+                uint64_t h = fnv1a_bytes(pref.data(), pref.size(), 0xB7E151628AED2A6AULL ^ p);
+                float weight = morph_scale * ((p >= 3 && p <= 5) ? 1.35f : 0.75f);
+                for (int rep = 0; rep < 4; ++rep) {
+                    uint64_t hr = hsaa_assoc::mix64(h ^ (static_cast<uint64_t>(rep) * 0x9E3779B97F4A7C15ULL));
+                    int idx = 1024 + static_cast<int>(hr & 1023ULL);
+                    float sgn = ((hr >> 12) & 1ULL) ? 1.0f : -1.0f;
+                    out_vec4096[idx] += sgn * weight;
+                }
+            }
+            // Character n-grams L=2..5 (2048..3583)
+            for (size_t ng = 2; ng <= 5; ++ng) {
+                if (n_cp < ng) continue;
+                float ng_w = morph_scale * (0.55f + 0.15f * static_cast<float>(ng));
+                for (size_t i = 0; i + ng <= n_cp; ++i) {
+                    std::string sub = w.substr(offs[i], offs[i + ng] - offs[i]);
+                    uint64_t h = fnv1a_bytes(sub.data(), sub.size(), 0x243F6A8885A308D3ULL ^ ng);
+                    for (int rep = 0; rep < 3; ++rep) {
+                        uint64_t hr = hsaa_assoc::mix64(h + rep * 0xBF58476D1CE4E5B9ULL);
+                        int idx = 2048 + static_cast<int>(hr % 1536ULL);
+                        float sgn = ((hr >> 16) & 1ULL) ? 1.0f : -1.0f;
+                        out_vec4096[idx] += sgn * ng_w;
+                    }
+                }
+            }
+            // Word-pair compositional interaction & Fourier positional phase (3584..4095)
+            uint64_t wh = fnv1a_bytes(w.data(), w.size());
+            for (int k = 0; k < 8; ++k) {
+                uint64_t hk = hsaa_assoc::mix64(wh ^ (static_cast<uint64_t>(k) * 0x94D049BB133111EBULL));
+                int idx = 3584 + static_cast<int>(hk & 511ULL);
+                float phase = static_cast<float>(wi + 1) * 0.35f + static_cast<float>(k) * 0.785398f;
+                out_vec4096[idx] += morph_scale * 0.55f * std::cos(phase) * (((hk >> 11) & 1ULL) ? 1.0f : -1.0f);
+            }
+        }
+    }
+
+    dense_l2_normalize_4096(out_vec4096);
+    return true;
+}
+
+int PopCountGenerativeLLM::paraphrase_continuous(
+    const PopCountBrain* brain,
+    const char* input_text,
+    char* out_text,
+    size_t max_len,
+    float semantic_diversity
+) {
+    if (out_text && max_len > 0) out_text[0] = '\0';
+    if (!input_text || !out_text || max_len == 0) return 0;
+
+    std::string raw(input_text);
+    if (raw.empty()) return 0;
+
+    ensure_continuous_representation_space();
+    auto raw_words = tokenizer.split_raw_tokens(raw);
+    if (raw_words.empty()) return 0;
+
+    const float div = std::max(0.05f, std::min(1.0f, semantic_diversity));
+    const size_t first_dyn = static_cast<size_t>(CodeProseTokenizer::TOK_REG_0 + CodeProseTokenizer::NUM_REGS);
+    const size_t V = tokenizer.id_to_word.size();
+
+    auto count_utf8_cp = [](const std::string& s) -> size_t {
+        size_t n = 0;
+        for (size_t i = 0; i < s.size(); ++n) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            size_t step = ((c & 0x80u) == 0u) ? 1 : (((c & 0xE0u) == 0xC0u) ? 2 : (((c & 0xF0u) == 0xE0u) ? 3 : 4));
+            i += std::min(step, s.size() - i);
+        }
+        return n;
+    };
+
+    // Encode tokens while keeping original strings for OOV words
+    std::vector<int> tids(raw_words.size(), -1);
+    for (size_t i = 0; i < raw_words.size(); ++i) {
+        auto it = tokenizer.word_to_id.find(raw_words[i]);
+        if (it != tokenizer.word_to_id.end()) {
+            tids[i] = it->second;
+        } else {
+            std::string lw = hsaa_assoc::normalize(raw_words[i].c_str());
+            auto lit = tokenizer.word_to_id.find(lw);
+            if (lit != tokenizer.word_to_id.end()) tids[i] = lit->second;
+        }
+    }
+
+    std::vector<std::string> out_words = raw_words;
+    int replaced_count = 0;
+
+    // Precompute FoundationContinuousManifold context probabilities at each position if trained
+    std::vector<int> prefix_toks;
+    prefix_toks.reserve(raw_words.size() + 1);
+    prefix_toks.push_back(CodeProseTokenizer::TOK_BOS);
+
+    for (size_t i = 0; i < raw_words.size(); ++i) {
+        const std::string& orig_w = raw_words[i];
+        int tid = tids[i];
+        MorphSignature orig_ms = classify_morph_signature(orig_w);
+
+        // Punctuation, numbers, short connectors/prepositions, and code symbols stay anchored
+        bool is_replaceable = is_content_token(orig_w) &&
+                              orig_ms.pos_cat != POS_PUNCT &&
+                              orig_ms.pos_cat != POS_PREP &&
+                              orig_ms.pos_cat != POS_CONJ &&
+                              orig_ms.pos_cat != POS_CODE_KW &&
+                              (count_utf8_cp(orig_w) >= 4);
+
+        if (is_replaceable && V > first_dyn) {
+            int orig_role = (tid >= 0) ? map_token_to_role(tid) : -1;
+            const float* orig_d4096 = (tid >= 0 && static_cast<size_t>(tid) < tok_dense_emb_4096.size())
+                ? tok_dense_emb_4096[tid].data()
+                : nullptr;
+
+            std::vector<float> net_probs(V, 0.0f);
+            if (foundation_net.initialized && !prefix_toks.empty()) {
+                std::array<float, FoundationContinuousManifold::D_LAT> x_ctx{}, u1{}, h_out{};
+                std::array<float, FoundationContinuousManifold::D_HID> z1{}, a1{}, z2{}, a2{};
+                foundation_net.forward_hidden(prefix_toks.data(), prefix_toks.size(), x_ctx, z1, a1, u1, z2, a2, h_out);
+                const size_t CV = foundation_net.compact_to_vocab.size();
+                std::vector<float> logits(CV, 0.0f);
+                float max_logit = -1e30f;
+                for (size_t c = 0; c < CV; ++c) {
+                    float s = foundation_net.b_out[c];
+                    const auto& w_c = foundation_net.W_out[c];
+                    for (int d = 0; d < FoundationContinuousManifold::D_LAT; ++d) {
+                        s += w_c[d] * h_out[d];
+                    }
+                    logits[c] = s;
+                    if (s > max_logit) max_logit = s;
+                }
+                float sum_exp = 0.0f;
+                for (size_t c = 0; c < CV; ++c) {
+                    logits[c] = std::exp(std::max(-20.0f, logits[c] - max_logit));
+                    sum_exp += logits[c];
+                }
+                if (sum_exp > 1e-12f) {
+                    float inv_s = 1.0f / sum_exp;
+                    for (size_t c = 0; c < CV; ++c) {
+                        int vt = foundation_net.compact_to_vocab[c];
+                        if (vt >= 0 && static_cast<size_t>(vt) < V) {
+                            net_probs[vt] = logits[c] * inv_s;
+                        }
+                    }
+                }
+            }
+
+            std::string orig_lower = hsaa_assoc::normalize(orig_w.c_str());
+            int best_alt_tid = -1;
+            float best_alt_score = -1e9f;
+
+            for (size_t cand = first_dyn; cand < V; ++cand) {
+                if (static_cast<int>(cand) == tid) continue;
+                const std::string& cw = tokenizer.id_to_word[cand];
+                if (!is_content_token(cw) || count_utf8_cp(cw) < 4) continue;
+                MorphSignature cand_ms = classify_morph_signature(cw);
+                if (cand_ms.pos_cat == POS_PUNCT || cand_ms.pos_cat == POS_PREP ||
+                    cand_ms.pos_cat == POS_CONJ || cand_ms.pos_cat == POS_CODE_KW) {
+                    continue;
+                }
+                std::string cand_lower = hsaa_assoc::normalize(cw.c_str());
+                if (cand_lower == orig_lower) continue;
+
+                // Enforce morphological POS & case/gender/number compatibility
+                if (orig_ms.pos_cat != cand_ms.pos_cat) continue;
+                if ((orig_ms.pos_cat == POS_ADJ || orig_ms.pos_cat == POS_NOUN) &&
+                    orig_ms.case_mask != 0 && cand_ms.case_mask != 0) {
+                    if ((orig_ms.case_mask & cand_ms.case_mask) == 0) continue;
+                    if (orig_ms.gn_mask != 0 && cand_ms.gn_mask != 0 &&
+                        (orig_ms.gn_mask & cand_ms.gn_mask) == 0) {
+                        continue;
+                    }
+                }
+
+                float cos4096 = 0.0f;
+                if (orig_d4096 && cand < tok_dense_emb_4096.size()) {
+                    cos4096 = dense_cosine_f32_4096(orig_d4096, tok_dense_emb_4096[cand].data());
+                } else if (tid >= 0 && static_cast<size_t>(tid) < tok_cont_emb.size() && cand < tok_cont_emb.size()) {
+                    cos4096 = static_cast<float>(continuous_cosine_q10_512(
+                        tok_cont_emb[tid].data(), tok_cont_norm_sq[tid],
+                        tok_cont_emb[cand].data(), tok_cont_norm_sq[cand])) * (1.0f / 1024.0f);
+                }
+
+                int cand_role = map_token_to_role(static_cast<int>(cand));
+                bool same_role = (orig_role >= 0 && cand_role == orig_role && orig_role != tid);
+                float net_p = (cand < net_probs.size()) ? net_probs[cand] : 0.0f;
+
+                // Candidate must be semantically close in the 4096-D manifold or share a learned distributional role
+                if (cos4096 < 0.22f && !same_role) continue;
+                // Keep finite verbs anchored unless strongly aligned in both role and 4096-D space
+                if ((orig_ms.pos_cat == POS_VERB_FIN || orig_ms.pos_cat == POS_VERB_INF) &&
+                    (!same_role || cos4096 < 0.48f)) {
+                    continue;
+                }
+
+                float score = cos4096 * 3.2f
+                            + (same_role ? 1.85f : 0.0f)
+                            + std::log(1.0f + net_p * 32.0f) * 0.65f;
+
+                // Prefer substituting adjectives/modifiers and role-paired synonyms
+                if (orig_ms.pos_cat == POS_ADJ) {
+                    score += 0.45f;
+                }
+
+                // Reward lexical diversity (different stem) proportional to semantic_diversity
+                if (orig_ms.stem_hash != 0 && cand_ms.stem_hash != 0 && orig_ms.stem_hash != cand_ms.stem_hash) {
+                    score += div * 0.55f;
+                }
+
+                if (score > best_alt_score) {
+                    best_alt_score = score;
+                    best_alt_tid = static_cast<int>(cand);
+                }
+            }
+
+            const int max_replacements = std::max<int>(1, static_cast<int>((raw_words.size() * 2) / 5));
+            const float min_accept_score = (replaced_count == 0) ? 0.65f : 1.45f;
+            if (best_alt_tid >= 0 && best_alt_score > min_accept_score && replaced_count < max_replacements) {
+                std::string chosen = tokenizer.id_to_word[best_alt_tid];
+                // Preserve leading ASCII capitalization if original word was capitalized
+                if (!orig_w.empty() && std::isupper(static_cast<unsigned char>(orig_w[0])) &&
+                    !chosen.empty() && std::islower(static_cast<unsigned char>(chosen[0]))) {
+                    chosen[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(chosen[0])));
+                }
+                out_words[i] = chosen;
+                ++replaced_count;
+                prefix_toks.push_back(best_alt_tid);
+                continue;
+            }
+        }
+        if (tid >= 0) prefix_toks.push_back(tid);
+    }
+
+    // Reconstruct paraphrased text with clean spacing around punctuation
+    std::string result;
+    for (size_t i = 0; i < out_words.size(); ++i) {
+        const std::string& w = out_words[i];
+        bool is_punct = (w == "." || w == "," || w == ";" || w == ":" || w == "!" || w == "?" || w == ")" || w == "]");
+        if (i > 0 && !is_punct) {
+            const std::string& prev = out_words[i - 1];
+            if (prev != "(" && prev != "[") result.push_back(' ');
+        }
+        result += w;
+    }
+
+    strncpy_s(out_text, max_len, result.c_str(), _TRUNCATE);
+    (void)brain;
+    (void)replaced_count;
+    return static_cast<int>(out_words.size());
+}
+
+POPCNT_BRAIN_API int brain_train_foundation_backprop(
+    PopCountBrain* brain,
+    const char* corpus_text,
+    int epochs,
+    float learning_rate,
+    float* out_initial_loss,
+    float* out_final_loss
+) {
+    if (out_initial_loss) *out_initial_loss = 0.0f;
+    if (out_final_loss) *out_final_loss = 0.0f;
+    if (!brain) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (corpus_text && corpus_text[0] != '\0') {
+        if (!brain_train_corpus(brain, corpus_text, std::max(1, epochs / 2), nullptr)) {
+            return 0;
+        }
+    }
+    if (!brain->llm_engine || !brain->llm_engine->is_trained) return 0;
+
+    double init_l = 0.0, final_l = 0.0;
+    bool ok = brain->llm_engine->train_foundation_backprop_internal(epochs, learning_rate, &init_l, &final_l);
+    if (!ok) return 0;
+
+    // Refresh 4096-D dense token embeddings with the updated backprop representations
+    const size_t V = brain->llm_engine->tokenizer.id_to_word.size();
+    for (size_t tid = 0; tid < V && tid < brain->llm_engine->tok_dense_emb_4096.size(); ++tid) {
+        brain->llm_engine->compute_token_dense_4096_single(tid, brain->llm_engine->tok_dense_emb_4096[tid]);
+    }
+
+    if (out_initial_loss) *out_initial_loss = static_cast<float>(init_l);
+    if (out_final_loss) *out_final_loss = static_cast<float>(final_l);
+    return 1;
+}
+
+POPCNT_BRAIN_API int brain_paraphrase_continuous(
+    PopCountBrain* brain,
+    const char* input_text,
+    char* out_text,
+    size_t max_len,
+    float temperature
+) {
+    if (!brain || !input_text || !out_text || max_len == 0) {
+        if (out_text && max_len > 0) out_text[0] = '\0';
+        return 0;
+    }
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    return brain->llm_engine->paraphrase_continuous(brain, input_text, out_text, max_len, temperature);
+}
+
+POPCNT_BRAIN_API int brain_learn_continuous_function(
+    PopCountBrain* brain,
+    const char* func_name,
+    const float* x_samples,
+    const float* y_samples,
+    size_t num_samples,
+    size_t x_dim,
+    size_t y_dim
+) {
+    if (!brain || !func_name || !x_samples || !y_samples || num_samples == 0 || x_dim == 0 || y_dim == 0) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    return brain->cont_vsa_func.learn_function(func_name, x_samples, y_samples, num_samples, x_dim, y_dim) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API int brain_eval_continuous_function(
+    PopCountBrain* brain,
+    const char* func_name,
+    const float* x_query,
+    size_t x_dim,
+    float* out_y,
+    size_t y_dim
+) {
+    if (!brain || !func_name || !x_query || !out_y || x_dim == 0 || y_dim == 0) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    return brain->cont_vsa_func.eval_function(func_name, x_query, x_dim, out_y, y_dim) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API int brain_infer_template_free_relation(
+    PopCountBrain* brain,
+    const char* unstructured_corpus,
+    const char* query_subject,
+    char* out_target,
+    size_t max_len
+) {
+    if (out_target && max_len > 0) out_target[0] = '\0';
+    if (!brain || !unstructured_corpus || !query_subject || !out_target || max_len == 0) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+
+    auto segments = PopCountGenerativeLLM::split_training_segments(unstructured_corpus);
+    if (segments.empty()) return 0;
+
+    std::string norm_q = hsaa_assoc::normalize(query_subject);
+    if (norm_q.empty()) return 0;
+
+    uint64_t q_sk[hsaa_assoc::kW];
+    hsaa_assoc::sketch(norm_q, q_sk);
+    alignas(64) float q_d4096[BRAIN_DENSE_4096_DIM];
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    brain->llm_engine->embed_dense_4096_text(brain, query_subject, q_d4096);
+
+    float best_seg_score = -1e9f;
+    std::string best_seg;
+
+    for (const auto& seg : segments) {
+        std::string norm_s = hsaa_assoc::normalize(seg.c_str());
+        if (norm_s.empty()) continue;
+
+        float score = 0.0f;
+        if (norm_s.find(norm_q) != std::string::npos) {
+            score += 3.0f;
+        }
+        uint64_t s_sk[hsaa_assoc::kW];
+        hsaa_assoc::sketch(norm_s, s_sk);
+        score += static_cast<float>(hsaa_assoc::dot512(q_sk, s_sk)) / 256.0f;
+
+        alignas(64) float s_d4096[BRAIN_DENSE_4096_DIM];
+        if (brain->llm_engine->embed_dense_4096_text(brain, seg.c_str(), s_d4096)) {
+            score += 2.0f * PopCountGenerativeLLM::dense_cosine_f32_4096(q_d4096, s_d4096);
+        }
+
+        if (score > best_seg_score) {
+            best_seg_score = score;
+            best_seg = seg;
+        }
+    }
+
+    if (best_seg.empty()) return 0;
+
+    auto words = brain->llm_engine->tokenizer.split_raw_tokens(best_seg);
+    std::vector<std::string> content_words;
+    for (const auto& w : words) {
+        auto ms = PopCountGenerativeLLM::classify_morph_signature(w);
+        if (PopCountGenerativeLLM::is_content_token(w) &&
+            ms.pos_cat != PopCountGenerativeLLM::POS_PREP &&
+            ms.pos_cat != PopCountGenerativeLLM::POS_CONJ &&
+            ms.pos_cat != PopCountGenerativeLLM::POS_PUNCT) {
+            content_words.push_back(w);
+        }
+    }
+    if (content_words.size() < 2) return 0;
+
+    // Find which content word best matches query_subject
+    size_t subj_idx = 0;
+    float best_w_sim = -1e9f;
+    for (size_t i = 0; i < content_words.size(); ++i) {
+        std::string nw = hsaa_assoc::normalize(content_words[i].c_str());
+        float w_sim = 0.0f;
+        if (!nw.empty() && (norm_q.find(nw) != std::string::npos || nw.find(norm_q) != std::string::npos)) {
+            w_sim += 4.0f;
+        }
+        uint64_t wsk[hsaa_assoc::kW];
+        hsaa_assoc::sketch(nw, wsk);
+        w_sim += static_cast<float>(hsaa_assoc::dot512(q_sk, wsk)) / 256.0f;
+        if (w_sim > best_w_sim) {
+            best_w_sim = w_sim;
+            subj_idx = i;
+        }
+    }
+
+    // Collect remaining content tokens outside the subject anchor
+    std::vector<std::string> rem;
+    for (size_t i = 0; i < content_words.size(); ++i) {
+        if (i == subj_idx) continue;
+        std::string nw = hsaa_assoc::normalize(content_words[i].c_str());
+        if (!nw.empty() && norm_q.find(nw) != std::string::npos) continue;
+        rem.push_back(content_words[i]);
+    }
+    if (rem.empty()) return 0;
+
+    std::string inferred_rel = "associated_with";
+    std::string inferred_obj;
+    int verb_idx = -1;
+    for (size_t i = 0; i < rem.size(); ++i) {
+        auto ms = PopCountGenerativeLLM::classify_morph_signature(rem[i]);
+        if (ms.pos_cat == PopCountGenerativeLLM::POS_VERB_FIN ||
+            ms.pos_cat == PopCountGenerativeLLM::POS_VERB_INF) {
+            verb_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (verb_idx >= 0 && rem.size() >= 2) {
+        inferred_rel = rem[verb_idx];
+        // Prefer the argument after the verb if available, else the last non-verb content token
+        for (size_t i = static_cast<size_t>(verb_idx + 1); i < rem.size(); ++i) {
+            if (!inferred_obj.empty()) inferred_obj.push_back(' ');
+            inferred_obj += rem[i];
+        }
+        if (inferred_obj.empty()) {
+            inferred_obj = rem.back();
+        }
+    } else {
+        inferred_obj = rem.back();
+    }
+
+    strncpy_s(out_target, max_len, inferred_obj.c_str(), _TRUNCATE);
+    assoc_upsert(brain, query_subject, inferred_rel.c_str(), inferred_obj.c_str());
+    return 1;
+}
+
+POPCNT_BRAIN_API int brain_embed_dense_4096(
+    PopCountBrain* brain,
+    const char* text,
+    float* out_vec4096
+) {
+    if (!brain || !text || !out_vec4096) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
+    }
+    return brain->llm_engine->embed_dense_4096_text(brain, text, out_vec4096) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API float brain_cosine_vec_4096(
+    const float* vec_a_4096,
+    const float* vec_b_4096
+) {
+    return PopCountGenerativeLLM::dense_cosine_f32_4096(vec_a_4096, vec_b_4096);
+}
+
+POPCNT_BRAIN_API float brain_cosine_similarity_4096(
+    PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b
+) {
+    if (!brain || !text_a || !text_b) return 0.0f;
+    alignas(64) float va[BRAIN_DENSE_4096_DIM];
+    alignas(64) float vb[BRAIN_DENSE_4096_DIM];
+    if (!brain_embed_dense_4096(brain, text_a, va)) return 0.0f;
+    if (!brain_embed_dense_4096(brain, text_b, vb)) return 0.0f;
+    return PopCountGenerativeLLM::dense_cosine_f32_4096(va, vb);
+}
+
 POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
     PopCountBrain* brain,
     const char* heldout_text,
@@ -15732,8 +17396,6 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                 }
                 if (!prior_reached) {
                     ++prior_unreachable;
-                    std::printf("DEBUG PRIOR UNREACH: gold=%d (%s), pos=%zu, prev=%s, causal_r=%d\n",
-                        gold, gw.c_str(), pos, get_token_word(seq[pos-1]).c_str(), causal_expected_role);
                 }
 
                 int best_tok = -1;
@@ -15849,7 +17511,7 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                 uint32_t pid = ws_pids[prng % num_ws_pages];
                 eids[0] = pid;
                 execute_sparse_micro_experts(base_ptr, dummy_in, eids, 1, dummy_out);
-                sink += dummy_out[it & (D_MODEL - 1)];
+                sink = sink + dummy_out[it & (D_MODEL - 1)];
             }
             (void)sink;
             const double ns = std::chrono::duration<double, std::nano>(

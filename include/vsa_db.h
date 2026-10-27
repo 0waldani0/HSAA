@@ -16,6 +16,7 @@ extern "C" {
 
 #define VSA_DIM 512
 #define VSA_WORDS (VSA_DIM / 64)       // 8 x uint64_t = 64 bytes (1 cache line / __m512i)
+#define VSA_DENSE_4096_DIM 4096        // 4096-D dense float32 embedding (16 KB)
 
 typedef struct VsaDbHandle VsaDbHandle;
 
@@ -53,6 +54,23 @@ int vsa_db_check_conflict(VsaDbHandle* db, const char* subj, const char* rel, co
 // still a miss (pinned by tests/test_vsa_db.cpp).
 int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512);
 int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* out_best_vec, float* out_sim);
+
+// 4096-Dimensional Dense Float32 Embeddings & Cosine Similarity (Bridging Discrete Hamming Discreteness)
+// Computes exact float32 cosine similarity in [-1.0, +1.0] across 4096 dimensions using SIMD FMA.
+float vsa_cosine_sim_4096_f32(const float* a_4096, const float* b_4096);
+int vsa_db_insert_dense_4096(VsaDbHandle* db, uint64_t key_hash, const float* vec_4096);
+int vsa_db_query_dense_4096(
+    VsaDbHandle* db,
+    const float* query_4096,
+    uint64_t* out_best_key,
+    float* out_best_vec_4096,
+    float* out_cosine_sim
+);
+
+// Continuous VSA Function Approximation (Fractional Power / Random Fourier Phase Encoding)
+// Approximates continuous functions y = f(x) without rigid syntactic templates.
+int vsa_db_bind_continuous_point(VsaDbHandle* db, const char* relation_name, float x_val, float y_val);
+int vsa_db_eval_continuous_function(VsaDbHandle* db, const char* relation_name, float x_query, float* out_y);
 
 // Telemetry & Introspection Helpers
 // The count getters take the database mutex; persist_path/capacity are

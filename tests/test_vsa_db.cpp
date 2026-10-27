@@ -1,11 +1,42 @@
 #include "vsa_db.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#else
+#include <cstring>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#ifndef MAX_PATH
+#define MAX_PATH 4096
+#endif
+typedef uint32_t DWORD;
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+static inline void GetTempPathA(DWORD buf_len, char* buf) {
+    const char* t = "/tmp/";
+    std::strncpy(buf, t, buf_len);
+    buf[buf_len - 1] = '\0';
+}
+static inline void strcat_s(char* dst, size_t dst_sz, const char* src) {
+    size_t cur = std::strlen(dst);
+    if (cur + 1 < dst_sz) {
+        std::strncat(dst, src, dst_sz - cur - 1);
+    }
+}
+static inline void DeleteFileA(const char* path) {
+    if (path) unlink(path);
+}
+static inline DWORD GetFileAttributesA(const char* path) {
+    struct stat st;
+    return (path && stat(path, &st) == 0) ? 1u : INVALID_FILE_ATTRIBUTES;
+}
+#endif
 
 #include <cstdint>
 #include <cstddef>
@@ -19,8 +50,6 @@
 #include <atomic>
 #include <thread>
 #include <iostream>
-
-#pragma comment(lib, "psapi.lib")
 
 // =============================================================================
 // Test Harness Mini-Framework
@@ -52,6 +81,7 @@ static int g_tests_failed = 0;
     } while (0)
 
 static double qpc_time_us() {
+#if defined(_WIN32)
     static LARGE_INTEGER freq;
     static bool init = false;
     if (!init) {
@@ -61,14 +91,32 @@ static double qpc_time_us() {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return (static_cast<double>(t.QuadPart) * 1000000.0) / static_cast<double>(freq.QuadPart);
+#else
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration<double, std::micro>(now).count();
+#endif
 }
 
 static size_t get_process_ram_mb() {
+#if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
         return pmc.WorkingSetSize / (1024 * 1024);
     }
     return 0;
+#else
+    FILE* fp = std::fopen("/proc/self/statm", "r");
+    if (fp) {
+        unsigned long size_pages = 0, resident_pages = 0;
+        if (std::fscanf(fp, "%lu %lu", &size_pages, &resident_pages) == 2) {
+            std::fclose(fp);
+            long page_sz = sysconf(_SC_PAGESIZE);
+            return (static_cast<size_t>(resident_pages) * static_cast<size_t>(page_sz)) / (1024 * 1024);
+        }
+        std::fclose(fp);
+    }
+    return 0;
+#endif
 }
 
 // =============================================================================
@@ -542,6 +590,93 @@ static bool test_adversarial_boundaries() {
 }
 
 // =============================================================================
+// Test 9: 4096-Dimensional Dense Float32 Embeddings & Cosine Similarity
+// =============================================================================
+
+static bool test_dense_4096_cosine_similarity() {
+    VsaDbHandle* db = vsa_db_create(VSA_CAP_MICRO, nullptr);
+    TEST_ASSERT(db != nullptr, "Create failed");
+
+    alignas(64) float base_vec[VSA_DENSE_4096_DIM];
+    alignas(64) float ortho_vec[VSA_DENSE_4096_DIM];
+    for (int d = 0; d < VSA_DENSE_4096_DIM; ++d) {
+        base_vec[d]  = std::sin(static_cast<float>(d) * 0.017f);
+        ortho_vec[d] = std::cos(static_cast<float>(d) * 0.017f);
+    }
+
+    TEST_ASSERT(vsa_db_insert_dense_4096(db, 1001ULL, base_vec) == 0, "Insert base_vec 4096 failed");
+    TEST_ASSERT(vsa_db_insert_dense_4096(db, 1002ULL, ortho_vec) == 0, "Insert ortho_vec 4096 failed");
+
+    // Verify sub-bit continuous gradient sensitivity (where 512-bit sign quantization has 0 bit flips)
+    alignas(64) float micro_pert1[VSA_DENSE_4096_DIM];
+    alignas(64) float micro_pert2[VSA_DENSE_4096_DIM];
+    for (int d = 0; d < VSA_DENSE_4096_DIM; ++d) {
+        micro_pert1[d] = 0.995f * base_vec[d] + 0.005f * ortho_vec[d];
+        micro_pert2[d] = 0.980f * base_vec[d] + 0.020f * ortho_vec[d];
+    }
+
+    float c_self = vsa_cosine_sim_4096_f32(base_vec, base_vec);
+    float c_p1   = vsa_cosine_sim_4096_f32(base_vec, micro_pert1);
+    float c_p2   = vsa_cosine_sim_4096_f32(base_vec, micro_pert2);
+    TEST_ASSERT(std::fabs(c_self - 1.0f) < 1e-5f, "Self cosine must be 1.0");
+    TEST_ASSERT(c_self > c_p1 && c_p1 > c_p2 && c_p2 > 0.99f,
+                "4096-D float32 cosine must strictly resolve fine-grained continuous perturbations");
+
+    uint64_t best_key = 0;
+    float best_sim = 0.0f;
+    alignas(64) float retrieved_4096[VSA_DENSE_4096_DIM];
+    TEST_ASSERT(vsa_db_query_dense_4096(db, micro_pert1, &best_key, retrieved_4096, &best_sim) == 1,
+                "Query dense 4096 failed");
+    TEST_ASSERT(best_key == 1001ULL && best_sim > 0.999f, "Dense 4096 argmax key/sim mismatch");
+
+    vsa_db_destroy(db);
+    return true;
+}
+
+// =============================================================================
+// Test 10: Continuous VSA Function Approximation (Fractional Power / Fourier Phase)
+// =============================================================================
+
+static bool test_continuous_vsa_function_approximation() {
+    VsaDbHandle* db = vsa_db_create(VSA_CAP_MICRO, nullptr);
+    TEST_ASSERT(db != nullptr, "Create failed");
+
+    // Bind sample points of a smooth non-linear function y = cos(x) + 0.5 * x
+    for (int i = 0; i <= 16; ++i) {
+        float x = -2.0f + 0.25f * static_cast<float>(i);
+        float y = std::cos(x) + 0.5f * x;
+        TEST_ASSERT(vsa_db_bind_continuous_point(db, "phase_response", x, y) == 0,
+                    "vsa_db_bind_continuous_point failed");
+    }
+
+    // Evaluate at unseen intermediate points and verify low MSE
+    double mse = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        float xq = -1.875f + 0.25f * static_cast<float>(i);
+        float y_true = std::cos(xq) + 0.5f * xq;
+        float y_pred = 0.0f;
+        TEST_ASSERT(vsa_db_eval_continuous_function(db, "phase_response", xq, &y_pred) == 1,
+                    "vsa_db_eval_continuous_function failed");
+        double err = static_cast<double>(y_pred - y_true);
+        mse += err * err;
+    }
+    mse /= 16.0;
+    TEST_ASSERT(mse < 1e-3, "Continuous VSA function approximation MSE must be < 1e-3");
+
+    // Verify vsa_db_query_relation seamlessly falls back to continuous function evaluation on unseen x="0.375"
+    char out_buf[64] = {0};
+    TEST_ASSERT(vsa_db_query_relation(db, "0.375", "phase_response", out_buf, sizeof(out_buf)) == 1,
+                "vsa_db_query_relation continuous fallback failed");
+    float parsed_y = std::strtof(out_buf, nullptr);
+    float expected_y = std::cos(0.375f) + 0.5f * 0.375f;
+    TEST_ASSERT(std::fabs(parsed_y - expected_y) < 0.02f,
+                "vsa_db_query_relation continuous interpolation value mismatch");
+
+    vsa_db_destroy(db);
+    return true;
+}
+
+// =============================================================================
 // Main Test Runner
 // =============================================================================
 
@@ -559,6 +694,8 @@ int main() {
     RUN_TEST(test_long_string_heap_reuse);
     RUN_TEST(test_multi_instance_hot_swapping);
     RUN_TEST(test_adversarial_boundaries);
+    RUN_TEST(test_dense_4096_cosine_similarity);
+    RUN_TEST(test_continuous_vsa_function_approximation);
 
     std::printf("=================================================================\n");
     std::printf("Test Summary: %d Run, %d Passed, %d Failed\n", g_tests_run, g_tests_passed, g_tests_failed);

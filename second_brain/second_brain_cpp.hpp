@@ -123,6 +123,70 @@ public:
         return res;
     }
 
+    std::pair<float, float> train_foundation_backprop(const std::string& corpus_text = "", int epochs = 8, float learning_rate = 0.08f) {
+        float init_loss = 0.0f;
+        float final_loss = 0.0f;
+        const char* c_ptr = corpus_text.empty() ? nullptr : corpus_text.c_str();
+        if (brain_train_foundation_backprop(handle_, c_ptr, epochs, learning_rate, &init_loss, &final_loss) == 0) {
+            throw std::runtime_error("brain_train_foundation_backprop failed");
+        }
+        return {init_loss, final_loss};
+    }
+
+    std::string paraphrase_continuous(const std::string& input_text, float temperature = 0.0f, size_t buffer_size = 8192) {
+        std::vector<char> buf(buffer_size, 0);
+        int n = brain_paraphrase_continuous(handle_, input_text.c_str(), buf.data(), buf.size(), temperature);
+        if (n <= 0) return {};
+        return std::string(buf.data());
+    }
+
+    bool learn_continuous_function(
+        const std::string& func_name,
+        const std::vector<float>& x_samples,
+        const std::vector<float>& y_samples,
+        size_t num_samples,
+        size_t x_dim = 1,
+        size_t y_dim = 1
+    ) {
+        if (x_samples.size() < num_samples * x_dim || y_samples.size() < num_samples * y_dim) return false;
+        return brain_learn_continuous_function(
+            handle_, func_name.c_str(), x_samples.data(), y_samples.data(), num_samples, x_dim, y_dim
+        ) != 0;
+    }
+
+    std::vector<float> eval_continuous_function(
+        const std::string& func_name,
+        const std::vector<float>& x_query,
+        size_t y_dim = 1
+    ) const {
+        std::vector<float> out_y(y_dim, 0.0f);
+        if (brain_eval_continuous_function(
+                handle_, func_name.c_str(), x_query.data(), x_query.size(), out_y.data(), y_dim) == 0) {
+            return {};
+        }
+        return out_y;
+    }
+
+    std::string infer_template_free_relation(const std::string& unstructured_corpus, const std::string& query_subject) {
+        char buf[512] = {0};
+        if (brain_infer_template_free_relation(handle_, unstructured_corpus.c_str(), query_subject.c_str(), buf, sizeof(buf)) != 0) {
+            return std::string(buf);
+        }
+        return {};
+    }
+
+    std::array<float, BRAIN_DENSE_4096_DIM> embed_dense_4096(const std::string& text) const {
+        std::array<float, BRAIN_DENSE_4096_DIM> vec{};
+        if (brain_embed_dense_4096(handle_, text.c_str(), vec.data()) == 0) {
+            vec.fill(0.0f);
+        }
+        return vec;
+    }
+
+    float cosine_similarity_4096(const std::string& text_a, const std::string& text_b) const {
+        return brain_cosine_similarity_4096(handle_, text_a.c_str(), text_b.c_str());
+    }
+
     BrainScaleAndHeldOutProfile profile_heldout_and_scale(const std::string& heldout_text = "") const {
         BrainScaleAndHeldOutProfile prof{};
         const char* h_ptr = heldout_text.empty() ? nullptr : heldout_text.c_str();
@@ -141,4 +205,3 @@ private:
 } // namespace hsaa
 
 namespace hssa = hsaa;
-

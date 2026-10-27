@@ -36,6 +36,9 @@ A pure native Windows C++/CUDA laboratory running on workstation hardware (Intel
 | 26 | F6.4 Relative Activation Band | `execute_sparse_micro_experts` gate is `max_h - 256` whenever a routed page is live; the old absolute floor 600 cut every neuron off whenever the achievable dot fell below it (measured `mean_max_h = -12710`) | M3 | Empirical |
 | 27 | F7.1 Honest Recall Semantics | `src/hssa.cpp` and `src/model_mod.cpp` seeded recall `similarity = 1.0f` and echoed the query back as `best_vec` on every miss / empty DB, fabricating certainty and injecting a gamma-weighted projection of the query into the memory state. Both now report 0.0f on a miss; functionally proven (no-db 0.0, empty-db 0.0, miss -0.027, exact hit 0.984) | M1/M3 | Empirical |
 | 28 | F7.2 Kernel Single Source of Truth | `dual_rail_binarize` is declared in `include/hssa.h` and no longer `static`; `tests/test_hssa_m1.cpp` used to carry a private byte-identical copy (`simd_psi_binarize`), which detached its latency and round-trip assertions from the shipped kernel | M1 | Structural |
+| 29 | F8.1 Foundation Continuous Manifold (Backprop) | Analytical cross-entropy backpropagation (`FoundationContinuousManifold` 2-layer SwiGLU/SiLU residual network), OOD open-ended extrapolation when discrete $L=1..16$ suffix hashes miss, and continuous semantic paraphrasing (`brain_train_foundation_backprop`, `brain_paraphrase_continuous`) | M3 | Empirical |
+| 30 | F8.2 Continuous VSA Function Approximation | Locality-Preserving Fractional Power Encoding (Random Fourier Phase in $\mathbb{R}^{4096}$ + 512-bit VSA sketch) + locally weighted tangent regression for non-linear continuous functions $y=f(x)$ and template-free relation inference (`brain_learn_continuous_function`, `brain_eval_continuous_function`, `brain_infer_template_free_relation`, `vsa_db_bind_continuous_point`, `vsa_db_eval_continuous_function`) | M2/M3 | Empirical |
+| 31 | F8.3 4096-D Dense Float32 Cosine Similarity | Native 4096-dimensional dense `float32` embeddings and AVX-512 / AVX2+FMA cosine similarity (`brain_embed_dense_4096`, `brain_cosine_similarity_4096`, `brain_cosine_vec_4096`, `vsa_cosine_sim_4096_f32`, `vsa_db_insert_dense_4096`, `vsa_db_query_dense_4096`) resolving continuous micro-gradients beyond discrete 512-bit Hamming quantization | M1/M2 | Empirical |
 | 14 | F4.2 Workstation Hardware Tracker | Win32 RAM working set (<=32GB) and CUDA Driver API VRAM (<=4096MB) ceiling assertion | M4 | Survey |
 | 15 | F4.3 Numerical Accuracy Metrics | Cosine similarity, SQNR dB, and perplexity/loss delta measurement | M4 | Survey |
 | 16 | F4.4 Boundary & Adversarial Suite | 0-1-N-NULL-BOUND boundary stress testing and MUTATION FLIP verification | M4 | Survey |
@@ -113,6 +116,14 @@ int vsa_db_check_conflict(VsaDbHandle* db, const char* subj, const char* rel, co
 // Raw 512-bit Vector Operations
 int vsa_db_insert_vector(VsaDbHandle* db, uint64_t key_hash, const uint64_t* vec_512);
 int vsa_db_query_vector(VsaDbHandle* db, const uint64_t* query_512, uint64_t* out_best_vec, float* out_sim);
+
+// 4096-Dimensional Dense Float32 Embeddings & Continuous VSA Function Approximation
+#define VSA_DENSE_4096_DIM 4096
+float vsa_cosine_sim_4096_f32(const float* a_4096, const float* b_4096);
+int vsa_db_insert_dense_4096(VsaDbHandle* db, uint64_t key_hash, const float* vec_4096);
+int vsa_db_query_dense_4096(VsaDbHandle* db, const float* query_4096, uint64_t* out_best_key, float* out_best_vec_4096, float* out_cosine_sim);
+int vsa_db_bind_continuous_point(VsaDbHandle* db, const char* func_name, float x_val, float y_val);
+int vsa_db_eval_continuous_function(VsaDbHandle* db, const char* func_name, float x_query, float* out_y_val);
 ```
 
 ### 3. `core/model_mod.h` (Architecture Experimentation & Mutation API)

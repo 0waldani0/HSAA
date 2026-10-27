@@ -196,7 +196,69 @@ int main() {
            prof.heldout_unreachable_before_pct, prof.heldout_unreachable_after_pct,
            prof.avx512_l1_page_eval_ns, prof.avx512_dram_page_eval_ns);
 
-    // 11. Destroy brain and cleanup
+    // 11. Verify Foundation Backprop Continuous Manifold Training & Continuous Paraphrasing
+    assert(oov_st.backprop_initial_loss > oov_st.backprop_final_loss && "Expected backprop loss reduction during train_corpus");
+    float bp_init = 0.0f, bp_final = 0.0f;
+    int bp_ok = brain_train_foundation_backprop(brain, NULL, 12, 0.25f, &bp_init, &bp_final);
+    assert(bp_ok == 1 && bp_final < oov_st.backprop_initial_loss && "brain_train_foundation_backprop failed to reduce loss");
+    printf("[+] Foundation Analytical Backprop verified: initial_loss=%.4f -> final_loss=%.4f\n",
+           oov_st.backprop_initial_loss, bp_final);
+
+    char para_out[256] = {0};
+    int para_n = brain_paraphrase_continuous(
+        brain,
+        "Quantum router initializes coherent channel for low latency.",
+        para_out, sizeof(para_out), 0.75f);
+    assert(para_n >= 5 && strcmp(para_out, "Quantum router initializes coherent channel for low latency.") != 0 &&
+           "Expected brain_paraphrase_continuous to produce a distinct semantic paraphrase");
+    printf("[+] Continuous Semantic Paraphrasing verified: '%s'\n", para_out);
+
+    // 12. Verify Continuous VSA Function Approximation (y = (x + 1)^2) & Template-Free Relation Inference
+    float xs[9], ys[9];
+    for (int i = 0; i < 9; ++i) {
+        xs[i] = -2.0f + 0.5f * (float)i;
+        ys[i] = xs[i] * xs[i] + 2.0f * xs[i] + 1.0f; // (x + 1)^2
+    }
+    int fn_ok = brain_learn_continuous_function(brain, "quadratic_energy", xs, ys, 9, 1, 1);
+    assert(fn_ok == 1 && "brain_learn_continuous_function failed");
+    float x_q = 0.25f, y_pred = 0.0f;
+    int ev_ok = brain_eval_continuous_function(brain, "quadratic_energy", &x_q, 1, &y_pred, 1);
+    float y_true = 1.25f * 1.25f; // 1.5625
+    float abs_err = (y_pred > y_true) ? (y_pred - y_true) : (y_true - y_pred);
+    assert(ev_ok == 1 && abs_err < 0.08f && "brain_eval_continuous_function error too large on unseen x=0.25");
+
+    // Also verify automatic continuous interpolation inside brain_query_relation for unseen numeric subject "0.75"
+    char cont_q_ans[64] = {0};
+    int cq_ok = brain_query_relation(brain, "0.75", "quadratic_energy", cont_q_ans, sizeof(cont_q_ans));
+    assert(cq_ok == 1 && cont_q_ans[0] != '\0' && "brain_query_relation failed to interpolate continuous function");
+    printf("[+] Continuous VSA Function Approximation verified: f(0.25)=%.4f (true=%.4f, err=%.4f), query('0.75')->%s\n",
+           y_pred, y_true, abs_err, cont_q_ans);
+
+    char inf_obj[128] = {0};
+    int inf_ok = brain_infer_template_free_relation(
+        brain,
+        "При критическом охлаждении сверхпроводящий_соленоид стабилизирует плазменное_кольцо.",
+        "сверхпроводящий_соленоид",
+        inf_obj, sizeof(inf_obj));
+    assert(inf_ok == 1 && strstr(inf_obj, "плазменное_кольцо") != NULL && "brain_infer_template_free_relation failed");
+    printf("[+] Template-Free VSA Relation Inference verified: subject='сверхпроводящий_соленоид' -> target='%s'\n",
+           inf_obj);
+
+    // 13. Verify 4096-Dimensional Dense Float32 Embeddings & Cosine Similarity
+    float d4096_a[BRAIN_DENSE_4096_DIM] = {0};
+    float d4096_b[BRAIN_DENSE_4096_DIM] = {0};
+    int d_ok1 = brain_embed_dense_4096(brain, "Quantum router initializes coherent channel", d4096_a);
+    int d_ok2 = brain_embed_dense_4096(brain, "Quantum router initializes photonic channel", d4096_b);
+    assert(d_ok1 == 1 && d_ok2 == 1 && "brain_embed_dense_4096 failed");
+    float cos_ab = brain_cosine_vec_4096(d4096_a, d4096_b);
+    float cos_unrel = brain_cosine_similarity_4096(
+        brain,
+        "Quantum router initializes coherent channel",
+        "completely unrelated culinary recipe with olive oil");
+    assert(cos_ab > 0.70f && cos_ab > cos_unrel + 0.35f && "4096-D dense float32 cosine similarity failed semantic ranking");
+    printf("[+] 4096-D Dense Float32 Cosine verified: cos_related=%.4f > cos_unrelated=%.4f\n", cos_ab, cos_unrel);
+
+    // 14. Destroy brain and cleanup
     brain_destroy(brain);
     printf("[+] Brain destroyed cleanly.\n");
 

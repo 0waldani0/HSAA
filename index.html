@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HSSA &amp; SecondBrain — Continuous Foundation Manifold &amp; 4096-D VSA Engine</title>
+  <meta name="description" content="Hybrid Sub-linear Sparse Architecture (HSSA) &amp; SecondBrain native C++20 engine featuring end-to-end backprop Foundation Continuous Manifold, locality-preserving Continuous VSA Function Approximation, and 4096-D float32 SIMD cosine similarity." />
+  <meta property="og:title" content="HSSA &amp; SecondBrain — Continuous Foundation Manifold &amp; 4096-D VSA Engine" />
+  <meta property="og:description" content="Hybrid Sub-linear Sparse Architecture (HSSA) &amp; SecondBrain native C++20 engine featuring end-to-end backprop Foundation Continuous Manifold, locality-preserving Continuous VSA Function Approximation, and 4096-D float32 SIMD cosine similarity." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased selection:bg-emerald-500/30">
+  <div class="max-w-7xl mx-auto px-6 py-8">
+    <header class="border-b border-slate-800 pb-6 mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+      <div>
+        <div class="text-xs font-mono uppercase tracking-widest text-emerald-400 mb-1">HSSA v2.0 / SecondBrain Native C++20 Engine</div>
+        <h1 class="text-2xl md:text-3xl font-bold tracking-tight text-white">
+          Continuous Foundation Manifold &amp; 4096-D Float32 VSA Architecture
+        </h1>
+        <p class="text-sm text-slate-400 mt-1">
+          Устранение трёх фундаментальных ограничений: аналитический Backprop по непрерывному многообразию, аппроксимация нелинейных функций в VSA и 4096-мерная плотная float32 косинусная метрика.
+        </p>
+      </div>
+      <div class="flex items-center gap-3">
+        <button id="refreshBtn" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg transition cursor-pointer">
+          Запустить C++ верификацию
+        </button>
+      </div>
+    </header>
+
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs font-mono text-emerald-400 uppercase mb-2">1. Foundation Continuous Manifold</div>
+        <h2 class="text-lg font-semibold text-white mb-2">Аналитический Backprop + OOD Генерация</h2>
+        <p class="text-xs text-slate-300 leading-relaxed mb-4">
+          Двухслойная SwiGLU/SiLU резидуальная сеть (<code class="text-emerald-300">FoundationContinuousManifold</code>) обучается сквозным обратным распространением ошибки (cross-entropy backprop) и управляет открытой генерацией при промахе суффиксных хэшей <code class="text-emerald-300">L=1..16</code>, а также непрерывным семантическим перефразированием.
+        </p>
+        <div class="text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1 text-slate-300">
+          <div>API: <span class="text-emerald-400">brain_train_foundation_backprop()</span></div>
+          <div>API: <span class="text-emerald-400">brain_paraphrase_continuous()</span></div>
+        </div>
+      </div>
+
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs font-mono text-cyan-400 uppercase mb-2">2. Continuous VSA Function Approximation</div>
+        <h2 class="text-lg font-semibold text-white mb-2">Аппроксимация <code class="text-cyan-300">y = f(x)</code> без шаблонов</h2>
+        <p class="text-xs text-slate-300 leading-relaxed mb-4">
+          Локально-сохраняющее Fractional Power Encoding (Random Fourier Phase в ℝ<sup>4096</sup> + 512-бит фазовый VSA-скетч) с локально-взвешенной касательной регрессией аппроксимирует гладкие нелинейные функции и извлекает связи без синтаксических шаблонов.
+        </p>
+        <div class="text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1 text-slate-300">
+          <div>API: <span class="text-cyan-400">brain_learn_continuous_function()</span></div>
+          <div>API: <span class="text-cyan-400">vsa_db_eval_continuous_function()</span></div>
+        </div>
+      </div>
+
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs font-mono text-violet-400 uppercase mb-2">3. 4096-D Dense Float32 Cosine Metric</div>
+        <h2 class="text-lg font-semibold text-white mb-2">Градиентная тонкость ℝ<sup>4096</sup> vs Хэмминг</h2>
+        <p class="text-xs text-slate-300 leading-relaxed mb-4">
+          8-полосные 4096-мерные <code class="text-violet-300">float32</code>-эмбеддинги (<code class="text-violet-300">BRAIN_DENSE_4096_DIM = 4096</code>) с аппаратным AVX-512 / AVX2+FMA косинусным ядром улавливают тонкие семантические и численные градиенты, невидимые для дискретного POPCNT.
+        </p>
+        <div class="text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1 text-slate-300">
+          <div>API: <span class="text-violet-400">brain_embed_dense_4096()</span></div>
+          <div>API: <span class="text-violet-400">vsa_cosine_sim_4096_f32()</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="bg-slate-900 border border-slate-800 rounded-xl p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-white">Результаты нативных C++20 тестов (<code class="text-emerald-400">test_c_api</code>, <code class="text-cyan-400">test_vsa_db</code>, <code class="text-violet-400">test_llm_text_code_gen</code>)</h2>
+        <span id="statusBadge" class="text-xs font-mono px-2.5 py-1 rounded bg-slate-800 text-slate-300">Загрузка...</span>
+      </div>
+      <div id="suitesContainer" class="space-y-4">
+        <div class="text-sm text-slate-400 font-mono">Выполняется сборка и опрос бинарных тестов...</div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    async function loadMetrics(refresh = false) {
+      const badge = document.getElementById('statusBadge');
+      const container = document.getElementById('suitesContainer');
+      badge.textContent = 'Выполнение...';
+      badge.className = 'text-xs font-mono px-2.5 py-1 rounded bg-amber-500/20 text-amber-300';
+      try {
+        const res = await fetch('/api/metrics' + (refresh ? '?refresh=1' : ''));
+        const data = await res.json();
+        const allPassed = data.suites.every(s => s.exists && s.exitCode === 0);
+        badge.textContent = allPassed ? 'ALL SUITES PASSED (EXIT 0)' : 'ПРОВЕРКА ЗАВЕРШЕНА';
+        badge.className = allPassed
+          ? 'text-xs font-mono px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+          : 'text-xs font-mono px-2.5 py-1 rounded bg-amber-500/20 text-amber-300';
+
+        container.innerHTML = data.suites.map(s => `
+          <div class="border border-slate-800 rounded-lg bg-slate-950 overflow-hidden">
+            <div class="px-4 py-2.5 bg-slate-900/80 border-b border-slate-800 flex items-center justify-between">
+              <span class="font-mono text-sm font-semibold text-white">${s.binary}</span>
+              <span class="font-mono text-xs ${s.exitCode === 0 ? 'text-emerald-400' : 'text-amber-400'}">
+                exit=${s.exitCode} &bull; ${s.durationMs} ms
+              </span>
+            </div>
+            <pre class="p-4 text-xs font-mono text-slate-300 overflow-x-auto max-h-80 whitespace-pre-wrap">${s.output.replace(/</g, '&lt;')}</pre>
+          </div>
+        `).join('');
+      } catch (err) {
+        badge.textContent = 'ОШИБКА СЕТИ';
+        container.innerHTML = `<div class="text-sm text-red-400 font-mono">${err.message}</div>`;
+      }
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', () => loadMetrics(true));
+    loadMetrics(false);
+  </script>
+</body>
+</html>

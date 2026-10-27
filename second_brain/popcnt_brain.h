@@ -181,6 +181,8 @@ typedef struct BrainTrainStats {
     double shortlist_coverage_percent;
     double train_time_ms;
     double tokens_per_sec;
+    double backprop_initial_loss;
+    double backprop_final_loss;
 } BrainTrainStats;
 
 // Train the PopCount Generative LLM on an in-memory UTF-8 text/code corpus.
@@ -274,6 +276,117 @@ POPCNT_BRAIN_API int brain_interpolate_continuous(
 );
 
 // =============================================================================
+// 1. Foundation Continuous Manifold via End-to-End Analytical Backpropagation,
+//    Semantic Paraphrasing & Out-of-Distribution (OOD) Open-Ended Extrapolation
+// =============================================================================
+
+// Train the continuous multi-layer hidden manifold and 4096-D dense embeddings
+// via end-to-end analytical backpropagation (cross-entropy + cosine alignment
+// gradients through output softmax, SwiGLU/GELU hidden layers, attention pooling,
+// and continuous token representations).
+// If corpus_text is NULL or empty, trains on the currently loaded corpus.
+// Writes initial and final analytical cross-entropy loss to out_initial_loss and
+// out_final_loss (if non-NULL). Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_train_foundation_backprop(
+    PopCountBrain* brain,
+    const char* corpus_text,
+    int epochs,
+    float learning_rate,
+    float* out_initial_loss,
+    float* out_final_loss
+);
+
+// Generate a fluent, meaning-preserving paraphrase of input_text by projecting
+// the sequence onto the backprop-trained 4096-D continuous manifold and decoding
+// high-cosine-similarity semantic equivalents validated by the continuous
+// transition network and morpho-syntactic agreement engine.
+// Returns the number of tokens (> 0) written to out_text on success, 0 on failure.
+POPCNT_BRAIN_API int brain_paraphrase_continuous(
+    PopCountBrain* brain,
+    const char* input_text,
+    char* out_text,
+    size_t max_len,
+    float temperature
+);
+
+// =============================================================================
+// 2. Continuous Function Approximation (Fractional Power / Fourier Phase VSA) &
+//    Template-Free Relational Resonance
+// =============================================================================
+
+// Learn a continuous non-linear function y = f(x) (f: R^{x_dim} -> R^{y_dim})
+// inside the VSA engine using Locality-Preserving Fractional Power Encoding
+// (Random Fourier Phase hypervectors in R^4096 coupled with 512-bit VSA sketches)
+// and continuous kernel-ridge / local tangent operator resonance.
+// x_samples has shape [num_samples * x_dim], y_samples has shape [num_samples * y_dim].
+// Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_learn_continuous_function(
+    PopCountBrain* brain,
+    const char* func_name,
+    const float* x_samples,
+    const float* y_samples,
+    size_t num_samples,
+    size_t x_dim,
+    size_t y_dim
+);
+
+// Evaluate a learned continuous function y = f(x_query) via VSA phase-kernel
+// resonance without requiring any discrete lookup hit or syntactic template.
+// Returns 1 on success and writes y_dim floats to out_y, 0 on failure.
+POPCNT_BRAIN_API int brain_eval_continuous_function(
+    PopCountBrain* brain,
+    const char* func_name,
+    const float* x_query,
+    size_t x_dim,
+    float* out_y,
+    size_t y_dim
+);
+
+// Infer the target entity for query_subject from an unstructured text corpus
+// that contains implicit relational co-occurrences without any fixed syntactic
+// template, using 4096-D continuous relational displacement vectors and VSA
+// resonance bundling.
+// Returns 1 on success and writes null-terminated target to out_target, 0 on failure.
+POPCNT_BRAIN_API int brain_infer_template_free_relation(
+    PopCountBrain* brain,
+    const char* unstructured_corpus,
+    const char* query_subject,
+    char* out_target,
+    size_t max_len
+);
+
+// =============================================================================
+// 3. 4096-Dimensional Dense Float32 Embeddings & SIMD FMA Cosine Similarity
+//    (Sub-Bit Gradient Semantic Nuance Beyond Discrete 512-Bit Hamming)
+// =============================================================================
+#define BRAIN_DENSE_4096_DIM 4096
+
+// Project a UTF-8 text or code snippet into a unit-L2 4096-dimensional dense
+// float32 embedding (8 orthogonal 512-D spectral/distributional/backprop-refined
+// subspaces), writing 4096 floats (16 KB) to out_vec4096.
+// Returns 1 on success, 0 on failure.
+POPCNT_BRAIN_API int brain_embed_dense_4096(
+    PopCountBrain* brain,
+    const char* text,
+    float* out_vec4096
+);
+
+// Compute AVX-512 / AVX2+FMA cosine similarity in [-1.0f, +1.0f] between two
+// UTF-8 texts in the 4096-dimensional dense float32 embedding space.
+POPCNT_BRAIN_API float brain_cosine_similarity_4096(
+    PopCountBrain* brain,
+    const char* text_a,
+    const char* text_b
+);
+
+// Compute AVX-512 / AVX2+FMA cosine similarity in [-1.0f, +1.0f] directly
+// between two arbitrary 4096-dimensional dense float32 vectors.
+POPCNT_BRAIN_API float brain_cosine_vec_4096(
+    const float* vec_a_4096,
+    const float* vec_b_4096
+);
+
+// =============================================================================
 // Distributional OOV Output Priors (Held-Out Target Reachability) &
 // Large-Scale 1.0 GB Sparse Bank Fragmentation / AVX-512 Cache-Miss Profiler
 // =============================================================================
@@ -347,6 +460,3 @@ static inline int brain_profile_heldout_and_scale(
     return brain_profile_heldout_and_scale(brain, heldout_text, out_profile) ? 1 : 0;
 }
 #endif
-
-
-
