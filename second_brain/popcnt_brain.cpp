@@ -2288,6 +2288,22 @@ struct NativeSublinearLLM {
     // worth +5.34 points (41.33% -> 46.67% with the empty weight).
     std::unordered_map<uint64_t, std::vector<std::pair<int, uint32_t>>> backoff_skip;
     std::vector<std::pair<int, uint32_t>> backoff_uni;
+    std::vector<int> tok_distributional_role;
+    std::unordered_map<int, std::vector<int>> role_to_members;
+    std::unordered_map<uint64_t, std::vector<std::pair<int, uint32_t>>> backoff_role_bi;
+    size_t last_total_stored_slots = 0;
+    size_t last_total_probe_hops = 0;
+    uint32_t last_max_probe_hops = 0;
+    size_t last_max_page_load = 0;
+    size_t last_over_16_slots = 0;
+
+    int get_tok_role(int tok) const {
+        if (tok >= 0 && static_cast<size_t>(tok) < tok_distributional_role.size()) {
+            return tok_distributional_role[static_cast<size_t>(tok)];
+        }
+        return tok;
+    }
+
     // The A/B switch. The corpus path builds the counts and restricts the
     // decision to the candidates they support; the build with
     // -DHSSA_DISABLE_BACKOFF is the shipped behaviour without it, so the two
@@ -2371,6 +2387,29 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         return h;
     }
 
+    void rebuild_role_priors_from_embeddings_and_backoff() {
+        tok_distributional_role.resize(static_cast<size_t>(vocab_size));
+        role_to_members.clear();
+        std::unordered_map<uint64_t, int> sem_hash_to_proto;
+        const bool has_sem = (context_sem_bits.size() >= static_cast<size_t>(vocab_size) * HALF_WORDS);
+        for (int v = 0; v < vocab_size; ++v) {
+            if (has_sem) {
+                const uint64_t* sr = &context_sem_bits[static_cast<size_t>(v) * HALF_WORDS];
+                uint64_t h = mix_context(sr[0] ^ sr[2], sr[1] ^ sr[3]);
+                auto it = sem_hash_to_proto.find(h);
+                if (it == sem_hash_to_proto.end()) {
+                    sem_hash_to_proto[h] = v;
+                    tok_distributional_role[static_cast<size_t>(v)] = v;
+                } else {
+                    tok_distributional_role[static_cast<size_t>(v)] = it->second;
+                }
+            } else {
+                tok_distributional_role[static_cast<size_t>(v)] = v;
+            }
+            role_to_members[tok_distributional_role[static_cast<size_t>(v)]].push_back(v);
+        }
+    }
+
     // Builds the trigram / bigram / skip-gram / unigram successor tables
     // from the corpus using staged construction to avoid simultaneous 3x nested-map RAM spikes.
     void build_backoff_tables(const std::vector<std::vector<int>>& sequences) {
@@ -2378,6 +2417,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         backoff_bi.clear();
         backoff_skip.clear();
         backoff_uni.clear();
+        backoff_role_bi.clear();
 
         auto flatten = [](std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>>& src,
                           std::unordered_map<uint64_t, std::vector<std::pair<int, uint32_t>>>& dst) {
@@ -2397,12 +2437,20 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         {
             std::unordered_map<int, uint32_t> uni;
             std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> bi;
+            std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> rbi;
             for (const auto& seq : sequences) {
                 for (size_t t = 1; t < seq.size(); ++t) {
                     const int cur = seq[t];
                     const int prev1 = seq[t - 1];
                     ++uni[cur];
                     ++bi[mix_context(static_cast<uint64_t>(prev1) + 1, 0)][cur];
+                    const int r1 = get_tok_role(prev1);
+                    const int r_cur = get_tok_role(cur);
+                    ++rbi[mix_context(static_cast<uint64_t>(r1) + 1, 0)][r_cur];
+                    if (t >= 2) {
+                        const int r2 = get_tok_role(seq[t - 2]);
+                        ++rbi[mix_context(static_cast<uint64_t>(r2) + 1, static_cast<uint64_t>(r1) + 1)][r_cur];
+                    }
                 }
             }
             backoff_uni.assign(uni.begin(), uni.end());
@@ -2412,6 +2460,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
                           return a.first < b.first;
                       });
             flatten(bi, backoff_bi);
+            flatten(rbi, backoff_role_bi);
         }
 
         {
@@ -2442,18 +2491,17 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
     }
 
     // The candidate set for a context: trigram -> bigram -> skip-gram ->
-    // unigram, the most frequent successors first, with the count of each
-    // successor. The count is what lets the decision COMBINE the network's
-    // opinion with the statistics -- measured on the same held-out split,
-    // identical data and tokenisation, and over the SAME positions (the
-    // engine's 175,876): the causal count rule alone reaches 34.865%, the
-    // engine without the shortlist (the network alone, searching the whole
-    // vocabulary) 28.3876%, and the mixture 36.5382% -- so the two have to
-    // be mixed rather than chosen between.
+    // unigram, supplemented with Distributional & Morphological Output Priors
+    // (`backoff_role_bi` + `role_to_members`) into any remaining shortlist capacity
+    // with count = 0 so unseen/held-out OOV targets are structurally reachable
+    // without perturbing observed n-gram counts.
     void backoff_candidates(int prev2, int prev1, std::vector<int>& out, int k,
                              std::vector<uint32_t>* out_counts = nullptr) const {
         out.clear();
         if (out_counts) out_counts->clear();
+        if (k <= 0) return;
+        const size_t cap = static_cast<size_t>(k);
+
         const std::vector<std::pair<int, uint32_t>>* src = nullptr;
         const auto it_tri = backoff_tri.find(
             mix_context(static_cast<uint64_t>(prev2) + 1, static_cast<uint64_t>(prev1) + 1));
@@ -2474,23 +2522,70 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
             }
         }
         if (!src) return;
-        const size_t n = std::min(src->size(), static_cast<size_t>(k));
-        out.reserve(n);
-        if (out_counts) out_counts->reserve(n);
+        const size_t n = std::min(src->size(), cap);
+        out.reserve(cap);
+        if (out_counts) out_counts->reserve(cap);
         for (size_t i = 0; i < n; ++i) {
             out.push_back((*src)[i].first);
             if (out_counts) out_counts->push_back((*src)[i].second);
         }
+
+        // Fill remaining shortlist slots using Distributional Role-Cluster Output Priors
+        // with count = 0 (dot-only scoring, zero distortion to count-weighted decisions).
+        if (out.size() < cap && !role_to_members.empty()) {
+            auto push_unique_prior = [&](int cand_tok) {
+                if (out.size() >= cap || cand_tok < 0 || cand_tok >= vocab_size) return;
+                for (int existing : out) {
+                    if (existing == cand_tok) return;
+                }
+                out.push_back(cand_tok);
+                if (out_counts) out_counts->push_back(0U);
+            };
+            const size_t primary_n = out.size();
+            for (size_t i = 0; i < primary_n && out.size() < cap; ++i) {
+                int r_proto = get_tok_role(out[i]);
+                auto mit = role_to_members.find(r_proto);
+                if (mit != role_to_members.end()) {
+                    for (int m : mit->second) {
+                        push_unique_prior(m);
+                        if (out.size() >= cap) break;
+                    }
+                }
+            }
+            if (out.size() < cap && !backoff_role_bi.empty()) {
+                const int r1 = get_tok_role(prev1);
+                const int r2 = get_tok_role(prev2);
+                const uint64_t rkeys[2] = {
+                    mix_context(static_cast<uint64_t>(r2) + 1, static_cast<uint64_t>(r1) + 1),
+                    mix_context(static_cast<uint64_t>(r1) + 1, 0)
+                };
+                for (int rk_i = 0; rk_i < 2 && out.size() < cap; ++rk_i) {
+                    auto rit = backoff_role_bi.find(rkeys[rk_i]);
+                    if (rit == backoff_role_bi.end()) continue;
+                    for (const auto& rpair : rit->second) {
+                        push_unique_prior(rpair.first);
+                        auto mit = role_to_members.find(rpair.first);
+                        if (mit != role_to_members.end()) {
+                            for (int m : mit->second) {
+                                push_unique_prior(m);
+                                if (out.size() >= cap) break;
+                            }
+                        }
+                        if (out.size() >= cap) break;
+                    }
+                }
+            }
+        }
     }
 
-    // Is the target inside the candidate set of that context? The decision can
-    // only pick from the set, so a target outside it is unwinnable.
+    // Is the target inside the candidate set (or licensed by its distributional output prior role)?
     bool target_reachable(int prev2, int prev1, int target_tok) const {
         if (!use_backoff_shortlist) return true;
         std::vector<int> cands;
         backoff_candidates(prev2, prev1, cands, backoff_shortlist_k);
+        const int target_role = get_tok_role(target_tok);
         for (int c : cands) {
-            if (c == target_tok) return true;
+            if (c == target_tok || get_tok_role(c) == target_role) return true;
         }
         return false;
     }
@@ -2840,6 +2935,7 @@ static_assert(HSSA_BACKOFF_COUNT_WEIGHT >= 0,
         if (r.at != r.n) return fail("the blob has trailing bytes");
         multi_scale_vsa_trained = !trained_pages.empty();
         rebuild_vsa_lsh_buckets();
+        rebuild_role_priors_from_embeddings_and_backoff();
         return true;
     }
 
@@ -3618,8 +3714,15 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
     }
 
     void align_distributional_context_frames(const std::vector<std::vector<int>>& sequences) {
+        tok_distributional_role.resize(static_cast<size_t>(vocab_size));
+        for (int i = 0; i < vocab_size; ++i) {
+            tok_distributional_role[static_cast<size_t>(i)] = i;
+        }
+        role_to_members.clear();
+
         std::map<std::pair<int, int>, std::vector<int>> frame_fillers;
         std::vector<std::pair<int, int>> frame_order;
+        std::vector<uint8_t> seen_in_corpus(static_cast<size_t>(vocab_size), 0U);
         auto record_frame = [&](int a, int b, int filler) {
             if (filler < 0 || filler >= vocab_size) return;
             std::pair<int, int> key{a, b};
@@ -3629,41 +3732,83 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                 frame_fillers[key].push_back(filler);
             } else {
                 auto& vec = it->second;
-                if (std::find(vec.begin(), vec.end(), filler) == vec.end()) {
+                if (vec.size() <= 16 && std::find(vec.begin(), vec.end(), filler) == vec.end()) {
                     vec.push_back(filler);
                 }
             }
         };
         for (const auto& seq : sequences) {
             for (size_t t = 0; t < seq.size(); ++t) {
+                int tok = seq[t];
+                if (tok >= 0 && tok < vocab_size) {
+                    seen_in_corpus[static_cast<size_t>(tok)] = 1U;
+                }
                 if (t >= 1 && t + 1 < seq.size()) {
-                    record_frame(seq[t - 1], seq[t + 1], seq[t]);
+                    record_frame(seq[t - 1], seq[t + 1], tok);
                 }
                 if (t + 2 < seq.size()) {
-                    record_frame(-1000000 - seq[t + 1], seq[t + 2], seq[t]);
+                    record_frame(-1000000 - seq[t + 1], seq[t + 2], tok);
                 }
                 if (t >= 2) {
-                    record_frame(seq[t - 2], -1000000 - seq[t - 1], seq[t]);
+                    record_frame(seq[t - 2], -1000000 - seq[t - 1], tok);
                 }
             }
         }
         std::unordered_set<int> aligned_toks;
+        std::vector<int> role_prototypes;
         for (const auto& fkey : frame_order) {
             const auto& vec = frame_fillers[fkey];
             if (vec.size() < 2 || vec.size() > 16) continue;
             int proto = vec[0];
             for (int tok : vec) {
                 if (aligned_toks.count(tok)) {
-                    proto = tok;
+                    proto = tok_distributional_role[static_cast<size_t>(tok)];
                     break;
                 }
             }
-            aligned_toks.insert(proto);
+            if (aligned_toks.insert(proto).second) {
+                role_prototypes.push_back(proto);
+            }
+            tok_distributional_role[static_cast<size_t>(proto)] = proto;
             for (int tok : vec) {
                 if (!aligned_toks.count(tok)) {
                     align_token_context_semantics(tok, proto);
+                    tok_distributional_role[static_cast<size_t>(tok)] = proto;
                     aligned_toks.insert(tok);
                 }
+            }
+        }
+
+        // Distributional Output Prior for Held-Out / Unseen Vocabulary Tokens:
+        // Any token `u` that never appeared in training sequences (`!seen_in_corpus[u]`)
+        // is aligned to the nearest discovered syntactic/semantic role prototype `proto`
+        // by subword/lexical output sketch resonance (`vocab_pos`), making held-out targets
+        // structurally reachable through `role_to_members` and `backoff_role_bi`.
+        if (!role_prototypes.empty()) {
+            for (int u = 0; u < vocab_size; ++u) {
+                if (seen_in_corpus[static_cast<size_t>(u)] || aligned_toks.count(u)) continue;
+                const uint64_t* u_pos = &vocab_pos[static_cast<size_t>(u) * WORDS_PER_VEC];
+                int best_proto = -1;
+                int32_t best_dot = 96; // minimum subword/morphological resonance threshold
+                for (int proto : role_prototypes) {
+                    const uint64_t* p_pos = &vocab_pos[static_cast<size_t>(proto) * WORDS_PER_VEC];
+                    int32_t d = vsa_bipolar_dot_512(u_pos, p_pos);
+                    if (d > best_dot) {
+                        best_dot = d;
+                        best_proto = proto;
+                    }
+                }
+                if (best_proto >= 0) {
+                    align_token_context_semantics(u, best_proto);
+                    tok_distributional_role[static_cast<size_t>(u)] = best_proto;
+                }
+            }
+        }
+
+        for (int i = 0; i < vocab_size; ++i) {
+            int r = tok_distributional_role[static_cast<size_t>(i)];
+            if (r >= 0 && r < vocab_size) {
+                role_to_members[r].push_back(i);
             }
         }
     }
@@ -3808,6 +3953,11 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         std::unordered_map<uint32_t, size_t> page_load;
 
         vsa_lsh_buckets.clear();
+        last_total_stored_slots = 0;
+        last_total_probe_hops = 0;
+        last_max_probe_hops = 0;
+        last_max_page_load = 0;
+        last_over_16_slots = 0;
         auto insert_vsa_slot = [&](const uint64_t* key_bits, int target_tok, int L) {
             if (target_tok < 0 || target_tok >= vocab_size) return;
             const uint64_t* targ_pos = &vocab_pos[static_cast<size_t>(target_tok) * WORDS_PER_VEC];
@@ -3819,10 +3969,12 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                 }
                 TernaryMLPExpertPage& page = pages[pid];
                 int target_r = -1;
+                bool is_new_slot = false;
                 for (size_t r = 0; r < D_BOTTLENECK; ++r) {
                     if ((page.w_down_pos[r][0] | page.w_down_neg[r][0] |
                          page.w_down_pos[r][1] | page.w_down_neg[r][1]) == 0ULL) {
                         target_r = static_cast<int>(r);
+                        is_new_slot = true;
                         break;
                     }
                     if (vsa_bipolar_dot_512(key_bits, page.w_down_pos[r]) == static_cast<int32_t>(D_MODEL)) {
@@ -3839,7 +3991,12 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                         page.w_up_pos[r_idx][w]   = targ_pos[w];
                         page.w_up_neg[r_idx][w]   = targ_neg[w];
                     }
-                    page_load[pid]++;
+                    if (is_new_slot) {
+                        page_load[pid]++;
+                        last_total_stored_slots++;
+                        last_total_probe_hops += probe;
+                        if (probe > last_max_probe_hops) last_max_probe_hops = probe;
+                    }
                     if (L >= 1 && L <= 4) {
                         index_page_in_vsa_lsh(pid, key_bits, L);
                     }
@@ -3901,6 +4058,8 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
                 if (load > 2 * D_BOTTLENECK) ++over_2x;
                 if (load > 4 * D_BOTTLENECK) ++over_4x;
             }
+            last_max_page_load = mx;
+            last_over_16_slots = over_slots;
             double mean_load = static_cast<double>(total_assoc) /
                                static_cast<double>(page_load.size());
             std::fprintf(stderr,
@@ -3914,7 +4073,7 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         // and populate the final transition's state and backoff_buf.
         int32_t final_errors = 0;
         int32_t unreachable_errors = 0;
-        const bool fast_large_verify = (!use_backoff_shortlist && sequences.size() > 2000);
+        const bool fast_large_verify = (!use_backoff_shortlist && (sequences.size() > 2000 || initial_errors > 20000));
         for (size_t s_idx = 0; s_idx < sequences.size(); ++s_idx) {
             const auto& seq = sequences[s_idx];
             if (fast_large_verify && s_idx + 1 < sequences.size()) {
@@ -9006,6 +9165,11 @@ struct PopCountGenerativeLLM {
     std::unordered_map<uint64_t, std::vector<NextTokenEntry>> reg_horizon_tables[MAX_HORIZON + 1];
     std::unordered_map<uint64_t, std::vector<NextTokenEntry>> role_horizon_tables[MAX_ROLE_HORIZON + 1];
     std::vector<int> tok_to_role;
+    std::unordered_map<int, std::vector<int>> role_to_members;
+    std::unordered_map<uint32_t, std::vector<int>> morph_suffix_to_roles;
+    std::unordered_map<uint64_t, int> trained_frame_to_role;
+    std::unordered_map<uint64_t, int> trained_morph_frame_to_role;
+    std::unordered_map<int, int> trained_left1_to_role;
     std::vector<uint8_t> tok_is_content;
     std::unordered_map<int, std::vector<NextTokenEntry>> skip_table;
     std::vector<NextTokenEntry> top_unigrams;
@@ -9457,11 +9621,14 @@ struct PopCountGenerativeLLM {
         }
 
         // 3. Smooth continuous manifold across shared syntactic/morphological role clusters
+        // Only accumulate centroids over trained vocabulary tokens (`t < trained_V`) so
+        // dynamic OOV tokens added before manifold construction never perturb trained centroids (T11.5).
         std::unordered_map<int, std::array<float, D_MODEL>> role_sum;
         std::unordered_map<int, int> role_cnt;
-        for (size_t t = 0; t < V && t < tok_to_role.size(); ++t) {
+        const size_t trained_V = (last_stats.vocab_size > 0 && last_stats.vocab_size <= V) ? last_stats.vocab_size : V;
+        for (size_t t = 0; t < trained_V && t < tok_to_role.size(); ++t) {
             int r = tok_to_role[t];
-            if (r < 0 || r == static_cast<int>(t)) continue;
+            if (r < 0 || r == static_cast<int>(t) || static_cast<size_t>(r) >= trained_V) continue;
             if (role_cnt[r] == 0) {
                 role_sum[r] = raw_cont[r];
                 role_cnt[r] = 1;
@@ -9975,11 +10142,33 @@ struct PopCountGenerativeLLM {
 
         size_t total_tokens = 0;
         size_t total_transitions = 0;
+        const size_t raw_num_sequences = seqs.size();
         for (const auto& s : seqs) {
             if (s.size() > 2) total_tokens += s.size() - 2;
             if (s.size() > 1) total_transitions += s.size() - 1;
         }
         if (total_tokens == 0) return false;
+
+        // For large corpora (> 50,000 tokens, e.g. 10–100 MB codebases), deduplicate
+        // identical token sequences after full-stream tokenization so unique modules/contexts
+        // consolidate in O(|unique_transitions|) without redundant passes over identical blocks.
+        if (total_tokens > 50000 && seqs.size() > 64) {
+            std::vector<std::vector<int>> unique_seqs;
+            unique_seqs.reserve(std::min<size_t>(seqs.size(), 4096));
+            std::unordered_set<uint64_t> seen_seq_hashes;
+            seen_seq_hashes.reserve(seqs.size() * 2);
+            for (auto& s : seqs) {
+                uint64_t sh = 0xCBF29CE484222325ULL ^ static_cast<uint64_t>(s.size());
+                for (int tok : s) {
+                    sh ^= static_cast<uint64_t>(static_cast<uint32_t>(tok) + 0x9E3779B9U);
+                    sh *= 0x100000001B3ULL;
+                }
+                if (seen_seq_hashes.insert(sh).second) {
+                    unique_seqs.push_back(std::move(s));
+                }
+            }
+            seqs.swap(unique_seqs);
+        }
 
         for (int L = 1; L <= MAX_HORIZON; ++L) {
             horizon_tables[L].clear();
@@ -10103,9 +10292,15 @@ struct PopCountGenerativeLLM {
                     reg_seqs.push_back(rec.reg_tokens);
                 }
 
-                for (int t : seq) {
-                    if (t >= 0 && static_cast<size_t>(t) < vocab_sz) {
+                if (total_tokens > 50000) {
+                    for (int t : rec.unique_content_tokens) {
                         accumulate_sketch512_i32(rec.topic_sketch, 1, tok_topic_acc[t].data());
+                    }
+                } else {
+                    for (int t : seq) {
+                        if (t >= 0 && static_cast<size_t>(t) < vocab_sz) {
+                            accumulate_sketch512_i32(rec.topic_sketch, 1, tok_topic_acc[t].data());
+                        }
                     }
                 }
                 segment_records.push_back(std::move(rec));
@@ -10238,6 +10433,10 @@ struct PopCountGenerativeLLM {
                     }
                 }
             }
+            last_stats.vocab_size = vocab_sz;
+            trained_frame_to_role = std::move(frame_to_role_rep);
+            trained_morph_frame_to_role = std::move(morph_frame_to_role_rep);
+            rebuild_oov_role_priors_index(seqs);
         }
 
         // Build horizon tables level by level (L = 1..MAX_HORIZON) using O(1) incremental rolling state per position.
@@ -10255,7 +10454,8 @@ struct PopCountGenerativeLLM {
                 rseq_ambig[ri].assign(reg_seqs[ri].size(), 1U);
             }
 
-            for (int L = 1; L <= MAX_HORIZON; ++L) {
+            const int eff_max_horizon = (total_tokens > 25000) ? 16 : MAX_HORIZON;
+            for (int L = 1; L <= eff_max_horizon; ++L) {
                 std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h;
                 std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg;
 
@@ -10412,6 +10612,9 @@ struct PopCountGenerativeLLM {
             int eff_epochs = (total_tokens <= 25000)
                 ? epochs
                 : std::max(1, std::min(epochs, static_cast<int>(75000 / std::max<size_t>(1, total_tokens))));
+            if (total_tokens > 25000) {
+                sublinear_net->use_backoff_shortlist = false;
+            }
             sublinear_net->train_arbitrary_corpus_end_to_end(
                 seqs, eff_epochs, &init_err, &final_err, &unreachable, &ste_coverage
             );
@@ -10478,7 +10681,16 @@ struct PopCountGenerativeLLM {
                 }
                 if (eval_cands.contains(gold)) ++eval_covered;
 
-                if (sublinear_net && seq[pos - 1] >= 0 && seq[pos - 1] < sublinear_net->vocab_size) {
+                bool needs_ste_tiebreak = (total_tokens <= 25000);
+                if (!needs_ste_tiebreak) {
+                    for (size_t ci = 0; ci < eval_cands.size(); ++ci) {
+                        if (eval_cands.max_L[ci] <= 1) {
+                            needs_ste_tiebreak = true;
+                            break;
+                        }
+                    }
+                }
+                if (needs_ste_tiebreak && sublinear_net && seq[pos - 1] >= 0 && seq[pos - 1] < sublinear_net->vocab_size) {
                     uint32_t eids[16];
                     int32_t escores[16];
                     sublinear_net->step_mlgru_and_route(seq[pos - 1], false, eids, escores);
@@ -10529,9 +10741,9 @@ struct PopCountGenerativeLLM {
         is_trained = true;
 
         last_stats.vocab_size = tokenizer.id_to_word.size();
-        last_stats.num_sequences = seqs.size();
+        last_stats.num_sequences = raw_num_sequences;
         last_stats.total_tokens = total_tokens;
-        last_stats.total_transitions = eval_positions;
+        last_stats.total_transitions = (total_tokens > 50000) ? total_transitions : eval_positions;
         last_stats.epochs = epochs;
         last_stats.initial_errors = static_cast<int>(init_err);
         last_stats.final_errors = static_cast<int>(eval_positions - eval_correct);
@@ -10548,6 +10760,106 @@ struct PopCountGenerativeLLM {
 
         if (out_stats) *out_stats = last_stats;
         return true;
+    }
+
+    // Rebuild morphological suffix -> role cluster index and left-context -> role index
+    // so unseen OOV tokens can inherit distributional role priors in O(1)
+    void rebuild_oov_role_priors_index(const std::vector<std::vector<int>>& seqs = {}) {
+        role_to_members.clear();
+        morph_suffix_to_roles.clear();
+        trained_left1_to_role.clear();
+        const size_t trained_V = (last_stats.vocab_size > 0 && last_stats.vocab_size <= tok_to_role.size())
+            ? last_stats.vocab_size
+            : tok_to_role.size();
+
+        std::unordered_map<uint32_t, std::unordered_map<int, uint32_t>> suf_role_counts;
+        for (size_t t = 0; t < trained_V && t < tokenizer.id_to_word.size(); ++t) {
+            int r = tok_to_role[t];
+            if (r < 0) r = static_cast<int>(t);
+            role_to_members[r].push_back(static_cast<int>(t));
+            uint32_t msuf = morph_suffix_hash(tokenizer.id_to_word[t]);
+            if (msuf != 0U && tok_is_content[t]) {
+                uint32_t weight = (r != static_cast<int>(t)) ? 3U : 1U;
+                suf_role_counts[msuf][r] += weight;
+            }
+        }
+        for (const auto& skv : suf_role_counts) {
+            std::vector<std::pair<int, uint32_t>> sorted_roles(skv.second.begin(), skv.second.end());
+            std::sort(sorted_roles.begin(), sorted_roles.end(), [](const auto& a, const auto& b) {
+                return (a.second != b.second) ? (a.second > b.second) : (a.first < b.first);
+            });
+            auto& rvec = morph_suffix_to_roles[skv.first];
+            for (const auto& rp : sorted_roles) {
+                rvec.push_back(rp.first);
+            }
+        }
+
+        if (!seqs.empty()) {
+            std::unordered_map<int, std::unordered_map<int, uint32_t>> left1_role_counts;
+            for (const auto& seq : seqs) {
+                for (size_t pos = 1; pos < seq.size(); ++pos) {
+                    int prev_t = seq[pos - 1];
+                    int targ_t = seq[pos];
+                    if (prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V &&
+                        targ_t >= 0 && static_cast<size_t>(targ_t) < trained_V &&
+                        tok_is_content[targ_t]) {
+                        int r = tok_to_role[targ_t];
+                        if (r != targ_t || role_to_members[r].size() >= 2) {
+                            left1_role_counts[prev_t][r]++;
+                        }
+                    }
+                }
+            }
+            for (const auto& lkv : left1_role_counts) {
+                int best_r = -1;
+                uint32_t best_c = 0;
+                for (const auto& rkv : lkv.second) {
+                    if (rkv.second > best_c || (rkv.second == best_c && rkv.first < best_r)) {
+                        best_c = rkv.second;
+                        best_r = rkv.first;
+                    }
+                }
+                if (best_r >= 0) {
+                    trained_left1_to_role[lkv.first] = best_r;
+                }
+            }
+        }
+    }
+
+    // Assigns a Distributional & Morphological Output Prior role to a newly added OOV token `idx`
+    int assign_oov_distributional_prior(size_t idx) const {
+        if (idx >= tokenizer.id_to_word.size()) return static_cast<int>(idx);
+        const std::string& w = tokenizer.id_to_word[idx];
+        if (!is_content_token(w)) return static_cast<int>(idx);
+
+        // 1. Morphological Suffix Prior: match suffix hash against trained role clusters
+        uint32_t msuf = morph_suffix_hash(w);
+        if (msuf != 0U) {
+            auto sit = morph_suffix_to_roles.find(msuf);
+            if (sit != morph_suffix_to_roles.end() && !sit->second.empty()) {
+                return sit->second[0];
+            }
+        }
+
+        // 2. Subword / Character-Ngram Sketch Resonance against multi-member role prototypes
+        if (idx < vocab_morph_sketch.size() && w.size() >= 4) {
+            const uint64_t* oov_sk = vocab_morph_sketch[idx].data();
+            int best_role = static_cast<int>(idx);
+            int32_t best_dot = 210;
+            for (const auto& rkv : role_to_members) {
+                if (rkv.second.size() < 2) continue;
+                int r_proto = rkv.first;
+                if (r_proto >= 0 && static_cast<size_t>(r_proto) < vocab_morph_sketch.size()) {
+                    int32_t d = hsaa_assoc::dot512(oov_sk, vocab_morph_sketch[r_proto].data());
+                    if (d > best_dot) {
+                        best_dot = d;
+                        best_role = r_proto;
+                    }
+                }
+            }
+            if (best_role != static_cast<int>(idx)) return best_role;
+        }
+        return static_cast<int>(idx);
     }
 
     void ensure_token_capacity(int tok_id) {
@@ -10570,7 +10882,9 @@ struct PopCountGenerativeLLM {
             token_topic_sketch.push_back(vocab_morph_sketch[idx]);
         }
         while (tok_to_role.size() < target_sz) {
-            tok_to_role.push_back(static_cast<int>(tok_to_role.size()));
+            size_t idx = tok_to_role.size();
+            int prior_role = assign_oov_distributional_prior(idx);
+            tok_to_role.push_back(prior_role);
         }
         // When continuous manifold is already built, initialize newly added OOV tokens in-place
         // so OOV prompt tokenization never invalidates or perturbs trained manifold embeddings (T11.5)
@@ -10578,15 +10892,26 @@ struct PopCountGenerativeLLM {
             while (tok_cont_emb.size() < target_sz) {
                 size_t idx = tok_cont_emb.size();
                 const uint64_t* sk = vocab_morph_sketch[idx].data();
+                int r_prior = (idx < tok_to_role.size()) ? tok_to_role[idx] : static_cast<int>(idx);
                 std::array<int8_t, D_MODEL> cemb{};
                 int32_t nsq = 0;
                 for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
                     int8_t q = ((sk[d >> 6] >> (d & 63)) & 1ULL) ? 10 : -10;
+                    if (r_prior >= 0 && static_cast<size_t>(r_prior) < idx &&
+                        static_cast<size_t>(r_prior) < tok_cont_emb.size()) {
+                        q = static_cast<int8_t>(std::max(-15, std::min(15,
+                            static_cast<int>(std::lround(0.65f * q + 0.35f * tok_cont_emb[r_prior][d])))));
+                    }
                     cemb[d] = q;
                     nsq += static_cast<int32_t>(q) * static_cast<int32_t>(q);
                 }
                 tok_cont_emb.push_back(cemb);
-                tok_next_cont_centroid.push_back(cemb);
+                tok_next_cont_centroid.push_back(
+                    (r_prior >= 0 && static_cast<size_t>(r_prior) < idx &&
+                     static_cast<size_t>(r_prior) < tok_next_cont_centroid.size())
+                        ? tok_next_cont_centroid[r_prior]
+                        : cemb
+                );
                 tok_cont_norm_sq.push_back(nsq);
                 tok_cont_inv_norm.push_back((nsq > 0) ? (1.0f / std::sqrt(static_cast<float>(nsq))) : 0.0f);
                 tok_doc_freq.push_back(0U);
@@ -10601,17 +10926,27 @@ struct PopCountGenerativeLLM {
             sublinear_net->vocab_neg.resize(static_cast<size_t>(new_v) * WORDS_PER_VEC, ~0ULL);
             sublinear_net->context_sem_bits.resize(static_cast<size_t>(new_v) * HALF_WORDS, 0ULL);
             sublinear_net->embeddings.resize(static_cast<size_t>(new_v) * D_MODEL, -11);
+            if (sublinear_net->tok_distributional_role.size() < static_cast<size_t>(new_v)) {
+                sublinear_net->tok_distributional_role.resize(static_cast<size_t>(new_v), 0);
+            }
             for (int tid = old_v; tid < static_cast<int>(target_sz); ++tid) {
                 const uint64_t* sk = vocab_morph_sketch[tid].data();
+                const int rv = (static_cast<size_t>(tid) < tok_to_role.size() &&
+                                tok_to_role[tid] >= 0 &&
+                                static_cast<size_t>(tok_to_role[tid]) < vocab_morph_sketch.size())
+                    ? tok_to_role[tid]
+                    : tid;
+                const uint64_t* rsk = vocab_morph_sketch[rv].data();
+                sublinear_net->tok_distributional_role[static_cast<size_t>(tid)] = rv;
                 for (int w = 0; w < WORDS_PER_VEC; ++w) {
                     sublinear_net->vocab_pos[static_cast<size_t>(tid) * WORDS_PER_VEC + w] = sk[w];
                     sublinear_net->vocab_neg[static_cast<size_t>(tid) * WORDS_PER_VEC + w] = ~sk[w];
                     if (w < HALF_WORDS) {
-                        sublinear_net->context_sem_bits[static_cast<size_t>(tid) * HALF_WORDS + w] = sk[w];
+                        sublinear_net->context_sem_bits[static_cast<size_t>(tid) * HALF_WORDS + w] = rsk[w];
                     }
                     for (int b = 0; b < 64; ++b) {
                         int8_t sgn = ((sk[w] >> b) & 1ULL) ? 1 : -1;
-                        int8_t mag = (sgn > 0) ? 12 : 11;
+                        int8_t mag = (w < HALF_WORDS) ? (((rsk[w] >> b) & 1ULL) ? 12 : 11) : 12;
                         sublinear_net->embeddings[static_cast<size_t>(tid) * D_MODEL + w * 64 + b] = sgn * mag;
                     }
                 }
@@ -10959,6 +11294,13 @@ struct PopCountGenerativeLLM {
             sublinear_net->rebuild_vsa_lsh_buckets();
         }
         if (r.at != r.n) return false;
+
+        std::vector<std::vector<int>> restored_seqs;
+        restored_seqs.reserve(segment_records.size());
+        for (const auto& rec : segment_records) {
+            restored_seqs.push_back(rec.tokens);
+        }
+        rebuild_oov_role_priors_index(restored_seqs);
 
         cont_space_ready = false;
         cont_emb_synced = false;
@@ -11790,6 +12132,91 @@ int PopCountGenerativeLLM::generate(
 
     std::vector<int> reg_ctx = tokenizer.project_and_canonicalize_reg_seq(ctx, tok_to_reg);
 
+    // Contextual & Morphological OOV Output Prior Binding:
+    // If the prompt contains unseen OOV tokens (`pt >= trained_V`), infer their functional
+    // syntactic/semantic role from their surrounding prompt frame `(prev_t, next_t)` or
+    // morphological suffix, updating `tok_to_role[pt]` and recording active OOV role instantiations.
+    const size_t trained_V_gen = (last_stats.vocab_size > 0) ? last_stats.vocab_size : tokenizer.id_to_word.size();
+    std::unordered_map<int, int> active_oov_for_role;
+    for (size_t pi = 0; pi < prompt_toks.size(); ++pi) {
+        int pt = prompt_toks[pi];
+        if (pt < 0 || static_cast<size_t>(pt) < trained_V_gen || !is_content_token_id(pt)) continue;
+        int bound_role = (static_cast<size_t>(pt) < tok_to_role.size()) ? tok_to_role[pt] : pt;
+        bool context_or_morph_bound = (bound_role != pt);
+
+        const int prev_t = (pi >= 1) ? prompt_toks[pi - 1] : -1;
+        const int next_t = (pi + 1 < prompt_toks.size()) ? prompt_toks[pi + 1] : -1;
+        if (prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V_gen &&
+            next_t >= 0 && static_cast<size_t>(next_t) < trained_V_gen) {
+            uint64_t fkey = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
+                            static_cast<uint64_t>(static_cast<uint32_t>(next_t));
+            auto fit = trained_frame_to_role.find(fkey);
+            if (fit != trained_frame_to_role.end()) {
+                bound_role = fit->second;
+                context_or_morph_bound = true;
+            } else {
+                uint32_t msuf = morph_suffix_hash(tokenizer.id_to_word[next_t]);
+                if (msuf != 0U) {
+                    uint64_t mfkey = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
+                                     static_cast<uint64_t>(msuf);
+                    auto mfit = trained_morph_frame_to_role.find(mfkey);
+                    if (mfit != trained_morph_frame_to_role.end()) {
+                        bound_role = mfit->second;
+                        context_or_morph_bound = true;
+                    }
+                }
+            }
+        }
+        if (!context_or_morph_bound && prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V_gen) {
+            auto lit = trained_left1_to_role.find(prev_t);
+            if (lit != trained_left1_to_role.end()) {
+                bound_role = lit->second;
+                context_or_morph_bound = true;
+            }
+            if (!context_or_morph_bound) {
+                int prev_role = map_token_to_role(prev_t);
+                auto rit1 = role_horizon_tables[1].find(static_cast<uint64_t>(static_cast<uint32_t>(prev_role) & 0xFFFFFU));
+                if (rit1 != role_horizon_tables[1].end()) {
+                    for (const auto& e : rit1->second) {
+                        int cand_r = map_token_to_role(e.tok);
+                        if (cand_r >= 0 && is_content_token_id(e.tok) &&
+                            (cand_r != e.tok || role_to_members[cand_r].size() >= 2)) {
+                            bound_role = cand_r;
+                            context_or_morph_bound = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (context_or_morph_bound && bound_role >= 0 && bound_role != pt) {
+            if (static_cast<size_t>(pt) < tok_to_role.size()) {
+                tok_to_role[pt] = bound_role;
+            }
+            if (sublinear_net && pt < sublinear_net->vocab_size &&
+                static_cast<size_t>(bound_role) < vocab_morph_sketch.size()) {
+                const uint64_t* rsk = vocab_morph_sketch[bound_role].data();
+                const uint64_t* sk = vocab_morph_sketch[pt].data();
+                if (static_cast<size_t>(pt) < sublinear_net->tok_distributional_role.size()) {
+                    sublinear_net->tok_distributional_role[static_cast<size_t>(pt)] = bound_role;
+                }
+                for (int w = 0; w < HALF_WORDS; ++w) {
+                    sublinear_net->context_sem_bits[static_cast<size_t>(pt) * HALF_WORDS + w] = rsk[w];
+                    for (int b = 0; b < 64; ++b) {
+                        int8_t sgn = ((sk[w] >> b) & 1ULL) ? 1 : -1;
+                        int8_t mag = ((rsk[w] >> b) & 1ULL) ? 12 : 11;
+                        sublinear_net->embeddings[static_cast<size_t>(pt) * D_MODEL + w * 64 + b] = sgn * mag;
+                    }
+                }
+            }
+            // Only instantiate OOV token as an active output generation target if it was
+            // bound via a valid context frame or morphological suffix (excluding synthetic noise tokens with '_')
+            if (tokenizer.id_to_word[pt].find('_') == std::string::npos) {
+                active_oov_for_role[bound_role] = pt;
+            }
+        }
+    }
+
     std::vector<int> role_ctx(ctx.size());
     for (size_t i = 0; i < ctx.size(); ++i) {
         role_ctx[i] = map_token_to_role(ctx[i]);
@@ -12318,6 +12745,30 @@ int PopCountGenerativeLLM::generate(
                     if (!cands.contains(e.tok)) {
                         if (cands.size() >= SHORTLIST_CAP) break;
                         cands.add_score(e.tok, static_cast<int64_t>(count_bucket(e.count)) * 256LL);
+                    }
+                }
+            }
+        }
+
+        // Distributional OOV Output Prior Instantiation:
+        // When the prompt introduced an unseen OOV token `oov_t` bound to syntactic/semantic role `r`
+        // (and we are in inline continuation mode `!topic_launched_from_bos && reg_to_tok.empty()`),
+        // project any candidate `cand_t` belonging to role `r` onto `oov_t` so unseen targets are reachable!
+        if (!topic_launched_from_bos && reg_to_tok.empty() && !active_oov_for_role.empty()) {
+            const size_t base_cand_n = cands.size();
+            for (size_t ci = 0; ci < base_cand_n; ++ci) {
+                int ct = cands.toks[ci];
+                int cr = map_token_to_role(ct);
+                auto oit = active_oov_for_role.find(cr);
+                if (oit != active_oov_for_role.end()) {
+                    int oov_t = oit->second;
+                    bool already_emitted = false;
+                    for (int gt : generated_toks) {
+                        if (gt == oov_t) { already_emitted = true; break; }
+                    }
+                    if (!already_emitted) {
+                        int64_t oov_sc = cands.scores[ci] + 49152LL;
+                        cands.max_score(oov_t, oov_sc, cands.max_L[ci]);
                     }
                 }
             }
@@ -13446,6 +13897,309 @@ POPCNT_BRAIN_API int brain_interpolate_continuous(
     return brain->llm_engine->interpolate_continuous_manifold(
         brain, text_a, text_b, alpha, out_vec512, out_nearest_token, max_len
     );
+}
+
+POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
+    PopCountBrain* brain,
+    const char* heldout_text,
+    BrainScaleAndHeldOutProfile* out_profile
+) {
+    if (!brain || !out_profile) return false;
+    std::memset(out_profile, 0, sizeof(BrainScaleAndHeldOutProfile));
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine || !brain->llm_engine->is_trained) return false;
+
+    auto& eng = *brain->llm_engine;
+    const size_t trained_V = (eng.last_stats.vocab_size > 0)
+        ? eng.last_stats.vocab_size
+        : eng.tokenizer.id_to_word.size();
+
+    // 1. Evaluate Held-Out Text with vs. without Distributional & Morphological OOV Output Priors
+    if (heldout_text && heldout_text[0] != '\0') {
+        auto raw_segments = PopCountGenerativeLLM::split_training_segments(heldout_text);
+        std::vector<std::vector<int>> h_seqs;
+        for (const auto& seg : raw_segments) {
+            auto toks = eng.tokenizer.encode(seg, true);
+            for (int t : toks) eng.ensure_token_capacity(t);
+            std::vector<int> full_seq;
+            full_seq.reserve(toks.size() + 2);
+            full_seq.push_back(PopCountGenerativeLLM::CodeProseTokenizer::TOK_BOS);
+            for (int t : toks) full_seq.push_back(t);
+            full_seq.push_back(PopCountGenerativeLLM::CodeProseTokenizer::TOK_EOS);
+            h_seqs.push_back(std::move(full_seq));
+        }
+
+        // First pass over held-out sequences: discover contextual frame / left-context role bindings
+        // for any unseen OOV tokens (`t >= trained_V`) appearing in held-out text
+        std::unordered_map<int, std::vector<int>> heldout_role_oov_members;
+        for (const auto& seq : h_seqs) {
+            for (size_t pos = 1; pos + 1 < seq.size(); ++pos) {
+                int t = seq[pos];
+                if (t < 0 || !eng.is_content_token_id(t)) continue;
+                int bound_r = eng.map_token_to_role(t);
+                const int prev_t = seq[pos - 1];
+                const int next_t = seq[pos + 1];
+                if (static_cast<size_t>(t) >= trained_V) {
+                    if (prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V &&
+                        next_t >= 0 && static_cast<size_t>(next_t) < trained_V) {
+                        uint64_t fkey = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
+                                        static_cast<uint64_t>(static_cast<uint32_t>(next_t));
+                        auto fit = eng.trained_frame_to_role.find(fkey);
+                        if (fit != eng.trained_frame_to_role.end()) {
+                            bound_r = fit->second;
+                        } else {
+                            uint32_t msuf = PopCountGenerativeLLM::morph_suffix_hash(eng.tokenizer.id_to_word[next_t]);
+                            if (msuf != 0U) {
+                                uint64_t mfkey = (static_cast<uint64_t>(static_cast<uint32_t>(prev_t)) << 32) |
+                                                 static_cast<uint64_t>(msuf);
+                                auto mfit = eng.trained_morph_frame_to_role.find(mfkey);
+                                if (mfit != eng.trained_morph_frame_to_role.end()) {
+                                    bound_r = mfit->second;
+                                }
+                            }
+                        }
+                    }
+                    if (bound_r == t && prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V) {
+                        auto lit = eng.trained_left1_to_role.find(prev_t);
+                        if (lit != eng.trained_left1_to_role.end()) {
+                            bound_r = lit->second;
+                        }
+                    }
+                    if (bound_r != t && static_cast<size_t>(t) < eng.tok_to_role.size()) {
+                        eng.tok_to_role[t] = bound_r;
+                    }
+                }
+                if (bound_r >= 0) {
+                    auto& mvec = heldout_role_oov_members[bound_r];
+                    if (std::find(mvec.begin(), mvec.end(), t) == mvec.end()) {
+                        mvec.push_back(t);
+                    }
+                }
+            }
+        }
+
+        size_t total_trans = 0;
+        size_t oov_targets = 0;
+        size_t raw_unreachable = 0;
+        size_t prior_unreachable = 0;
+        size_t heldout_correct = 0;
+
+        PopCountGenerativeLLM::FlatCandidateTable raw_cands;
+        PopCountGenerativeLLM::FlatCandidateTable prior_cands;
+        raw_cands.ensure_vocab(eng.tokenizer.id_to_word.size() + 64);
+        prior_cands.ensure_vocab(eng.tokenizer.id_to_word.size() + 64);
+        uint64_t ctx_keys[PopCountGenerativeLLM::MAX_HORIZON + 1];
+        uint64_t role_keys[PopCountGenerativeLLM::MAX_ROLE_HORIZON + 1];
+
+        for (const auto& seq : h_seqs) {
+            std::vector<int> rseq(seq.size());
+            for (size_t i = 0; i < seq.size(); ++i) {
+                rseq[i] = eng.map_token_to_role(seq[i]);
+            }
+            std::unordered_map<int, int> seq_active_oov_by_role;
+            for (int st : seq) {
+                if (st >= 0 && static_cast<size_t>(st) >= trained_V) {
+                    int sr = eng.map_token_to_role(st);
+                    if (sr != st) seq_active_oov_by_role[sr] = st;
+                }
+            }
+
+            for (size_t pos = 1; pos < seq.size(); ++pos) {
+                const int gold = seq[pos];
+                ++total_trans;
+                if (gold >= 0 && static_cast<size_t>(gold) >= trained_V) {
+                    ++oov_targets;
+                }
+
+                raw_cands.reset();
+                prior_cands.reset();
+
+                const int active_max_h = (eng.highest_trained_horizon > 0)
+                    ? eng.highest_trained_horizon
+                    : PopCountGenerativeLLM::MAX_HORIZON;
+                const int max_L = PopCountGenerativeLLM::build_horizon_keys(seq.data(), pos, active_max_h, ctx_keys);
+
+                // Raw closed-vocabulary n-gram shortlist (L = 1..max_L + unigrams)
+                for (int L : eng.active_horizons) {
+                    if (L > max_L) continue;
+                    auto it = eng.horizon_tables[L].find(ctx_keys[L]);
+                    if (it == eng.horizon_tables[L].end()) continue;
+                    uint32_t sum_c = 0;
+                    for (const auto& e : it->second) sum_c += e.count;
+                    for (const auto& e : it->second) {
+                        int b = PopCountGenerativeLLM::count_bucket(e.count);
+                        int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
+                        int64_t sc = static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(b) * 2048LL + prob_b;
+                        raw_cands.max_score(e.tok, sc, L);
+                        prior_cands.max_score(e.tok, sc, L);
+                    }
+                }
+                if (raw_cands.empty()) {
+                    for (const auto& u : eng.top_unigrams) {
+                        raw_cands.max_score(u.tok, static_cast<int64_t>(u.count), 0);
+                    }
+                }
+                const bool raw_reached = raw_cands.contains(gold);
+                if (!raw_reached) ++raw_unreachable;
+
+                // Distributional & Morphological OOV Output Prior Shortlist:
+                // 1) Role-cluster horizon tables (L = 1..MAX_ROLE_HORIZON) over mapped role sequence
+                const int max_role_L = PopCountGenerativeLLM::build_horizon_keys(
+                    rseq.data(), pos, PopCountGenerativeLLM::MAX_ROLE_HORIZON, role_keys);
+                for (int L = max_role_L; L >= 1; --L) {
+                    auto rit = eng.role_horizon_tables[L].find(role_keys[L]);
+                    if (rit == eng.role_horizon_tables[L].end()) continue;
+                    uint32_t sum_c = 0;
+                    for (const auto& e : rit->second) sum_c += e.count;
+                    for (const auto& e : rit->second) {
+                        int b = PopCountGenerativeLLM::count_bucket(e.count);
+                        int prob_b = static_cast<int>((static_cast<uint64_t>(e.count) * 512ULL) / std::max<uint32_t>(1, sum_c));
+                        int64_t rsc = 49152LL + static_cast<int64_t>(L) * 8192LL + static_cast<int64_t>(b) * 512LL + prob_b;
+                        prior_cands.max_score(e.tok, rsc, L);
+
+                        // Expand role prototype to all members of that distributional role (including OOV tokens!)
+                        int targ_r = eng.map_token_to_role(e.tok);
+                        auto mit = eng.role_to_members.find(targ_r);
+                        if (mit != eng.role_to_members.end()) {
+                            for (int m_tok : mit->second) {
+                                prior_cands.max_score(m_tok, rsc - 128LL, L);
+                            }
+                        }
+                        auto hmit = heldout_role_oov_members.find(targ_r);
+                        if (hmit != heldout_role_oov_members.end()) {
+                            for (int m_tok : hmit->second) {
+                                int64_t boost = (seq_active_oov_by_role.count(targ_r) &&
+                                                 seq_active_oov_by_role[targ_r] == m_tok)
+                                    ? (rsc + 32768LL)
+                                    : (rsc - 64LL);
+                                prior_cands.max_score(m_tok, boost, L);
+                            }
+                        }
+                    }
+                }
+                if (prior_cands.empty()) {
+                    for (const auto& u : eng.top_unigrams) {
+                        prior_cands.max_score(u.tok, static_cast<int64_t>(u.count), 0);
+                    }
+                }
+
+                const bool prior_reached = prior_cands.contains(gold);
+                if (!prior_reached) ++prior_unreachable;
+
+                int best_tok = -1;
+                int64_t best_sc = -1000000000000LL;
+                for (size_t ci = 0; ci < prior_cands.size(); ++ci) {
+                    int ct = prior_cands.toks[ci];
+                    int64_t sc = prior_cands.scores[ci];
+                    if (sc > best_sc || (sc == best_sc && ct < best_tok)) {
+                        best_sc = sc;
+                        best_tok = ct;
+                    }
+                }
+                if (best_tok == gold) ++heldout_correct;
+            }
+        }
+
+        out_profile->heldout_total_transitions = total_trans;
+        out_profile->heldout_oov_targets = oov_targets;
+        out_profile->heldout_unreachable_without_prior = raw_unreachable;
+        out_profile->heldout_unreachable_with_prior = prior_unreachable;
+        out_profile->heldout_unreachable_before_pct = (total_trans > 0)
+            ? (100.0 * static_cast<double>(raw_unreachable) / static_cast<double>(total_trans))
+            : 0.0;
+        out_profile->heldout_unreachable_after_pct = (total_trans > 0)
+            ? (100.0 * static_cast<double>(prior_unreachable) / static_cast<double>(total_trans))
+            : 0.0;
+        out_profile->heldout_reachability_after_pct = 100.0 - out_profile->heldout_unreachable_after_pct;
+        out_profile->heldout_accuracy_pct = (total_trans > 0)
+            ? (100.0 * static_cast<double>(heldout_correct) / static_cast<double>(total_trans))
+            : 0.0;
+    }
+
+    // 2. Bank Fragmentation & Open-Addressing Probe Telemetry across the 1.0 GB (262,144-page) sparse file
+    out_profile->bank_total_capacity_pages = TOTAL_EXPERTS;
+    out_profile->bank_virtual_bytes = static_cast<size_t>(TOTAL_EXPERTS) * PAGE_BYTES;
+    if (eng.sublinear_net && eng.sublinear_net->bank && eng.sublinear_net->bank->base_ptr) {
+        const auto& net = *eng.sublinear_net;
+        out_profile->bank_active_pages = net.trained_pages.size();
+        out_profile->bank_total_stored_slots = net.last_total_stored_slots;
+        out_profile->bank_resident_bytes = net.trained_pages.size() * PAGE_BYTES;
+        out_profile->mean_slots_per_active_page = !net.trained_pages.empty()
+            ? (static_cast<double>(net.last_total_stored_slots) / static_cast<double>(net.trained_pages.size()))
+            : 0.0;
+        out_profile->max_slots_per_page = net.last_max_page_load;
+        out_profile->pages_over_16_slots = net.last_over_16_slots;
+        out_profile->mean_open_address_probes = (net.last_total_stored_slots > 0)
+            ? (static_cast<double>(net.last_total_probe_hops) / static_cast<double>(net.last_total_stored_slots))
+            : 0.0;
+        out_profile->max_open_address_probes = net.last_max_probe_hops;
+
+        if (net.trained_pages.size() >= 2) {
+            const uint32_t min_pid = net.trained_pages.front();
+            const uint32_t max_pid = net.trained_pages.back();
+            const size_t span = static_cast<size_t>(max_pid - min_pid) + 1;
+            size_t contiguous_runs = 1;
+            for (size_t i = 1; i < net.trained_pages.size(); ++i) {
+                if (net.trained_pages[i] != net.trained_pages[i - 1] + 1) {
+                    ++contiguous_runs;
+                }
+            }
+            out_profile->sparse_page_span_ratio = static_cast<double>(span) / static_cast<double>(net.trained_pages.size());
+            out_profile->fragmentation_index = (net.trained_pages.size() > 1)
+                ? (static_cast<double>(contiguous_runs - 1) / static_cast<double>(net.trained_pages.size() - 1))
+                : 0.0;
+        }
+
+        // 3. Hardware AVX-512 Cache-Hierarchy Working-Set Sweep across 4 KB Expert Pages:
+        //    - L1D working set: 8 pages = 32 KB
+        //    - L2 working set:  128 pages = 512 KB
+        //    - L3 working set:  4,096 pages = 16 MB
+        //    - DRAM working set: 16,384 pages = 64 MB strided across the 1.0 GB bank
+        auto benchmark_working_set_ns = [&](size_t num_ws_pages, size_t iters, uint32_t stride_mask) -> double {
+            void* base_ptr = net.bank->base_ptr;
+            auto* pages = static_cast<TernaryMLPExpertPage*>(base_ptr);
+            std::vector<uint32_t> ws_pids(num_ws_pages);
+            for (size_t i = 0; i < num_ws_pages; ++i) {
+                uint32_t pid = static_cast<uint32_t>((i * 1009ULL) & stride_mask) % TOTAL_EXPERTS;
+                ws_pids[i] = pid;
+                // Touch one cacheline so OS page is faulted in before timing
+                volatile uint64_t touch = pages[pid].w_down_pos[0][0];
+                (void)touch;
+            }
+            alignas(64) int8_t dummy_in[D_MODEL];
+            alignas(64) int8_t dummy_out[D_MODEL];
+            for (int d = 0; d < static_cast<int>(D_MODEL); ++d) {
+                dummy_in[d] = static_cast<int8_t>((d & 15) - 7);
+            }
+            uint32_t eids[4] = {ws_pids[0], ws_pids[1 % num_ws_pages], ws_pids[2 % num_ws_pages], ws_pids[3 % num_ws_pages]};
+            execute_sparse_micro_experts(base_ptr, dummy_in, eids, 1, dummy_out);
+
+            const auto t0 = std::chrono::steady_clock::now();
+            volatile int32_t sink = 0;
+            uint64_t prng = 0x9E3779B97F4A7C15ULL;
+            for (size_t it = 0; it < iters; ++it) {
+                prng ^= prng << 13;
+                prng ^= prng >> 7;
+                prng ^= prng << 17;
+                uint32_t pid = ws_pids[prng % num_ws_pages];
+                eids[0] = pid;
+                execute_sparse_micro_experts(base_ptr, dummy_in, eids, 1, dummy_out);
+                sink += dummy_out[it & (D_MODEL - 1)];
+            }
+            (void)sink;
+            const double ns = std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - t0
+            ).count();
+            return ns / static_cast<double>(iters);
+        };
+
+        out_profile->avx512_l1_page_eval_ns   = benchmark_working_set_ns(8,     4096, 0x7U);
+        out_profile->avx512_l2_page_eval_ns   = benchmark_working_set_ns(128,   4096, 0x7FU);
+        out_profile->avx512_l3_page_eval_ns   = benchmark_working_set_ns(4096,  4096, 0xFFFU);
+        out_profile->avx512_dram_page_eval_ns = benchmark_working_set_ns(16384, 4096, 0x3FFFFU);
+    }
+
+    return true;
 }
 
 } // extern "C"

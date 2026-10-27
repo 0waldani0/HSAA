@@ -815,6 +815,175 @@ int main() {
 
     brain_destroy(brain_deep);
 
+    // -------------------------------------------------------------------------
+    // TEST 14: Distributional OOV Output Priors (Breaking the 20.6–28.1% Held-Out
+    //          Target Barrier) & Large-Scale (10+ MB Corpus / 1.0 GB Bank) Profiling
+    // -------------------------------------------------------------------------
+    PopCountBrain* brain_oov_scale = brain_create(4096, "build/test_llm_oov_and_scale.bin");
+    const char* oov_train_corpus =
+        "Модуль квантового ядра инициализирует когерентный процессор и возвращает когерентный процессор.\n"
+        "Модуль квантового ядра инициализирует тензорный сопроцессор и возвращает тензорный сопроцессор.\n"
+        "Модуль квантового ядра инициализирует векторный ускоритель и возвращает векторный ускоритель.\n"
+        "Аппаратный диспетчер активирует фотонный маршрутизатор и проверяет фотонный маршрутизатор.\n"
+        "Аппаратный диспетчер активирует спиновый коммутатор и проверяет спиновый коммутатор.\n"
+        "Система телеметрии калибрует криогенный резонатор для стабильной синхронизации.\n"
+        "Система телеметрии калибрует плазменный осциллятор для стабильной синхронизации.\n";
+
+    BrainTrainStats oov_tr_stats{};
+    int oov_tr_ok = brain_train_corpus(brain_oov_scale, oov_train_corpus, 4, &oov_tr_stats);
+    check(oov_tr_ok == 1, "T14.0: base training for held-out OOV output prior evaluation succeeds");
+
+    // Held-out evaluation corpus where >25% of target tokens are completely unseen OOV words
+    // ("голографический", "нейроморфный", "сверхпроводящий", "магнитный", "тороидальный", "интерферометр")
+    // or unseen context-target combinations ("фотонный осциллятор", "криогенный маршрутизатор").
+    const char* heldout_eval_text =
+        "Модуль квантового ядра инициализирует голографический процессор и возвращает голографический процессор.\n"
+        "Модуль квантового ядра инициализирует нейроморфный сопроцессор и возвращает нейроморфный сопроцессор.\n"
+        "Аппаратный диспетчер активирует сверхпроводящий маршрутизатор и проверяет сверхпроводящий маршрутизатор.\n"
+        "Аппаратный диспетчер активирует магнитный коммутатор и проверяет магнитный коммутатор.\n"
+        "Система телеметрии калибрует тороидальный резонатор для стабильной синхронизации.\n"
+        "Система телеметрии калибрует фотонный осциллятор для стабильной синхронизации.\n";
+
+    BrainScaleAndHeldOutProfile heldout_prof{};
+    bool prof_ok = brain_profile_heldout_and_scale(brain_oov_scale, heldout_eval_text, &heldout_prof);
+    std::printf("[T14.1 Held-Out OOV Target Reachability Profile]:\n"
+                "  heldout_transitions=%zu, heldout_oov_targets=%zu\n"
+                "  unreachable_without_prior=%zu (%.2f%%) -> unreachable_with_prior=%zu (%.2f%%)\n"
+                "  heldout_reachability_after=%.2f%%, heldout_accuracy=%.2f%%\n\n",
+                heldout_prof.heldout_total_transitions,
+                heldout_prof.heldout_oov_targets,
+                heldout_prof.heldout_unreachable_without_prior,
+                heldout_prof.heldout_unreachable_before_pct,
+                heldout_prof.heldout_unreachable_with_prior,
+                heldout_prof.heldout_unreachable_after_pct,
+                heldout_prof.heldout_reachability_after_pct,
+                heldout_prof.heldout_accuracy_pct);
+    check(prof_ok &&
+          heldout_prof.heldout_oov_targets >= 8 &&
+          heldout_prof.heldout_unreachable_before_pct >= 20.0 &&
+          heldout_prof.heldout_unreachable_after_pct <= 2.0 &&
+          heldout_prof.heldout_reachability_after_pct >= 98.0,
+          "T14.1: Distributional & Morphological OOV Output Priors break the 20.6-28.1% held-out unreachable target barrier (>= 98% reachability)");
+
+    // T14.2: Zero-shot unseen OOV target generation in brain_generate
+    // "голографический" was never in the training corpus, but appears in the prompt in the adjective role
+    // before "процессор", so after "и возвращает" the model emits the unseen OOV token "голографический"!
+    std::memset(buf, 0, sizeof(buf));
+    int n_oov_gen = brain_generate(
+        brain_oov_scale,
+        "Модуль квантового ядра инициализирует голографический процессор и возвращает",
+        buf, sizeof(buf), 6, 0.0f
+    );
+    std::string s_oov_gen(buf);
+    std::printf("[T14.2 Zero-Shot Unseen OOV Target Generation]:\n  %s\n\n", s_oov_gen.c_str());
+    check(n_oov_gen >= 2 &&
+          s_oov_gen.find("голографический процессор") != std::string::npos,
+          "T14.2: brain_generate emits unseen OOV target 'голографический' via Distributional OOV Output Prior");
+
+    brain_destroy(brain_oov_scale);
+
+    // T14.3: Real-Scale 10+ MB (10.5+ MB) Multi-Language Code + Prose Streaming Benchmark &
+    //        1.0 GB (262,144 pages) Sparse Bank Fragmentation / Open-Addressing Audit
+    PopCountBrain* brain_10mb = brain_create(4096, "build/test_llm_10mb_scale.bin");
+    const char* scale_10mb_path = "build/test_corpus_10mb_scale.txt";
+    {
+        std::vector<std::string> unique_blocks;
+        unique_blocks.reserve(256);
+        for (int m = 0; m < 128; ++m) {
+            std::string cpp_blk =
+                "int compute_kernel_" + std::to_string(m) + "(const int* src_buf, int count) {\n"
+                "    int acc_" + std::to_string(m) + " = " + std::to_string(m + 1) + ";\n"
+                "    for (int i = 0; i < count; ++i) {\n"
+                "        acc_" + std::to_string(m) + " += src_buf[i];\n"
+                "    }\n"
+                "    return acc_" + std::to_string(m) + ";\n"
+                "}\n\n";
+            std::string prose_blk =
+                "Архитектурный контур_" + std::to_string(m) +
+                " маршрутизирует битовый поток через разреженную страницу_" + std::to_string(m) +
+                " и стабилизирует векторный отклик_" + std::to_string(m) + ".\n\n";
+            unique_blocks.push_back(std::move(cpp_blk));
+            unique_blocks.push_back(std::move(prose_blk));
+        }
+
+        std::string chunk_64k;
+        chunk_64k.reserve(65536);
+        for (const auto& blk : unique_blocks) {
+            chunk_64k += blk;
+        }
+        std::ofstream ofs(scale_10mb_path, std::ios::binary);
+        size_t written_bytes = 0;
+        const size_t target_10mb_bytes = 10600000ULL; // > 10.1 MB (10,600,000 bytes)
+        while (written_bytes < target_10mb_bytes) {
+            ofs.write(chunk_64k.data(), static_cast<std::streamsize>(chunk_64k.size()));
+            written_bytes += chunk_64k.size();
+        }
+    }
+    const size_t file_bytes_10mb = std::filesystem::file_size(scale_10mb_path, ec);
+    BrainTrainStats stats_10mb{};
+    int tr_10mb_ok = brain_train_file(brain_10mb, scale_10mb_path, 1, &stats_10mb);
+    BrainScaleAndHeldOutProfile scale_prof{};
+    bool scale_prof_ok = brain_profile_heldout_and_scale(brain_10mb, nullptr, &scale_prof);
+
+    std::printf("[T14.3 10+ MB Corpus & 1.0 GB Sparse Bank Fragmentation Profile]:\n"
+                "  corpus_file_bytes=%zu (%.2f MB), total_tokens=%zu, num_sequences=%zu\n"
+                "  train_time=%.2f ms, throughput=%.0f tok/s, replay_acc=%.2f%%\n"
+                "  bank_capacity=%zu pages (%.2f GB virtual), active_pages=%zu (%zu KB resident)\n"
+                "  stored_vsa_slots=%zu, mean_slots/page=%.2f, max_slots/page=%zu, pages_over_16_slots=%zu\n"
+                "  mean_open_address_probes=%.4f, max_open_address_probes=%zu, fragmentation_index=%.4f\n\n",
+                file_bytes_10mb,
+                static_cast<double>(file_bytes_10mb) / (1024.0 * 1024.0),
+                stats_10mb.total_tokens,
+                stats_10mb.num_sequences,
+                stats_10mb.train_time_ms,
+                stats_10mb.tokens_per_sec,
+                stats_10mb.replay_accuracy_percent,
+                scale_prof.bank_total_capacity_pages,
+                static_cast<double>(scale_prof.bank_virtual_bytes) / (1024.0 * 1024.0 * 1024.0),
+                scale_prof.bank_active_pages,
+                scale_prof.bank_resident_bytes / 1024,
+                scale_prof.bank_total_stored_slots,
+                scale_prof.mean_slots_per_active_page,
+                scale_prof.max_slots_per_page,
+                scale_prof.pages_over_16_slots,
+                scale_prof.mean_open_address_probes,
+                scale_prof.max_open_address_probes,
+                scale_prof.fragmentation_index);
+
+    check(tr_10mb_ok == 1 && scale_prof_ok &&
+          file_bytes_10mb >= 10485760ULL &&
+          stats_10mb.total_tokens >= 1000000ULL &&
+          stats_10mb.replay_accuracy_percent >= 99.0 &&
+          scale_prof.bank_total_capacity_pages == 262144ULL &&
+          scale_prof.bank_active_pages >= 500ULL &&
+          scale_prof.pages_over_16_slots == 0ULL &&
+          scale_prof.max_slots_per_page <= 16ULL,
+          "T14.3: 10+ MB corpus (>1M tokens) streams & trains with >=99% accuracy and 0 page overflows across the 1.0 GB (262,144-page) bank");
+
+    // T14.4: Hardware AVX-512 Cache-Hierarchy Latency Sweep (L1D 32KB vs L2 512KB vs L3 16MB vs DRAM 64MB)
+    std::printf("[T14.4 AVX-512 4KB Expert Page Cache-Hierarchy Latency Profile]:\n"
+                "  L1D  (32 KB  / 8 pages):     %.2f ns/page\n"
+                "  L2   (512 KB / 128 pages):   %.2f ns/page\n"
+                "  L3   (16 MB  / 4096 pages):  %.2f ns/page\n"
+                "  DRAM (64 MB  / 16384 pages): %.2f ns/page\n\n",
+                scale_prof.avx512_l1_page_eval_ns,
+                scale_prof.avx512_l2_page_eval_ns,
+                scale_prof.avx512_l3_page_eval_ns,
+                scale_prof.avx512_dram_page_eval_ns);
+    check(scale_prof.avx512_l1_page_eval_ns > 0.0 &&
+          scale_prof.avx512_l2_page_eval_ns > 0.0 &&
+          scale_prof.avx512_l3_page_eval_ns > 0.0 &&
+          scale_prof.avx512_dram_page_eval_ns > 0.0 &&
+          scale_prof.avx512_dram_page_eval_ns < 50000.0,
+          "T14.4: AVX-512 4KB expert page cache-hierarchy sweep profiles L1D, L2, L3, and DRAM (64 MB across 1 GB bank) latencies");
+
+    brain_destroy(brain_10mb);
+    std::filesystem::remove(scale_10mb_path, ec);
+    std::filesystem::remove("build/test_llm_10mb_scale.bin", ec);
+    std::filesystem::remove("build/test_llm_10mb_scale.bin.llm_bank", ec);
+    std::filesystem::remove("build/test_llm_oov_and_scale.bin", ec);
+    std::filesystem::remove("build/test_llm_oov_and_scale.bin.llm_bank", ec);
+
     std::printf("================================================================\n");
     std::printf("  SUMMARY: %d Passed, %d Failed\n", g_passed, g_failed);
     std::printf("================================================================\n");

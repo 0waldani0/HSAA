@@ -55,7 +55,7 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 | Adversarial stress | `tests\build_adversarial_stress.bat` | pass |
 | Micro-benchmark | `tests\build_micro_bench.bat` | pass |
 | PTQ host validation | `tests\build_ptq_validation.bat run` | 5 / 5 (N/M tiling and fused rank rejections) |
-| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 55 / 55 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override, L>1000 hard context horizon up to MAX_HORIZON=2048) |
+| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 65 / 65 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override, L>1000 hard context horizon, 32-layer non-linear + Riemannian SGD + 3-hop deduction, Distributional OOV Output Priors on held-out targets, and 10+ MB / 1.0 GB bank AVX-512 cache & fragmentation profiling) |
 | C-ABI probe (F22) | `second_brain\measur\build_capi_probe.bat` | exit 0 |
 | Assoc calibration | `second_brain\measur\build_assoc_calib.bat` | recall/FP table at the shipped gate |
 

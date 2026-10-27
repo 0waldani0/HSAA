@@ -171,7 +171,31 @@ int main() {
     printf("[+] Multi-hop logical deduction verified: 2-hop='%s', 3-hop='%s' (conflict check active).\n",
            hop2_ans, hop3_ans);
 
-    // 10. Destroy brain and cleanup
+    // 10. Verify Distributional OOV Output Priors & Scale Profiler via C-ABI (brain_profile_heldout_and_scale)
+    const char* oov_corpus =
+        "Quantum router initializes coherent channel and validates coherent channel.\n"
+        "Quantum router initializes photonic channel and validates photonic channel.\n"
+        "Hardware controller calibrates cryogenic sensor for low latency.\n"
+        "Hardware controller calibrates magnetic sensor for low latency.\n";
+    BrainTrainStats oov_st{};
+    int tr_oov = brain_train_corpus(brain, oov_corpus, 3, &oov_st);
+    assert(tr_oov == 1 && "brain_train_corpus failed on OOV prior test");
+
+    const char* heldout_oov =
+        "Quantum router initializes holographic channel and validates holographic channel.\n"
+        "Hardware controller calibrates superconducting sensor for low latency.\n";
+    BrainScaleAndHeldOutProfile prof{};
+    bool prof_ok = brain_profile_heldout_and_scale(brain, heldout_oov, &prof);
+    assert(prof_ok && "brain_profile_heldout_and_scale returned false");
+    assert(prof.heldout_unreachable_before_pct >= 18.0 && "Expected raw held-out unreachable >= 18%");
+    assert(prof.heldout_unreachable_after_pct <= 2.0 && "Expected prior held-out unreachable <= 2%");
+    assert(prof.pages_over_16_slots == 0 && "Expected zero pages over 16 slots");
+    assert(prof.avx512_l1_page_eval_ns > 0.0 && prof.avx512_dram_page_eval_ns > 0.0 && "Expected non-zero AVX-512 cache profile");
+    printf("[+] Held-Out OOV Prior & Scale Profile verified: raw_unreach=%.1f%% -> prior_unreach=%.1f%%, L1=%.1f ns, DRAM=%.1f ns.\n",
+           prof.heldout_unreachable_before_pct, prof.heldout_unreachable_after_pct,
+           prof.avx512_l1_page_eval_ns, prof.avx512_dram_page_eval_ns);
+
+    // 11. Destroy brain and cleanup
     brain_destroy(brain);
     printf("[+] Brain destroyed cleanly.\n");
 
