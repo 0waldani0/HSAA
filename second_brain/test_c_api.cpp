@@ -7,6 +7,7 @@ int main() {
     printf("[*] Starting PopCount Second Brain C-ABI Integration Test...\n");
 
     // 1. Create instance (4,096 pages = 16MB)
+    remove("build/test_brain.bin");
     PopCountBrain* brain = brain_create(4096, "build/test_brain.bin");
     assert(brain != NULL && "brain_create failed");
     printf("[+] Brain created successfully.\n");

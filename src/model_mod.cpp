@@ -1075,7 +1075,11 @@ int model_load_weights(void* ctx, const char* filepath) {
             if (metas[l].M != MODEL_DEFAULT_DIM_M ||
                 metas[l].N != MODEL_DEFAULT_DIM_N ||
                 metas[l].R != MODEL_DEFAULT_RANK_R ||
-                metas[l].precision > static_cast<uint32_t>(QUANT_FP16) ||
+                (metas[l].precision != static_cast<uint32_t>(QUANT_2BIT) &&
+                 metas[l].precision != static_cast<uint32_t>(QUANT_3BIT) &&
+                 metas[l].precision != static_cast<uint32_t>(QUANT_4BIT) &&
+                 metas[l].precision != static_cast<uint32_t>(QUANT_DELTA_24) &&
+                 metas[l].precision != static_cast<uint32_t>(QUANT_DELTA_34)) ||
                 (metas[l].layer_type != static_cast<uint32_t>(LAYER_GQA_ATTENTION) &&
                  metas[l].layer_type != static_cast<uint32_t>(LAYER_GATED_DELTANET))) {
                 ok = false;

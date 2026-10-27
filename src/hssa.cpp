@@ -2171,10 +2171,10 @@ int hssa_load_weights(HssaContext* ctx, const char* filepath) {
         hssa_set_unembedding_matrix(ctx, tmp_unemb.data(), static_cast<size_t>(hdr.vocab_size));
     }
     if (ctx->cuda_active && ctx->cuda_drv && ctx->gpu_matrix && L > 0) {
-        CudaDriverApi* drv = static_cast<CudaDriverApi*>(ctx->cuda_drv);
-        GpuQuantizedMatrix* gpu = static_cast<GpuQuantizedMatrix*>(ctx->gpu_matrix);
-        drv->cuMemcpyHtoD_v2(gpu->d_tt_u, ctx->layers[0].tt_u, tt_bytes);
-        drv->cuMemcpyHtoD_v2(gpu->d_tt_v, ctx->layers[0].tt_v, tt_bytes);
+        CudaDrv* drv = (CudaDrv*)ctx->cuda_drv;
+        PtqGpuMatrix* gpu = (PtqGpuMatrix*)ctx->gpu_matrix;
+        if (gpu->d_tt_u) drv->cuMemcpyHtoD(gpu->d_tt_u, ctx->layers[0].tt_u, tt_bytes);
+        if (gpu->d_tt_v) drv->cuMemcpyHtoD(gpu->d_tt_v, ctx->layers[0].tt_v, tt_bytes);
     }
     return 0;
 }
@@ -2208,13 +2208,13 @@ int hssa_train_token_step(
     const float mse = _mm512_reduce_add_ps(v_sq_err) / static_cast<float>(HSSA_HIDDEN_DIM);
     if (out_mse_loss) *out_mse_loss = mse;
 
-    const float x_norm_sq = std::max(1e-6f, _mm512_reduce_add_ps(v_sq_x));
+    const float x_norm_sq = (std::max)(1e-6f, _mm512_reduce_add_ps(v_sq_x));
     const float x_norm    = std::sqrt(x_norm_sq);
     const float inv_sqrt_r_x = 1.0f / (std::sqrt(static_cast<float>(HSSA_RANK)) * x_norm);
 
     // 1. Update base layer Q/K/V/Gate projections via Straight-Through Estimator (STE)
     //    and re-quantize 1.58-bit ternary bitplanes + coupled low-rank TT16 adapters
-    const float layer_lr = lr / static_cast<float>(std::max<uint32_t>(1U, ctx->config.num_layers));
+    const float layer_lr = lr / static_cast<float>((std::max)(1U, ctx->config.num_layers));
     const float base_lr  = (0.25f * layer_lr) / x_norm_sq;
     for (uint32_t l = 0; l < ctx->config.num_layers; ++l) {
         HssaLayer* layer = &ctx->layers[l];
@@ -2295,11 +2295,11 @@ int hssa_train_token_step(
         layer->reserved[0] = reinterpret_cast<void*>(1);
     }
     if (ctx->cuda_active && ctx->cuda_drv && ctx->gpu_matrix && ctx->config.num_layers > 0) {
-        CudaDriverApi* drv = static_cast<CudaDriverApi*>(ctx->cuda_drv);
-        GpuQuantizedMatrix* gpu = static_cast<GpuQuantizedMatrix*>(ctx->gpu_matrix);
+        CudaDrv* drv = (CudaDrv*)ctx->cuda_drv;
+        PtqGpuMatrix* gpu = (PtqGpuMatrix*)ctx->gpu_matrix;
         const size_t tt_bytes = static_cast<size_t>(HSSA_TT16_CORE_SIZE) * sizeof(float);
-        drv->cuMemcpyHtoD_v2(gpu->d_tt_u, ctx->layers[0].tt_u, tt_bytes);
-        drv->cuMemcpyHtoD_v2(gpu->d_tt_v, ctx->layers[0].tt_v, tt_bytes);
+        if (gpu->d_tt_u) drv->cuMemcpyHtoD(gpu->d_tt_u, ctx->layers[0].tt_u, tt_bytes);
+        if (gpu->d_tt_v) drv->cuMemcpyHtoD(gpu->d_tt_v, ctx->layers[0].tt_v, tt_bytes);
     }
 
     // 2. Adapt the closest Hopfield attractor pattern along err_vec = target_vec - pred_vec
@@ -2319,7 +2319,7 @@ int hssa_train_token_step(
             }
         }
         float* pat = &ctx->attractor_patterns[best_k * HSSA_HIDDEN_DIM];
-        const float att_lr = std::min(0.50f, lr);
+        const float att_lr = (std::min)(0.50f, lr);
         const __m512 v_att_lr = _mm512_set1_ps(att_lr);
         for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
             __m512 vp   = _mm512_load_ps(pat + j);
@@ -2346,7 +2346,7 @@ int hssa_train_token_step(
             }
         }
         float* row = &ctx->unembed_weights[best_v * HSSA_HIDDEN_DIM];
-        const __m512 v_unemb_lr = _mm512_set1_ps(std::min(0.10f, 0.05f * lr));
+        const __m512 v_unemb_lr = _mm512_set1_ps((std::min)(0.10f, 0.05f * lr));
         for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
             __m512 vr   = _mm512_load_ps(row + j);
             __m512 verr = _mm512_load_ps(err_vec + j);

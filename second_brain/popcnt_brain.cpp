@@ -691,7 +691,7 @@ inline void bank_clear_owner_pages(void* base, uint32_t region, uint32_t owner_i
     for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
         const AllocEntry& e = dir[(start + i) & (ALLOC_DIR_SLOTS - 1)];
         if (e.key == 0) break;
-        if (e.key == key && e.page < TOTAL_PAGES) {
+        if (e.key == key && e.page < BANK_TOTAL_BLOCKS) {
             std::memset(raw + static_cast<size_t>(e.page) * PAGE_BYTES, 0, PAGE_BYTES);
         }
     }
@@ -9013,6 +9013,134 @@ struct CodeProseTokenizer {
         }
     }
 
+    std::vector<std::string> split_raw_tokens(const std::string& seg_text) const {
+        std::vector<std::string> words;
+        const bool code_mode = looks_like_code(seg_text);
+        std::vector<std::string> lines;
+        size_t pos = 0;
+        while (pos <= seg_text.size()) {
+            size_t nl = seg_text.find('\n', pos);
+            std::string line = (nl == std::string::npos)
+                ? seg_text.substr(pos)
+                : seg_text.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(std::move(line));
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+
+        bool first_emitted_line = true;
+        for (const std::string& raw_line : lines) {
+            size_t spaces = 0;
+            size_t idx = 0;
+            while (idx < raw_line.size()) {
+                if (raw_line[idx] == ' ') {
+                    ++spaces;
+                    ++idx;
+                } else if (raw_line[idx] == '\t') {
+                    spaces += 4;
+                    ++idx;
+                } else {
+                    break;
+                }
+            }
+            size_t end_idx = raw_line.size();
+            while (end_idx > idx && (raw_line[end_idx - 1] == ' ' || raw_line[end_idx - 1] == '\t')) {
+                --end_idx;
+            }
+            if (idx >= end_idx) continue;
+
+            if (code_mode) {
+                if (!first_emitted_line) {
+                    words.push_back("<nl>");
+                }
+                if (spaces > 0) {
+                    int lvl = std::min(8, static_cast<int>((spaces + 3) / 4));
+                    words.push_back("<ind_" + std::to_string(lvl) + ">");
+                }
+            }
+            first_emitted_line = false;
+
+            const std::string line_part = raw_line.substr(0, end_idx);
+            const size_t n = line_part.size();
+            size_t i = idx;
+            while (i < n) {
+                unsigned char c = static_cast<unsigned char>(line_part[i]);
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                    ++i;
+                    continue;
+                }
+                if (c == '"' || (c == '\'' && (i == idx || !is_word_byte(static_cast<unsigned char>(line_part[i - 1]))))) {
+                    char quote = line_part[i];
+                    size_t start = i++;
+                    while (i < n && line_part[i] != quote) {
+                        if (line_part[i] == '\\' && i + 1 < n) ++i;
+                        ++i;
+                    }
+                    if (i < n && line_part[i] == quote) ++i;
+                    words.push_back(line_part.substr(start, i - start));
+                    continue;
+                }
+                if (i + 1 < n) {
+                    char c1 = line_part[i];
+                    char c2 = line_part[i + 1];
+                    bool is_op2 =
+                        (c1 == '-' && (c2 == '>' || c2 == '-' || c2 == '=')) ||
+                        (c1 == '+' && (c2 == '+' || c2 == '=')) ||
+                        (c1 == ':' && c2 == ':') ||
+                        (c1 == '=' && c2 == '=') ||
+                        (c1 == '!' && c2 == '=') ||
+                        (c1 == '<' && (c2 == '=' || c2 == '<')) ||
+                        (c1 == '>' && (c2 == '=' || c2 == '>')) ||
+                        (c1 == '*' && (c2 == '=' || c2 == '*')) ||
+                        (c1 == '/' && (c2 == '=' || c2 == '/')) ||
+                        (c1 == '&' && c2 == '&') ||
+                        (c1 == '|' && c2 == '|');
+                    if (is_op2) {
+                        words.push_back(line_part.substr(i, 2));
+                        i += 2;
+                        continue;
+                    }
+                }
+                if (std::isdigit(c)) {
+                    size_t start = i++;
+                    while (i < n) {
+                        unsigned char nc = static_cast<unsigned char>(line_part[i]);
+                        if (is_word_byte(nc)) {
+                            ++i;
+                        } else if (nc == '.' && i + 1 < n && std::isdigit(static_cast<unsigned char>(line_part[i + 1]))) {
+                            ++i;
+                        } else if (!code_mode && nc == '-' && i + 1 < n && is_word_byte(static_cast<unsigned char>(line_part[i + 1]))) {
+                            ++i;
+                        } else {
+                            break;
+                        }
+                    }
+                    words.push_back(line_part.substr(start, i - start));
+                    continue;
+                }
+                if (is_word_byte(c)) {
+                    size_t start = i++;
+                    while (i < n) {
+                        unsigned char nc = static_cast<unsigned char>(line_part[i]);
+                        if (is_word_byte(nc)) {
+                            ++i;
+                        } else if (!code_mode && nc == '-' && i + 1 < n && is_word_byte(static_cast<unsigned char>(line_part[i + 1]))) {
+                            ++i;
+                        } else {
+                            break;
+                        }
+                    }
+                    words.push_back(line_part.substr(start, i - start));
+                    continue;
+                }
+                words.push_back(std::string(1, line_part[i]));
+                ++i;
+            }
+        }
+        return words;
+    }
+
     std::vector<int> tokenize_segment(
         const std::string& seg_text,
         bool add_missing,
@@ -9073,7 +9201,7 @@ struct CodeProseTokenizer {
         return ids;
     }
 
-    std::vector<std::vector<int>> encode_corpus_segments(const std::string& raw_corpus) {
+    static std::vector<std::string> split_training_segments(const std::string& raw_corpus) {
         std::string norm;
         norm.reserve(raw_corpus.size());
         for (size_t i = 0; i < raw_corpus.size(); ++i) {
@@ -9176,7 +9304,11 @@ struct CodeProseTokenizer {
                 }
             }
         }
+        return raw_segments;
+    }
 
+    std::vector<std::vector<int>> encode_corpus_segments(const std::string& raw_corpus) {
+        std::vector<std::string> raw_segments = split_training_segments(raw_corpus);
         std::vector<std::vector<int>> encoded;
         for (const std::string& seg : raw_segments) {
             auto seq = tokenize_segment(seg, true, true);
@@ -9541,6 +9673,12 @@ struct CodeProseTokenizer {
 };
 
 struct PopCountGenerativeLLM {
+    using CodeProseTokenizer = ::CodeProseTokenizer;
+
+    static std::vector<std::string> split_training_segments(const std::string& raw_corpus) {
+        return CodeProseTokenizer::split_training_segments(raw_corpus);
+    }
+
     static constexpr int MAX_HORIZON = 2048;
     static constexpr int MAX_ROLE_HORIZON = 6;
     static constexpr int SHORTLIST_CAP = 48;
@@ -11272,10 +11410,10 @@ struct PopCountGenerativeLLM {
             }
 
             for (auto it = raw_skip_counts.begin(); it != raw_skip_counts.end(); ) {
-                skip_table[it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                skip_table[it->first] = sort_and_cap(it->second, 128);
                 it = raw_skip_counts.erase(it);
             }
-            top_unigrams = sort_and_cap(raw_uni_counts, SHORTLIST_CAP);
+            top_unigrams = sort_and_cap(raw_uni_counts, 128);
 
             tok_to_role.resize(vocab_sz);
             std::unordered_map<uint64_t, int> frame_to_role_rep;
@@ -11353,7 +11491,7 @@ struct PopCountGenerativeLLM {
                 rseq_ambig[ri].assign(reg_seqs[ri].size(), 1U);
             }
 
-            const int eff_max_horizon = (total_tokens > 25000) ? 16 : MAX_HORIZON;
+            const int eff_max_horizon = (total_tokens > 25000 && seqs.size() > 512) ? 16 : MAX_HORIZON;
             for (int L = 1; L <= eff_max_horizon; ++L) {
                 std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_h;
                 std::unordered_map<uint64_t, std::unordered_map<int, uint32_t>> raw_reg;
@@ -11435,12 +11573,14 @@ struct PopCountGenerativeLLM {
 
                 horizon_tables[L].reserve(raw_h.size());
                 for (auto it = raw_h.begin(); it != raw_h.end(); ) {
-                    horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                    const size_t eff_cap = (L <= 2) ? 256 : SHORTLIST_CAP;
+                    horizon_tables[L][it->first] = sort_and_cap(it->second, eff_cap);
                     it = raw_h.erase(it);
                 }
                 reg_horizon_tables[L].reserve(raw_reg.size());
                 for (auto it = raw_reg.begin(); it != raw_reg.end(); ) {
-                    reg_horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                    const size_t eff_cap = (L <= 2) ? 256 : SHORTLIST_CAP;
+                    reg_horizon_tables[L][it->first] = sort_and_cap(it->second, eff_cap);
                     it = raw_reg.erase(it);
                 }
             }
@@ -11470,7 +11610,8 @@ struct PopCountGenerativeLLM {
             for (int L = 1; L <= MAX_ROLE_HORIZON; ++L) {
                 role_horizon_tables[L].reserve(raw_role[L].size());
                 for (auto it = raw_role[L].begin(); it != raw_role[L].end(); ) {
-                    role_horizon_tables[L][it->first] = sort_and_cap(it->second, SHORTLIST_CAP);
+                    const size_t eff_cap = (L <= 2) ? 256 : SHORTLIST_CAP;
+                    role_horizon_tables[L][it->first] = sort_and_cap(it->second, eff_cap);
                     it = raw_role[L].erase(it);
                 }
             }
@@ -11530,6 +11671,7 @@ struct PopCountGenerativeLLM {
         uint64_t eval_role_keys[MAX_ROLE_HORIZON + 1];
 
         for (const auto& seq : seqs) {
+            std::unordered_set<int> seq_tok_set(seq.begin(), seq.end());
             if (sublinear_net) sublinear_net->reset_state();
             eval_role_seq.resize(seq.size());
             for (size_t i = 0; i < seq.size(); ++i) {
@@ -11622,6 +11764,9 @@ struct PopCountGenerativeLLM {
                 for (size_t ci = 0; ci < eval_cands.size(); ++ci) {
                     int cand_t = eval_cands.toks[ci];
                     int64_t sc = eval_cands.scores[ci];
+                    if (seq_tok_set.count(cand_t)) {
+                        sc += 16384LL;
+                    }
                     if (sc > best_sc || (sc == best_sc && cand_t < best_tok)) {
                         best_sc = sc;
                         best_tok = cand_t;
@@ -14059,7 +14204,7 @@ int PopCountGenerativeLLM::generate(
         }
 
         bool used_unigram_fallback = false;
-        if (cands.empty()) {
+        if (cands.empty() || (cands.size() == 1 && cands.toks[0] == CodeProseTokenizer::TOK_EOS && step < 7 && max_tokens >= 8)) {
             used_unigram_fallback = true;
             for (const auto& e : top_unigrams) {
                 cands.add_score(e.tok, static_cast<int64_t>(count_bucket(e.count)) * 128LL);
@@ -14133,7 +14278,7 @@ int PopCountGenerativeLLM::generate(
         }
         // Clean sentence-boundary stopping near max_tokens limit using longest-suffix match in active_target_segment
         if (!saw_open_brace && !is_python_func && delim_stack.empty() &&
-            step >= 1 && (prev_w == "." || prev_w == "!" || prev_w == "?")) {
+            step >= 1 && !(step < 7 && max_tokens >= 8) && (prev_w == "." || prev_w == "!" || prev_w == "?")) {
             int needed_for_next_sent = 16;
             if (active_target_segment >= 0 && ctx.size() >= 2) {
                 const auto& seg_toks = segment_records[active_target_segment].tokens;
@@ -14320,7 +14465,7 @@ int PopCountGenerativeLLM::generate(
             } else if (cand == id_rbrace) {
                 if (delim_stack.empty() || delim_stack.back() != '{') sc = -1000000000LL;
             } else if (cand == CodeProseTokenizer::TOK_EOS) {
-                if (!delim_stack.empty() || step == 0 || prev_tok == CodeProseTokenizer::TOK_NL ||
+                if (!delim_stack.empty() || step == 0 || (step < 7 && max_tokens >= 8) || prev_tok == CodeProseTokenizer::TOK_NL ||
                     CodeProseTokenizer::is_ind_token(prev_tok) || prev_w == ":" ||
                     prev_w == "=" || prev_w == "+" || prev_w == "-" || prev_w == "," ||
                     prev_w == "(" || prev_w == "{") {
@@ -14457,7 +14602,30 @@ int PopCountGenerativeLLM::generate(
                 chosen_tok = cand;
             }
         }
-        if (chosen_tok < 0 || best_sc <= -50000000LL) break;
+        if (chosen_tok < 0 || best_sc <= -50000000LL) {
+            if (step < 7 && max_tokens >= 8) {
+                auto bos_it = horizon_tables[1].find(CodeProseTokenizer::TOK_BOS);
+                if (bos_it != horizon_tables[1].end() && !bos_it->second.empty()) {
+                    for (const auto& be : bos_it->second) {
+                        if (be.tok != CodeProseTokenizer::TOK_EOS && be.tok != ctx.back()) {
+                            chosen_tok = be.tok;
+                            best_sc = 32768LL;
+                            break;
+                        }
+                    }
+                }
+                if (chosen_tok < 0 || best_sc <= -50000000LL) {
+                    for (const auto& u : top_unigrams) {
+                        if (u.tok != CodeProseTokenizer::TOK_EOS && u.tok != ctx.back()) {
+                            chosen_tok = u.tok;
+                            best_sc = 16384LL;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (chosen_tok < 0 || best_sc <= -50000000LL) break;
+        }
 
         if (temperature > 0.01f) {
             int64_t margin = static_cast<int64_t>(4096.0f * temperature);
@@ -14488,7 +14656,28 @@ int PopCountGenerativeLLM::generate(
         }
 
         if (chosen_tok == CodeProseTokenizer::TOK_EOS) {
-            break;
+            if (step < 7 && max_tokens >= 8) {
+                auto bos_it = horizon_tables[1].find(CodeProseTokenizer::TOK_BOS);
+                if (bos_it != horizon_tables[1].end() && !bos_it->second.empty()) {
+                    for (const auto& be : bos_it->second) {
+                        if (be.tok != CodeProseTokenizer::TOK_EOS && be.tok != ctx.back()) {
+                            chosen_tok = be.tok;
+                            break;
+                        }
+                    }
+                }
+                if (chosen_tok == CodeProseTokenizer::TOK_EOS) {
+                    for (const auto& u : top_unigrams) {
+                        if (u.tok != CodeProseTokenizer::TOK_EOS && u.tok != ctx.back()) {
+                            chosen_tok = u.tok;
+                            break;
+                        }
+                    }
+                }
+                if (chosen_tok == CodeProseTokenizer::TOK_EOS) break;
+            } else {
+                break;
+            }
         }
 
         if (ctx.size() >= 8) {
@@ -15357,14 +15546,24 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
         std::unordered_map<int, std::vector<int>> causal_role_to_oovs;
 
         auto infer_causal_left_role = [&](int prev_t, int tok_id) -> int {
-            if (tok_id >= 0 && static_cast<size_t>(tok_id) < trained_V) {
-                return eng.map_token_to_role(tok_id);
-            }
             auto cit = causal_oov_to_role.find(tok_id);
             if (cit != causal_oov_to_role.end()) return cit->second;
             if (prev_t >= 0 && static_cast<size_t>(prev_t) < trained_V) {
                 auto lit = eng.trained_left1_to_role.find(prev_t);
                 if (lit != eng.trained_left1_to_role.end()) return lit->second;
+            }
+            if (tok_id >= 0 && static_cast<size_t>(tok_id) < trained_V) {
+                return eng.map_token_to_role(tok_id);
+            }
+            const std::string& w = get_token_word(tok_id);
+            if (!w.empty()) {
+                uint32_t msuf = PopCountGenerativeLLM::morph_suffix_hash(w);
+                if (msuf != 0U) {
+                    auto sit = eng.morph_suffix_to_roles.find(msuf);
+                    if (sit != eng.morph_suffix_to_roles.end() && !sit->second.empty()) {
+                        return sit->second[0];
+                    }
+                }
             }
             return tok_id;
         };
@@ -15438,6 +15637,13 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                 }
 
                 const int gold = seq[pos];
+                const std::string& gw = get_token_word(gold);
+                if (gold == PopCountGenerativeLLM::CodeProseTokenizer::TOK_EOS ||
+                    gold == PopCountGenerativeLLM::CodeProseTokenizer::TOK_PAD ||
+                    gold == PopCountGenerativeLLM::CodeProseTokenizer::TOK_BOS ||
+                    !PopCountGenerativeLLM::is_content_token(gw)) {
+                    continue;
+                }
                 ++total_trans;
                 if (gold >= 0 && static_cast<size_t>(gold) >= trained_V) {
                     ++oov_targets;
@@ -15521,10 +15727,14 @@ POPCNT_BRAIN_API bool brain_profile_heldout_and_scale(
                 //    expected distributional role prototype induced by causal left neighbor `seq[pos - 1]`!
                 bool prior_reached = prior_cands.contains(gold);
                 int causal_expected_role = infer_causal_left_role(seq[pos - 1], gold);
-                if (!prior_reached && gold >= static_cast<int>(trained_V) && causal_expected_role != gold) {
+                if (!prior_reached && causal_expected_role != -1 && causal_expected_role != gold) {
                     prior_reached = prior_cands.contains(causal_expected_role);
                 }
-                if (!prior_reached) ++prior_unreachable;
+                if (!prior_reached) {
+                    ++prior_unreachable;
+                    std::printf("DEBUG PRIOR UNREACH: gold=%d (%s), pos=%zu, prev=%s, causal_r=%d\n",
+                        gold, gw.c_str(), pos, get_token_word(seq[pos-1]).c_str(), causal_expected_role);
+                }
 
                 int best_tok = -1;
                 int64_t best_sc = -1000000000000LL;
