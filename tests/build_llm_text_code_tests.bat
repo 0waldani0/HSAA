@@ -24,6 +24,11 @@ if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxilia
 )
 
 :msvc_ok
+if not exist "%BUILD_DIR%\popcnt_brain_lib.obj" (
+    echo [*] popcnt_brain_lib.obj missing, building second_brain first...
+    call "%ROOT_DIR%\build.bat" brain
+    if errorlevel 1 exit /b 1
+)
 echo [*] Compiling test_llm_text_code_gen.exe...
 cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /wd4996 ^
     "%ROOT_DIR%\tests\test_llm_text_code_gen.cpp" ^

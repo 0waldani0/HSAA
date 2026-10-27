@@ -191,7 +191,7 @@ static constexpr uint32_t ALLOC_REGION_FACT         = 1;
 static constexpr uint32_t ALLOC_NO_PAGE             = 0xFFFFFFFFu;
 static constexpr uint64_t ALLOC_MAGIC               = 0x48435353414C4F43ULL; // "HSSALLOC"
 static constexpr uint32_t ALLOC_VERSION             = 1;
-static constexpr int32_t  ALLOC_SAME_RULE_THRESHOLD = 500;   // XNOR agreement for "same rule"
+static constexpr int32_t  ALLOC_SAME_RULE_THRESHOLD = 510;   // Exact 512/512 bit match for in-place rule overwrite
 
 struct AllocHeader {
     uint64_t magic;                 // ALLOC_MAGIC once the allocator is live
@@ -653,6 +653,48 @@ inline bool bank_alloc_add_page(void* base, uint64_t key, uint32_t page) {
         }
     }
     return false;   // the directory is full
+}
+
+// Allocate and register a new 4 KB page for (region, owner_id) in the bank directory.
+inline uint32_t bank_alloc_new_page(void* base, uint32_t region, uint32_t owner_id) {
+    if (!base) return ALLOC_NO_PAGE;
+    bank_alloc_init(base);
+    const uint64_t key = bank_alloc_key(region, owner_id);
+    const AllocEntry* dir = bank_alloc_dir(base);
+    const uint32_t start = bank_alloc_slot(key);
+    size_t npages = 0;
+    for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+        const AllocEntry& e = dir[(start + i) & (ALLOC_DIR_SLOTS - 1)];
+        if (e.key == 0) break;
+        if (e.key == key && ++npages >= ALLOC_MAX_PAGES_PER_OWNER) {
+            return ALLOC_NO_PAGE;
+        }
+    }
+    const uint32_t page = bank_alloc_new_page(base, region);
+    if (page == ALLOC_NO_PAGE) return ALLOC_NO_PAGE;
+    if (!bank_alloc_add_page(base, key, page)) {
+        bank_alloc_release_page(base, region, page);
+        return ALLOC_NO_PAGE;
+    }
+    return page;
+}
+
+// Clear the 4 KB page payloads owned by (region, owner_id) in place while keeping
+// directory entries intact so linear-probing chains and page pool IDs never break or leak.
+inline void bank_clear_owner_pages(void* base, uint32_t region, uint32_t owner_id) {
+    if (!base) return;
+    bank_alloc_init(base);
+    const uint64_t key = bank_alloc_key(region, owner_id);
+    const AllocEntry* dir = bank_alloc_dir(base);
+    const uint32_t start = bank_alloc_slot(key);
+    char* raw = static_cast<char*>(base);
+    for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+        const AllocEntry& e = dir[(start + i) & (ALLOC_DIR_SLOTS - 1)];
+        if (e.key == 0) break;
+        if (e.key == key && e.page < TOTAL_PAGES) {
+            std::memset(raw + static_cast<size_t>(e.page) * PAGE_BYTES, 0, PAGE_BYTES);
+        }
+    }
 }
 
 inline void bank_write_rule_slot(
@@ -5821,6 +5863,391 @@ struct PureNeuralReasoningEngine {
         }
     }
 
+    static constexpr uint64_t OPEN_VOCAB_SLOT_MAGIC = 0x4F5646414354534CULL; // "OVFACTSL"
+    static constexpr uint32_t kOpenVocabLexiconOwnerId = 0x0002FFFFU;
+    static constexpr size_t OPEN_VOCAB_SLOTS_PER_PAGE = 8;
+
+    struct alignas(64) OpenVocabFactSlot {
+        uint64_t magic;                     // 8 B (non-zero in slot 0 marks 4 KB page occupied)
+        uint32_t owner_id;                  // 4 B
+        uint32_t flags;                     // 4 B
+        uint64_t subj_vec[WORDS_PER_VEC];   // 64 B
+        uint64_t rel_vec[WORDS_PER_VEC];    // 64 B
+        uint64_t obj_vec[WORDS_PER_VEC];    // 64 B
+        char subject[76];                   // 76 B
+        char relation[76];                  // 76 B
+        char object[76];                    // 76 B
+        char prev_object[76];               // 76 B
+    };
+    static_assert(sizeof(OpenVocabFactSlot) == 512, "OpenVocabFactSlot must be 512 bytes");
+
+    struct alignas(PAGE_BYTES) OpenVocabFactPage4KB {
+        OpenVocabFactSlot slots[OPEN_VOCAB_SLOTS_PER_PAGE];
+    };
+    static_assert(sizeof(OpenVocabFactPage4KB) == PAGE_BYTES, "OpenVocabFactPage4KB must be 4096 bytes");
+
+    struct DynamicOpenFact {
+        std::string subject;
+        std::string relation;
+        std::string object;
+        std::string prev_object;
+        std::string subj_norm;
+        std::string rel_norm;
+        std::string obj_norm;
+        uint64_t subj_vec[WORDS_PER_VEC];
+        uint64_t rel_vec[WORDS_PER_VEC];
+        uint64_t obj_vec[WORDS_PER_VEC];
+        uint32_t owner_id;
+    };
+
+    static void copy_str_trunc(char* dst, size_t cap, const std::string& src) {
+        if (!dst || cap == 0) return;
+        size_t n = std::min(src.size(), cap - 1);
+        std::memcpy(dst, src.data(), n);
+        dst[n] = '\0';
+    }
+
+    template <typename Fn>
+    void for_each_open_vocab_slot_4kb(Fn&& fn) const {
+        if (!bank || !bank->base_ptr) return;
+        void* base = bank->base_ptr;
+        const AllocHeader* hdr = bank_alloc_header(base);
+        if (!hdr || hdr->magic != ALLOC_MAGIC || hdr->version != ALLOC_VERSION) return;
+        const uint64_t akey = bank_alloc_key(ALLOC_REGION_FACT, kOpenVocabLexiconOwnerId);
+        const AllocEntry* dir = bank_alloc_dir(base);
+        const uint32_t start = bank_alloc_slot(akey);
+        auto* raw_pages = static_cast<OpenVocabFactPage4KB*>(base);
+
+        for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+            const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+            const AllocEntry& e = dir[idx];
+            if (e.key == 0) break;
+            if (e.key != akey) continue;
+            if (!bank_page_in_region(e.page, ALLOC_REGION_FACT) || e.page >= BANK_TOTAL_BLOCKS) continue;
+            OpenVocabFactPage4KB& page = raw_pages[e.page];
+            for (size_t s = 0; s < OPEN_VOCAB_SLOTS_PER_PAGE; ++s) {
+                if (page.slots[s].magic == OPEN_VOCAB_SLOT_MAGIC) {
+                    if (fn(page.slots[s])) return;
+                }
+            }
+        }
+    }
+
+    static std::string open_vocab_norm(const std::string& s) {
+        auto is_p = [](char c) {
+            return c == '.' || c == ',' || c == '?' || c == '!' || c == ':' || c == ';' ||
+                   c == '"' || c == '\'' || c == '(' || c == ')' || c == ' ';
+        };
+        size_t b = 0, e = s.size();
+        while (b < e && is_p(s[b])) ++b;
+        while (e > b && is_p(s[e - 1])) --e;
+        std::string out;
+        out.reserve(e - b);
+        for (size_t i = b; i < e; ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c >= 'A' && c <= 'Z') {
+                out.push_back(static_cast<char>(c + 32));
+            } else if (c == 0xD0 && i + 1 < e) {
+                unsigned char n = static_cast<unsigned char>(s[i + 1]);
+                if (n >= 0x90 && n <= 0xAF) {
+                    out.push_back(static_cast<char>(0xD0));
+                    out.push_back(static_cast<char>(n + 0x20));
+                    ++i;
+                } else if (n == 0x81) {
+                    out.push_back(static_cast<char>(0xD1));
+                    out.push_back(static_cast<char>(0x91));
+                    ++i;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+        return out;
+    }
+
+    static void open_vocab_sketch_512(const std::string& norm_str, uint64_t* out_bits) {
+        int32_t acc[512];
+        std::memset(acc, 0, sizeof(acc));
+        auto mix_feat = [&](uint64_t seed, int32_t weight) {
+            for (int w = 0; w < WORDS_PER_VEC; ++w) {
+                seed += 0x9E3779B97F4A7C15ULL;
+                uint64_t z = seed;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                z = z ^ (z >> 31);
+                for (int b = 0; b < 64; ++b) {
+                    acc[w * 64 + b] += ((z >> b) & 1ULL) ? weight : -weight;
+                }
+            }
+        };
+        const size_t n = norm_str.size();
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t h = 14695981039346656037ULL;
+            for (size_t l = 1; l <= 4 && i + l <= n; ++l) {
+                h ^= static_cast<unsigned char>(norm_str[i + l - 1]);
+                h *= 1099511628211ULL;
+                int32_t w = (l == 1) ? 1 : ((l == 2) ? 2 : 3);
+                if (i == 0 && l >= 3) w += 3;
+                mix_feat(h ^ (static_cast<uint64_t>(l) << 56), w);
+            }
+        }
+        for (int w = 0; w < WORDS_PER_VEC; ++w) {
+            uint64_t word = 0;
+            for (int b = 0; b < 64; ++b) {
+                if (acc[w * 64 + b] >= 0) word |= (1ULL << b);
+            }
+            out_bits[w] = word;
+        }
+    }
+
+    static uint32_t open_vocab_owner_id(const std::string& subj_norm) {
+        uint32_t h = 2166136261U;
+        for (unsigned char c : subj_norm) {
+            h ^= c;
+            h *= 16777619U;
+        }
+        return 0x20000U | (h & 0xFFFEU);
+    }
+
+    bool store_open_vocab_declarative_4kb(const std::string& user_text, DynamicOpenFact* out_stored = nullptr) {
+        if (!bank || !bank->base_ptr) return false;
+        std::istringstream iss(user_text);
+        std::vector<std::string> raw_toks;
+        std::string tok;
+        while (iss >> tok) {
+            if (tok == "<|user|>" || tok == "." || tok == "!" || tok == "?" || tok == ",") continue;
+            std::string cleaned = open_vocab_norm(tok);
+            if (cleaned.empty()) continue;
+            while (!tok.empty() && (tok.back() == '.' || tok.back() == ',' || tok.back() == '!' || tok.back() == ';' || tok.back() == ':')) {
+                tok.pop_back();
+            }
+            if (!tok.empty()) raw_toks.push_back(tok);
+        }
+        if (raw_toks.size() < 3) return false;
+
+        std::string subj = raw_toks.front();
+        std::string obj  = raw_toks.back();
+        std::string rel;
+        for (size_t i = 1; i + 1 < raw_toks.size(); ++i) {
+            if (raw_toks[i] == "-" || raw_toks[i] == "—") continue;
+            if (!rel.empty()) rel += "_";
+            rel += raw_toks[i];
+        }
+        if (rel.empty()) rel = "связан_с";
+
+        DynamicOpenFact fact{};
+        fact.subject   = subj;
+        fact.relation  = rel;
+        fact.object    = obj;
+        fact.subj_norm = open_vocab_norm(subj);
+        fact.rel_norm  = open_vocab_norm(rel);
+        fact.obj_norm  = open_vocab_norm(obj);
+        if (fact.subj_norm.empty() || fact.rel_norm.empty() || fact.obj_norm.empty()) return false;
+
+        open_vocab_sketch_512(fact.subj_norm, fact.subj_vec);
+        open_vocab_sketch_512(fact.rel_norm,  fact.rel_vec);
+        open_vocab_sketch_512(fact.obj_norm,  fact.obj_vec);
+        fact.owner_id = open_vocab_owner_id(fact.subj_norm);
+
+        uint64_t rel_key[WORDS_PER_VEC];
+        uint64_t rel_val[WORDS_PER_VEC];
+        vsa_make_relational_key_512(fact.subj_vec, fact.rel_vec, rel_key);
+        vsa_bind_xnor_512(rel_key, fact.obj_vec, rel_val);
+        bank_store_rule(bank->base_ptr, ALLOC_REGION_FACT, fact.owner_id, rel_key, rel_val);
+
+        // Persist the open-vocabulary lexicon slot directly inside 4 KB pages in ALLOC_REGION_FACT
+        void* base = bank->base_ptr;
+        bank_alloc_init(base);
+        const uint64_t akey = bank_alloc_key(ALLOC_REGION_FACT, kOpenVocabLexiconOwnerId);
+        const AllocEntry* dir = bank_alloc_dir(base);
+        const uint32_t start = bank_alloc_slot(akey);
+        auto* raw_pages = static_cast<OpenVocabFactPage4KB*>(base);
+
+        OpenVocabFactSlot* free_slot = nullptr;
+        for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+            const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+            const AllocEntry& e = dir[idx];
+            if (e.key == 0) break;
+            if (e.key != akey) continue;
+            if (!bank_page_in_region(e.page, ALLOC_REGION_FACT) || e.page >= BANK_TOTAL_BLOCKS) continue;
+            OpenVocabFactPage4KB& page = raw_pages[e.page];
+            for (size_t s = 0; s < OPEN_VOCAB_SLOTS_PER_PAGE; ++s) {
+                OpenVocabFactSlot& sl = page.slots[s];
+                if (sl.magic == OPEN_VOCAB_SLOT_MAGIC) {
+                    if (open_vocab_norm(sl.subject) == fact.subj_norm &&
+                        open_vocab_norm(sl.relation) == fact.rel_norm) {
+                        if (open_vocab_norm(sl.object) != fact.obj_norm) {
+                            copy_str_trunc(sl.prev_object, sizeof(sl.prev_object), sl.object);
+                            fact.prev_object = sl.prev_object;
+                        } else {
+                            fact.prev_object = sl.prev_object;
+                        }
+                        copy_str_trunc(sl.object, sizeof(sl.object), fact.object);
+                        std::memcpy(sl.obj_vec, fact.obj_vec, sizeof(fact.obj_vec));
+                        if (out_stored) *out_stored = fact;
+                        return true;
+                    }
+                } else if (!free_slot) {
+                    free_slot = &sl;
+                }
+            }
+        }
+
+        if (!free_slot) {
+            uint32_t new_pid = bank_alloc_new_page(base, ALLOC_REGION_FACT, kOpenVocabLexiconOwnerId);
+            if (new_pid == ALLOC_NO_PAGE || new_pid >= BANK_TOTAL_BLOCKS) return false;
+            std::memset(&raw_pages[new_pid], 0, sizeof(OpenVocabFactPage4KB));
+            free_slot = &raw_pages[new_pid].slots[0];
+        }
+
+        std::memset(free_slot, 0, sizeof(OpenVocabFactSlot));
+        free_slot->magic    = OPEN_VOCAB_SLOT_MAGIC;
+        free_slot->owner_id = fact.owner_id;
+        free_slot->flags    = 1U;
+        std::memcpy(free_slot->subj_vec, fact.subj_vec, sizeof(fact.subj_vec));
+        std::memcpy(free_slot->rel_vec,  fact.rel_vec,  sizeof(fact.rel_vec));
+        std::memcpy(free_slot->obj_vec,  fact.obj_vec,  sizeof(fact.obj_vec));
+        copy_str_trunc(free_slot->subject,  sizeof(free_slot->subject),  fact.subject);
+        copy_str_trunc(free_slot->relation, sizeof(free_slot->relation), fact.relation);
+        copy_str_trunc(free_slot->object,   sizeof(free_slot->object),   fact.object);
+        free_slot->prev_object[0] = '\0';
+
+        if (out_stored) *out_stored = fact;
+        return true;
+    }
+
+    bool query_open_vocab_question_4kb(
+        const std::string& user_text,
+        const std::chrono::steady_clock::time_point& t0,
+        DialogueTurnResult* out_res
+    ) const {
+        if (!bank || !bank->base_ptr || !out_res) return false;
+        std::istringstream iss(user_text);
+        std::vector<std::string> q_norms;
+        std::string w;
+        while (iss >> w) {
+            if (w == "<|user|>" || w == "?") continue;
+            std::string cn = open_vocab_norm(w);
+            if (cn.size() >= 2) q_norms.push_back(cn);
+        }
+        if (q_norms.empty()) return false;
+
+        bool found_any = false;
+        OpenVocabFactSlot best_slot{};
+        int32_t best_total_score = -1;
+        int32_t best_resolved_obj_sim = 0;
+        uint32_t best_page_id = ALLOC_NO_PAGE;
+        std::string best_resolved_obj;
+
+        for_each_open_vocab_slot_4kb([&](const OpenVocabFactSlot& df) -> bool {
+            const std::string df_subj_norm = open_vocab_norm(df.subject);
+            const std::string df_rel_norm  = open_vocab_norm(df.relation);
+            int32_t best_subj_sim = -512;
+            size_t matched_q_idx = q_norms.size();
+            for (size_t qi = 0; qi < q_norms.size(); ++qi) {
+                if (q_norms[qi] == df_subj_norm) {
+                    best_subj_sim = 512;
+                    matched_q_idx = qi;
+                    break;
+                }
+                uint64_t q_sk[WORDS_PER_VEC];
+                open_vocab_sketch_512(q_norms[qi], q_sk);
+                int32_t d = vsa_bipolar_dot_512(q_sk, df.subj_vec);
+                if (d > best_subj_sim) {
+                    best_subj_sim = d;
+                    matched_q_idx = qi;
+                }
+            }
+            if (best_subj_sim < 340) return false;
+
+            int32_t best_rel_sim = -512;
+            for (size_t qi = 0; qi < q_norms.size(); ++qi) {
+                if (qi == matched_q_idx) continue;
+                if (df_rel_norm.find(q_norms[qi]) != std::string::npos ||
+                    q_norms[qi].find(df_rel_norm) != std::string::npos) {
+                    best_rel_sim = 512;
+                    break;
+                }
+                if (q_norms[qi].size() >= 5 && df_rel_norm.find(q_norms[qi].substr(0, 5)) != std::string::npos) {
+                    best_rel_sim = std::max<int32_t>(best_rel_sim, 420);
+                }
+                uint64_t qr_sk[WORDS_PER_VEC];
+                open_vocab_sketch_512(q_norms[qi], qr_sk);
+                int32_t rd = vsa_bipolar_dot_512(qr_sk, df.rel_vec);
+                if (rd > best_rel_sim) best_rel_sim = rd;
+            }
+            if (best_rel_sim < 240) return false;
+
+            uint64_t rel_key[WORDS_PER_VEC];
+            vsa_make_relational_key_512(df.subj_vec, df.rel_vec, rel_key);
+            uint64_t retrieved_val[WORDS_PER_VEC];
+            int32_t page_sim = 0;
+            uint32_t page_id = ALLOC_NO_PAGE;
+            int found = bank_query_rule(
+                bank->base_ptr, ALLOC_REGION_FACT, df.owner_id,
+                rel_key, 260, retrieved_val, &page_sim, &page_id
+            );
+            if (!found) return false;
+
+            uint64_t unbound_bits[WORDS_PER_VEC];
+            vsa_bind_xnor_512(rel_key, retrieved_val, unbound_bits);
+
+            int32_t cand_obj_sim = -512;
+            std::string cand_obj_str;
+            for_each_open_vocab_slot_4kb([&](const OpenVocabFactSlot& os_slot) -> bool {
+                int32_t os = vsa_bipolar_dot_512(unbound_bits, os_slot.obj_vec);
+                if (os > cand_obj_sim) {
+                    cand_obj_sim = os;
+                    cand_obj_str = os_slot.object;
+                }
+                return false;
+            });
+            if (cand_obj_sim < 380 || cand_obj_str.empty()) return false;
+
+            int32_t total_sc = best_subj_sim + best_rel_sim + page_sim + cand_obj_sim;
+            if (total_sc > best_total_score) {
+                best_total_score = total_sc;
+                best_slot = df;
+                best_resolved_obj_sim = cand_obj_sim;
+                best_page_id = page_id;
+                best_resolved_obj = cand_obj_str;
+                found_any = true;
+            }
+            return false;
+        });
+
+        if (!found_any || best_resolved_obj.empty()) return false;
+
+        size_t mmu_pages = disarm_hardware_mmu_page_trap(bank);
+        if (mmu_pages == 0 && best_page_id != ALLOC_NO_PAGE) mmu_pages = 1;
+        double elapsed_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0
+        ).count();
+
+        const std::string subj_str(best_slot.subject);
+        const std::string rel_str(best_slot.relation);
+        const std::string prev_str(best_slot.prev_object);
+
+        out_res->user = user_text;
+        out_res->think = "Дедукция по 4 KB VSA странице #" + std::to_string(best_page_id) + " : " +
+                         subj_str + " --[" + rel_str + "]--> " + best_resolved_obj + " .";
+        if (!prev_str.empty()) {
+            out_res->assistant = "По данным 4 KB VSA страницы весов для " + subj_str +
+                                 " (" + rel_str + ") активен " + best_resolved_obj +
+                                 " вместо прежнего " + prev_str + " .";
+        } else {
+            out_res->assistant = "По данным 4 KB VSA страницы весов : " + subj_str +
+                                 " " + rel_str + " " + best_resolved_obj + " .";
+        }
+        out_res->expert_relay_chain = "VSA_4KB_FACT:#" + std::to_string(best_page_id) +
+                                      " [XNOR_sim=" + std::to_string(best_resolved_obj_sim) + "/512]";
+        out_res->mmu_pages = mmu_pages;
+        out_res->latency_us = elapsed_us;
+        return true;
+    }
+
     // Zero-Shot Role-Identity Unbinding at Each Token Step:
     // When the Role-Subspace neural network (`MLGRU + PKM + 4 KB Micro-Experts`)
     // predicts a token `raw_pred`, if `raw_pred` is one of the prototype role slots
@@ -5835,6 +6262,7 @@ struct PureNeuralReasoningEngine {
             int deduced_old_cipher = -1;
             consolidate_declarative_statement_in_4kb_pages(f, &deduced_prop, &deduced_old_cipher);
         }
+        store_open_vocab_declarative_4kb(user_text);
     }
 
     DialogueTurnResult chat_and_reason_native(const std::string& user_text) {
@@ -5843,6 +6271,16 @@ struct PureNeuralReasoningEngine {
 
         std::vector<int> u_ids = tokenizer.encode_line("<|user|> " + user_text, false);
         UnsupervisedSemanticFrame f = parse_frame_unsupervised(u_ids);
+
+        // If this is an open-vocabulary question answered by a fact stored in 4 KB VSA pages,
+        // resolve it directly via ALLOC_REGION_FACT XNOR unbinding before falling back or abstaining.
+        if (user_text.find('?') != std::string::npos &&
+            f.src_entity < 0 && f.dst_entity < 0 && f.host_entity < 0 && f.cipher_entity < 0) {
+            DialogueTurnResult dyn_res;
+            if (query_open_vocab_question_4kb(user_text, t0, &dyn_res)) {
+                return dyn_res;
+            }
+        }
 
         // Honest abstention. The entity named in a question is bound to the frame
         // only if the WORD ITSELF is in the cluster map, so an entity carrying
@@ -5877,6 +6315,32 @@ struct PureNeuralReasoningEngine {
         int deduced_old_cipher = -1;
         if (user_text.find('?') == std::string::npos) {
             consolidate_declarative_statement_in_4kb_pages(f, &deduced_prop, &deduced_old_cipher);
+            if (f.src_entity < 0 && f.host_entity < 0) {
+                const std::vector<int> s_form = content_form_tokens(u_ids);
+                int32_t max_proto_sc = 0;
+                for (const auto& pf : prototype_form_tokens) {
+                    max_proto_sc = std::max(max_proto_sc, prototype_form_score(pf, s_form));
+                }
+                if (max_proto_sc < 640) {
+                    DynamicOpenFact stored_fact{};
+                    if (store_open_vocab_declarative_4kb(user_text, &stored_fact)) {
+                        size_t mmu_pages = disarm_hardware_mmu_page_trap(bank);
+                        double elapsed_us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - t0
+                        ).count();
+                        DialogueTurnResult out;
+                        out.user = user_text;
+                        out.think = "Запись открытой ролевой связки в 4 KB VSA страницу : " +
+                                    stored_fact.subject + " --[" + stored_fact.relation + "]--> " + stored_fact.object + " .";
+                        out.assistant = "Я записал правило для " + stored_fact.subject + " (" +
+                                        stored_fact.relation + " -> " + stored_fact.object + ") в 4 KB VSA страницу весов .";
+                        out.expert_relay_chain = "VSA_4KB_STORE";
+                        out.mmu_pages = (mmu_pages > 0) ? mmu_pages : 1;
+                        out.latency_us = elapsed_us;
+                        return out;
+                    }
+                }
+            }
         }
 
         // Query the 4 KB VSA pages live for the entities in `f` so their Identity Subspace
@@ -6098,6 +6562,10 @@ struct PureNeuralReasoningEngine {
                     if (asst_str.find(w) != std::string::npos) { answered_about_the_subject = true; break; }
                 }
                 if (!answered_about_the_subject) {
+                    DialogueTurnResult dyn_res;
+                    if (query_open_vocab_question_4kb(user_text, t0, &dyn_res)) {
+                        return dyn_res;
+                    }
                     DialogueTurnResult out;
                     out.user = user_text;
                     out.think = "[abstain] the answer does not mention the subject of the question";
@@ -9228,6 +9696,121 @@ struct PopCountGenerativeLLM {
     mutable bool cont_space_ready = false;
     mutable bool cont_emb_synced = false;
 
+    // Morpho-Syntactic Agreement & Inflectional Synthesis Engine
+    enum PosCategory : uint8_t {
+        POS_UNKNOWN    = 0,
+        POS_ADJ        = 1,
+        POS_NOUN       = 2,
+        POS_VERB_FIN   = 3,
+        POS_VERB_INF   = 4,
+        POS_PREP       = 5,
+        POS_CONJ       = 6,
+        POS_CODE_KW    = 7,
+        POS_CODE_IDENT = 8,
+        POS_PUNCT      = 9
+    };
+    enum CaseMask : uint8_t {
+        CASE_NONE = 0,
+        CASE_NOM  = 1 << 0,
+        CASE_GEN  = 1 << 1,
+        CASE_DAT  = 1 << 2,
+        CASE_ACC  = 1 << 3,
+        CASE_INS  = 1 << 4,
+        CASE_PREP = 1 << 5,
+        CASE_ALL  = 0x3F
+    };
+    enum GenderNumMask : uint8_t {
+        GN_MASC_SG = 1 << 0,
+        GN_FEM_SG  = 1 << 1,
+        GN_NEUT_SG = 1 << 2,
+        GN_PLURAL  = 1 << 3,
+        GN_ANY     = 0x0F
+    };
+    struct MorphSignature {
+        uint8_t pos_cat = POS_UNKNOWN;
+        uint8_t case_mask = CASE_ALL;
+        uint8_t gn_mask = GN_ANY;
+        uint8_t governed_case = CASE_NONE;
+        uint64_t stem_hash = 0ULL;
+    };
+    mutable std::vector<MorphSignature> tok_morph_sig;
+    mutable std::unordered_map<uint64_t, std::vector<int>> stem_to_inflected_toks;
+
+    // Code Symbol & Type Scope Tracker
+    enum CodeVarType : uint8_t {
+        CTYPE_UNKNOWN      = 0,
+        CTYPE_PTR_ARRAY    = 1,
+        CTYPE_INT_SCALAR   = 2,
+        CTYPE_FLOAT_SCALAR = 3,
+        CTYPE_BOOL         = 4
+    };
+
+    // Inline Gated DeltaNet Recurrent Fast-Weight State (8 heads x 64 x 64 = 512-D)
+    // Bridges HSSA Gated DeltaNet continuous recurrence directly into PopCountGenerativeLLM
+    struct InlineDeltaNetState {
+        static constexpr int DN_HEADS = 8;
+        static constexpr int DN_DIM   = 64;
+        float S[DN_HEADS][DN_DIM * DN_DIM];
+
+        void reset() {
+            std::memset(S, 0, sizeof(S));
+        }
+
+        void step_and_predict(
+            const int8_t* x_emb512,
+            const float* gain512,
+            int8_t* out_pred512,
+            bool update_state = true
+        ) {
+            const float alpha = 0.94f;
+            const float beta  = 0.26f;
+            for (int h = 0; h < DN_HEADS; ++h) {
+                const int8_t* x_h = x_emb512 + h * DN_DIM;
+                float* S_h = S[h];
+                float q_p[DN_DIM], k_p[DN_DIM], v_p[DN_DIM], g_p[DN_DIM];
+                const int rk = (h * 3 + 1) & (DN_DIM - 1);
+                const int rq = (h * 5 + 3) & (DN_DIM - 1);
+                const int rv = (h * 7 + 5) & (DN_DIM - 1);
+                float k_sq = 0.0f;
+                for (int r = 0; r < DN_DIM; ++r) {
+                    const float x0 = static_cast<float>(x_h[r]);
+                    const float xk = static_cast<float>(x_h[(r + rk) & (DN_DIM - 1)]);
+                    const float xq = static_cast<float>(x_h[(r + rq) & (DN_DIM - 1)]);
+                    const float xv = static_cast<float>(x_h[(r + rv) & (DN_DIM - 1)]);
+                    k_p[r] = 0.85f * x0 + 0.15f * xk;
+                    q_p[r] = 0.85f * x0 - 0.15f * xq;
+                    v_p[r] = 0.90f * x0 + 0.10f * xv;
+                    float z = 0.12f * (0.80f * x0 + 0.20f * xq);
+                    g_p[r] = 0.5f + 0.5f * (z / (1.0f + std::fabs(z)));
+                    k_sq += k_p[r] * k_p[r];
+                }
+                const float inv_kn = (k_sq > 1e-6f) ? (1.0f / std::sqrt(k_sq)) : 0.0f;
+                for (int r = 0; r < DN_DIM; ++r) k_p[r] *= inv_kn;
+
+                for (int r = 0; r < DN_DIM; ++r) {
+                    float* row = &S_h[r * DN_DIM];
+                    if (update_state) {
+                        float v_hat = 0.0f;
+                        for (int c = 0; c < DN_DIM; ++c) v_hat += row[c] * k_p[c];
+                        const float scale_e = beta * (v_p[r] - v_hat);
+                        for (int c = 0; c < DN_DIM; ++c) {
+                            row[c] = alpha * row[c] + scale_e * k_p[c];
+                        }
+                    }
+                    if (out_pred512) {
+                        float dot = 0.0f;
+                        for (int c = 0; c < DN_DIM; ++c) dot += row[c] * q_p[c];
+                        const int d_idx = h * DN_DIM + r;
+                        const float g_scale = gain512 ? gain512[d_idx] : 1.0f;
+                        float u_val = g_scale * (0.45f * static_cast<float>(x_h[r]) + 0.55f * dot * g_p[r]);
+                        int32_t qi = static_cast<int32_t>(std::lround(u_val));
+                        out_pred512[d_idx] = static_cast<int8_t>(std::max(-15, std::min(15, qi)));
+                    }
+                }
+            }
+        }
+    };
+
     std::string last_trained_corpus;
     int last_trained_epochs = 0;
     BrainTrainStats last_stats{};
@@ -9970,6 +10553,243 @@ struct PopCountGenerativeLLM {
                 }
             }
         }
+
+        // 8. Build Morpho-Syntactic Signatures & Root-Stem Inflectional Equivalence Table
+        tok_morph_sig.resize(V);
+        stem_to_inflected_toks.clear();
+        for (size_t t = 0; t < V; ++t) {
+            MorphSignature ms = classify_morph_signature(tokenizer.id_to_word[t]);
+            tok_morph_sig[t] = ms;
+            if (ms.stem_hash != 0ULL && (ms.pos_cat == POS_ADJ || ms.pos_cat == POS_NOUN || ms.pos_cat == POS_VERB_FIN || ms.pos_cat == POS_VERB_INF)) {
+                auto& vec = stem_to_inflected_toks[ms.stem_hash];
+                if (vec.size() < 16) vec.push_back(static_cast<int>(t));
+            }
+        }
+    }
+
+    static MorphSignature classify_morph_signature(const std::string& raw_w) {
+        MorphSignature sig{};
+        if (raw_w.empty() || raw_w[0] == '<') return sig;
+        if (raw_w.size() == 1 && std::ispunct(static_cast<unsigned char>(raw_w[0]))) {
+            sig.pos_cat = POS_PUNCT;
+            return sig;
+        }
+        if (CodeProseTokenizer::is_code_keyword(raw_w) || CodeProseTokenizer::is_type_starter(raw_w)) {
+            sig.pos_cat = POS_CODE_KW;
+            return sig;
+        }
+        bool has_ascii_ident = false;
+        for (unsigned char c : raw_w) {
+            if (c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                has_ascii_ident = true;
+                break;
+            }
+        }
+        std::string nw = hsaa_assoc::normalize(raw_w.c_str());
+        if (nw.empty()) return sig;
+
+        // Preposition government rules (Russian & English)
+        if (nw == "для" || nw == "от" || nw == "из" || nw == "без" || nw == "у" || nw == "около" || nw == "после") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_GEN;
+            return sig;
+        }
+        if (nw == "к" || nw == "по" || nw == "благодаря") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_DAT;
+            return sig;
+        }
+        if (nw == "сквозь" || nw == "через" || nw == "про") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_ACC;
+            return sig;
+        }
+        if (nw == "между" || nw == "над" || nw == "перед") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_INS;
+            return sig;
+        }
+        if (nw == "с" || nw == "со" || nw == "под" || nw == "за") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_INS | CASE_ACC | CASE_GEN;
+            return sig;
+        }
+        if (nw == "в" || nw == "во" || nw == "на") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_ACC | CASE_PREP;
+            return sig;
+        }
+        if (nw == "при" || nw == "о" || nw == "об") {
+            sig.pos_cat = POS_PREP;
+            sig.governed_case = CASE_PREP;
+            return sig;
+        }
+        if (nw == "и" || nw == "а" || nw == "но" || nw == "или" || nw == "что" || nw == "чтобы" || nw == "если" || nw == "когда") {
+            sig.pos_cat = POS_CONJ;
+            return sig;
+        }
+        if (has_ascii_ident) {
+            sig.pos_cat = POS_CODE_IDENT;
+            return sig;
+        }
+
+        // Extract UTF-8 codepoint offsets for Russian suffix & stem analysis
+        std::vector<size_t> cp;
+        cp.reserve(nw.size() + 1);
+        for (size_t i = 0; i < nw.size(); ) {
+            cp.push_back(i);
+            unsigned char c = static_cast<unsigned char>(nw[i]);
+            size_t step = ((c & 0x80u) == 0u) ? 1 : (((c & 0xE0u) == 0xC0u) ? 2 : (((c & 0xF0u) == 0xE0u) ? 3 : 4));
+            i += std::min(step, nw.size() - i);
+        }
+        cp.push_back(nw.size());
+        const size_t n_cp = cp.size() - 1;
+        if (n_cp < 3) return sig;
+
+        auto ends_with_utf8 = [&](const char* suf) -> bool {
+            size_t slen = std::strlen(suf);
+            return nw.size() >= slen && std::memcmp(nw.data() + nw.size() - slen, suf, slen) == 0;
+        };
+
+        size_t stem_cp = (n_cp >= 6) ? (n_cp - 2) : (n_cp - 1);
+        if (ends_with_utf8("ого") || ends_with_utf8("его") || ends_with_utf8("ому") || ends_with_utf8("ему") ||
+            ends_with_utf8("ами") || ends_with_utf8("ями") || ends_with_utf8("ися") || ends_with_utf8("ться")) {
+            if (n_cp >= 6) stem_cp = n_cp - 3;
+        } else if (ends_with_utf8("ый") || ends_with_utf8("ий") || ends_with_utf8("ой") ||
+                   ends_with_utf8("ая") || ends_with_utf8("яя") || ends_with_utf8("ое") ||
+                   ends_with_utf8("ее") || ends_with_utf8("ые") || ends_with_utf8("ие") ||
+                   ends_with_utf8("ым") || ends_with_utf8("им") || ends_with_utf8("ую") ||
+                   ends_with_utf8("юю") || ends_with_utf8("ых") || ends_with_utf8("их") ||
+                   ends_with_utf8("ом") || ends_with_utf8("ем") || ends_with_utf8("ей") ||
+                   ends_with_utf8("ов") || ends_with_utf8("ев") || ends_with_utf8("ам") ||
+                   ends_with_utf8("ям") || ends_with_utf8("ах") || ends_with_utf8("ях") ||
+                   ends_with_utf8("ет") || ends_with_utf8("ит") || ends_with_utf8("ют") ||
+                   ends_with_utf8("ат") || ends_with_utf8("ть")) {
+            if (n_cp >= 5) stem_cp = n_cp - 2;
+        }
+        stem_cp = std::max<size_t>(3, std::min<size_t>(stem_cp, 6));
+        if (stem_cp > n_cp) stem_cp = n_cp;
+        uint64_t sh = 0xCBF29CE484222325ULL;
+        for (size_t b = 0; b < cp[stem_cp]; ++b) {
+            sh ^= static_cast<uint8_t>(nw[b]);
+            sh *= 0x100000001B3ULL;
+        }
+        sig.stem_hash = sh;
+
+        // Classify Russian Verbs
+        if (ends_with_utf8("ться") || ends_with_utf8("тись") ||
+            (n_cp >= 5 && (ends_with_utf8("ать") || ends_with_utf8("ять") || ends_with_utf8("ить") ||
+                           ends_with_utf8("еть") || ends_with_utf8("уть") || ends_with_utf8("оть")))) {
+            sig.pos_cat = POS_VERB_INF;
+            return sig;
+        }
+        if (n_cp >= 4 && (ends_with_utf8("ет") || ends_with_utf8("ит") || ends_with_utf8("ют") ||
+                          ends_with_utf8("ят") || ends_with_utf8("ется") || ends_with_utf8("ится") ||
+                          ends_with_utf8("ются") || ends_with_utf8("ятся"))) {
+            sig.pos_cat = POS_VERB_FIN;
+            sig.gn_mask = (ends_with_utf8("ют") || ends_with_utf8("ят") || ends_with_utf8("ются") || ends_with_utf8("ятся"))
+                ? GN_PLURAL : (GN_MASC_SG | GN_FEM_SG | GN_NEUT_SG);
+            return sig;
+        }
+
+        // Classify Russian Adjectives
+        if (n_cp >= 5) {
+            if (ends_with_utf8("ый") || ends_with_utf8("ий")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_NOM | CASE_ACC;
+                sig.gn_mask = GN_MASC_SG;
+                return sig;
+            }
+            if (ends_with_utf8("ая") || ends_with_utf8("яя")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_NOM;
+                sig.gn_mask = GN_FEM_SG;
+                return sig;
+            }
+            if (ends_with_utf8("ую") || ends_with_utf8("юю")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_ACC;
+                sig.gn_mask = GN_FEM_SG;
+                return sig;
+            }
+            if (ends_with_utf8("ое") || ends_with_utf8("ее")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_NOM | CASE_ACC;
+                sig.gn_mask = GN_NEUT_SG;
+                return sig;
+            }
+            if (ends_with_utf8("ые") || ends_with_utf8("ие") && !ends_with_utf8("ние") && !ends_with_utf8("тие")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_NOM | CASE_ACC;
+                sig.gn_mask = GN_PLURAL;
+                return sig;
+            }
+            if (ends_with_utf8("ого") || ends_with_utf8("его")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_GEN | CASE_ACC;
+                sig.gn_mask = GN_MASC_SG | GN_NEUT_SG;
+                return sig;
+            }
+            if (ends_with_utf8("ому") || ends_with_utf8("ему")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_DAT;
+                sig.gn_mask = GN_MASC_SG | GN_NEUT_SG;
+                return sig;
+            }
+            if (ends_with_utf8("ым") || ends_with_utf8("им")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_INS | CASE_DAT;
+                sig.gn_mask = GN_MASC_SG | GN_NEUT_SG | GN_PLURAL;
+                return sig;
+            }
+            if (ends_with_utf8("ых") || ends_with_utf8("их")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_GEN | CASE_PREP | CASE_ACC;
+                sig.gn_mask = GN_PLURAL;
+                return sig;
+            }
+            if (ends_with_utf8("ой") || ends_with_utf8("ей")) {
+                sig.pos_cat = POS_ADJ;
+                sig.case_mask = CASE_NOM | CASE_GEN | CASE_DAT | CASE_INS | CASE_PREP;
+                sig.gn_mask = GN_MASC_SG | GN_FEM_SG;
+                return sig;
+            }
+        }
+
+        // Classify Russian Nouns by inflectional ending
+        sig.pos_cat = POS_NOUN;
+        if (ends_with_utf8("ами") || ends_with_utf8("ями")) {
+            sig.case_mask = CASE_INS;
+            sig.gn_mask = GN_PLURAL;
+        } else if (ends_with_utf8("ах") || ends_with_utf8("ях")) {
+            sig.case_mask = CASE_PREP;
+            sig.gn_mask = GN_PLURAL;
+        } else if (ends_with_utf8("ов") || ends_with_utf8("ев")) {
+            sig.case_mask = CASE_GEN;
+            sig.gn_mask = GN_PLURAL;
+        } else if (ends_with_utf8("ом") || ends_with_utf8("ем")) {
+            sig.case_mask = CASE_INS | CASE_PREP;
+            sig.gn_mask = GN_MASC_SG | GN_NEUT_SG;
+        } else if (ends_with_utf8("ии") || ends_with_utf8("ие")) {
+            sig.case_mask = ends_with_utf8("ии") ? (CASE_GEN | CASE_DAT | CASE_PREP | CASE_NOM | CASE_ACC) : (CASE_NOM | CASE_ACC);
+            sig.gn_mask = GN_FEM_SG | GN_NEUT_SG | GN_PLURAL;
+        } else if (ends_with_utf8("ке") || ends_with_utf8("не") || ends_with_utf8("ре") || ends_with_utf8("ле") || ends_with_utf8("се") || ends_with_utf8("де") || ends_with_utf8("те")) {
+            sig.case_mask = CASE_DAT | CASE_PREP;
+            sig.gn_mask = GN_MASC_SG | GN_FEM_SG | GN_NEUT_SG;
+        } else if (ends_with_utf8("ку") || ends_with_utf8("ну") || ends_with_utf8("ру") || ends_with_utf8("лу") || ends_with_utf8("су") || ends_with_utf8("ду") || ends_with_utf8("ту") || ends_with_utf8("ю")) {
+            sig.case_mask = CASE_ACC | CASE_DAT;
+            sig.gn_mask = GN_FEM_SG | GN_MASC_SG;
+        } else if (ends_with_utf8("ка") || ends_with_utf8("на") || ends_with_utf8("ра") || ends_with_utf8("ла") || ends_with_utf8("са") || ends_with_utf8("да") || ends_with_utf8("та") || ends_with_utf8("ия") || ends_with_utf8("я")) {
+            sig.case_mask = CASE_NOM | CASE_GEN;
+            sig.gn_mask = GN_FEM_SG | GN_MASC_SG | GN_NEUT_SG;
+        } else if (ends_with_utf8("ы") || ends_with_utf8("и")) {
+            sig.case_mask = CASE_GEN | CASE_NOM | CASE_ACC | CASE_PREP;
+            sig.gn_mask = GN_FEM_SG | GN_PLURAL;
+        } else {
+            sig.case_mask = CASE_NOM | CASE_ACC;
+            sig.gn_mask = GN_MASC_SG;
+        }
+        return sig;
     }
 
     inline void ensure_continuous_representation_space() const {
@@ -11413,10 +12233,32 @@ struct PopCountGenerativeLLM {
     );
 };
 
+static constexpr uint64_t ASSOC_FACT_SLOT_MAGIC = 0x415346414354534CULL; // "ASFACTSL"
+static constexpr uint32_t kAssocLexiconOwnerId = 0x7FFFFFFFU;
+static constexpr size_t ASSOC_SLOTS_PER_PAGE = 8;
+
+struct alignas(64) AssocFactSlot4KB {
+    uint64_t magic;                     // 8 B (non-zero in slot 0 marks 4 KB page occupied)
+    uint32_t fact_idx;                  // 4 B
+    uint32_t flags;                     // 4 B
+    uint64_t skey[hsaa_assoc::kW];      // 64 B
+    uint64_t rkey[hsaa_assoc::kW];      // 64 B
+    uint64_t okey[hsaa_assoc::kW];      // 64 B
+    char subject_raw[100];              // 100 B
+    char relation_raw[100];             // 100 B
+    char object[104];                   // 104 B
+};
+static_assert(sizeof(AssocFactSlot4KB) == 512, "AssocFactSlot4KB must be 512 bytes");
+
+struct alignas(PAGE_BYTES) AssocFactPage4KB {
+    AssocFactSlot4KB slots[ASSOC_SLOTS_PER_PAGE];
+};
+static_assert(sizeof(AssocFactPage4KB) == PAGE_BYTES, "AssocFactPage4KB must be 4096 bytes");
+
 // Partitioned Holographic Superposition Memory with Iterative Explaining-Away Clean-Up (Successive Interference Cancellation).
 // Breaks the single-vector D=512 VSA superposition crosstalk wall (C <= D / (2 ln N)) by routing
 // XOR-bound rules (S (x) R (x) O) across K=64 orthogonal LSH superposition cells and running
-// iterative resonator interference cancellation against the clean codebook.
+// iterative resonator interference cancellation against the 4 KB WeightBank lexicon pages.
 struct HolographicSuperpositionBank {
     static constexpr size_t NUM_CELLS = 64;
     struct Cell {
@@ -11474,34 +12316,27 @@ struct HolographicSuperpositionBank {
         rel_cells[rcid].fact_indices.push_back(idx);
     }
 
-    void rebuild(const std::vector<AssocFact>& facts) {
-        clear();
-        for (size_t i = 0; i < facts.size(); ++i) {
-            add_fact(i, facts[i]);
-        }
-    }
-
-    static const AssocFact* probe_cell_clean_up(
+    template <typename GetFactFn>
+    static bool probe_cell_clean_up(
         const Cell& cell,
-        const std::vector<AssocFact>& facts,
+        GetFactFn&& get_fact,
         const std::string& sn,
         const std::string& rn,
         const uint64_t* qs,
         const uint64_t* qr,
+        AssocFact* out_best,
         int32_t* out_score
     ) {
-        if (cell.fact_indices.empty()) return nullptr;
+        if (cell.fact_indices.empty() || !out_best) return false;
 
         uint64_t q_sr[hsaa_assoc::kW];
         bind_s_r(qs, qr, q_sr);
 
-        // Residual accumulator in [-K, +K]^512 for iterative interference cancellation
         std::array<int32_t, 512> resid = cell.bipolar_acc;
-        const AssocFact* best_fact = nullptr;
+        bool found_best = false;
         int32_t best_score = -2147483647;
 
         for (int iter = 0; iter < 3; ++iter) {
-            // Unbind query q_sr from current holographic residual: unbind_b = resid_b * q_sr_b
             uint64_t unbound_bits[hsaa_assoc::kW] = {0};
             for (size_t w = 0; w < hsaa_assoc::kW; ++w) {
                 uint64_t qw = q_sr[w];
@@ -11518,8 +12353,8 @@ struct HolographicSuperpositionBank {
             size_t dominant_interferer_idx = SIZE_MAX;
             int32_t dominant_interferer_sim = -2147483647;
             for (size_t fidx : cell.fact_indices) {
-                if (fidx >= facts.size()) continue;
-                const AssocFact& cand = facts[fidx];
+                AssocFact cand{};
+                if (!get_fact(fidx, &cand)) continue;
                 int32_t o_sim = hsaa_assoc::dot512(unbound_bits, cand.okey);
                 int32_t ds = (cand.subject_norm == sn) ? 512 : hsaa_assoc::dot512(qs, cand.skey);
                 int32_t dr = (cand.relation_norm == rn) ? 512 : hsaa_assoc::dot512(qr, cand.rkey);
@@ -11531,41 +12366,49 @@ struct HolographicSuperpositionBank {
                         int32_t total = ds + dr + (o_sim / 2);
                         if (total > best_score) {
                             best_score = total;
-                            best_fact = &cand;
+                            *out_best = std::move(cand);
+                            found_best = true;
                         }
                     }
                 } else if (o_sim > dominant_interferer_sim) {
-                    // Only cancel non-matching interferers so we never erase the target fact itself!
                     dominant_interferer_sim = o_sim;
                     dominant_interferer_idx = fidx;
                 }
             }
-            if (best_fact || dominant_interferer_idx == SIZE_MAX) break;
-            // Explain away the strongest non-matching interferer from the holographic cell and re-probe
-            const AssocFact& dom = facts[dominant_interferer_idx];
+            if (found_best || dominant_interferer_idx == SIZE_MAX) break;
+            AssocFact dom{};
+            if (!get_fact(dominant_interferer_idx, &dom)) break;
             uint64_t dom_sr[hsaa_assoc::kW];
             bind_s_r(dom.skey, dom.rkey, dom_sr);
             accumulate_trace(resid, dom_sr, dom.okey, -1);
         }
         if (out_score) *out_score = best_score;
-        return best_fact;
+        return found_best;
     }
 
-    // Unbinds query (qs (x) qr) from dual subject/relation partitioned holographic cells and performs
-    // Iterative Explaining-Away Clean-Up (Successive Interference Cancellation) to eliminate VSA crosstalk noise.
-    const AssocFact* query_clean_up(
-        const std::vector<AssocFact>& facts,
+    template <typename GetFactFn>
+    bool query_clean_up(
+        GetFactFn&& get_fact,
         const std::string& sn,
         const std::string& rn,
         const uint64_t* qs,
-        const uint64_t* qr
+        const uint64_t* qr,
+        AssocFact* out_best
     ) const {
-        if (facts.empty()) return nullptr;
+        if (!out_best) return false;
         int32_t sc_s = -2147483647;
-        const AssocFact* hit_s = probe_cell_clean_up(subj_cells[select_norm_cell(sn)], facts, sn, rn, qs, qr, &sc_s);
+        AssocFact hit_s{};
+        bool ok_s = probe_cell_clean_up(subj_cells[select_norm_cell(sn)], get_fact, sn, rn, qs, qr, &hit_s, &sc_s);
         int32_t sc_r = -2147483647;
-        const AssocFact* hit_r = probe_cell_clean_up(rel_cells[select_norm_cell(rn)], facts, sn, rn, qs, qr, &sc_r);
-        return (sc_r > sc_s) ? hit_r : hit_s;
+        AssocFact hit_r{};
+        bool ok_r = probe_cell_clean_up(rel_cells[select_norm_cell(rn)], get_fact, sn, rn, qs, qr, &hit_r, &sc_r);
+        if (!ok_s && !ok_r) return false;
+        if (ok_r && (!ok_s || sc_r > sc_s)) {
+            *out_best = std::move(hit_r);
+        } else {
+            *out_best = std::move(hit_s);
+        }
+        return true;
     }
 };
 
@@ -11576,9 +12419,9 @@ struct PopCountBrain {
     std::unique_ptr<PopCountGenerativeLLM> llm_engine;
     size_t max_pages;
     size_t active_rules;
-    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> direct_facts;
-    std::vector<AssocFact> assoc_facts;
+    uint32_t assoc_fact_count = 0;
     HolographicSuperpositionBank holo_bank;
+    mutable AssocFact resolved_fact_cache;
     mutable AssocFact synthesized_multihop_fact;
     mutable std::recursive_mutex brain_mutex;
 };
@@ -11587,6 +12430,100 @@ namespace {
 
 constexpr int32_t kAssocMinSubjectDot = 200;
 constexpr int32_t kAssocMinRelationDot = 200;
+
+void assoc_copy_str_trunc(char* dst, size_t cap, const char* src) {
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t n = std::min(std::strlen(src), cap - 1);
+    std::memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+void assoc_slot_to_fact(const AssocFactSlot4KB& slot, AssocFact* out) {
+    if (!out) return;
+    out->subject_raw  = slot.subject_raw;
+    out->relation_raw = slot.relation_raw;
+    out->object       = slot.object;
+    out->subject_norm  = hsaa_assoc::normalize(slot.subject_raw);
+    out->relation_norm = hsaa_assoc::normalize(slot.relation_raw);
+    std::memcpy(out->skey, slot.skey, sizeof(slot.skey));
+    std::memcpy(out->rkey, slot.rkey, sizeof(slot.rkey));
+    std::memcpy(out->okey, slot.okey, sizeof(slot.okey));
+}
+
+template <typename Fn>
+void assoc_for_each_slot_4kb(const PopCountBrain* brain, Fn&& fn) {
+    if (!brain || !brain->bank_guard || !brain->bank_guard->get() || !brain->bank_guard->get()->base_ptr) return;
+    void* base = brain->bank_guard->get()->base_ptr;
+    const AllocHeader* hdr = bank_alloc_header(base);
+    if (!hdr || hdr->magic != ALLOC_MAGIC || hdr->version != ALLOC_VERSION) return;
+    const uint64_t akey = bank_alloc_key(ALLOC_REGION_FACT, kAssocLexiconOwnerId);
+    const AllocEntry* dir = bank_alloc_dir(base);
+    const uint32_t start = bank_alloc_slot(akey);
+    auto* raw_pages = static_cast<AssocFactPage4KB*>(base);
+
+    for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+        const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+        const AllocEntry& e = dir[idx];
+        if (e.key == 0) break;
+        if (e.key != akey) continue;
+        if (!bank_page_in_region(e.page, ALLOC_REGION_FACT) || e.page >= BANK_TOTAL_BLOCKS) continue;
+        AssocFactPage4KB& page = raw_pages[e.page];
+        for (size_t s = 0; s < ASSOC_SLOTS_PER_PAGE; ++s) {
+            if (page.slots[s].magic == ASSOC_FACT_SLOT_MAGIC) {
+                if (fn(page.slots[s])) return;
+            }
+        }
+    }
+}
+
+bool assoc_get_slot_by_idx_4kb(const PopCountBrain* brain, size_t target_idx, AssocFact* out_fact) {
+    bool found = false;
+    assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+        if (static_cast<size_t>(sl.fact_idx) == target_idx) {
+            assoc_slot_to_fact(sl, out_fact);
+            found = true;
+            return true;
+        }
+        return false;
+    });
+    return found;
+}
+
+std::vector<AssocFact> assoc_collect_all_4kb(const PopCountBrain* brain) {
+    std::vector<AssocFact> out;
+    if (!brain || brain->assoc_fact_count == 0) return out;
+    out.reserve(brain->assoc_fact_count);
+    assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+        AssocFact f{};
+        assoc_slot_to_fact(sl, &f);
+        out.push_back(std::move(f));
+        return false;
+    });
+    return out;
+}
+
+void assoc_clear_lexicon_4kb(PopCountBrain* brain) {
+    if (!brain) return;
+    brain->assoc_fact_count = 0;
+    brain->holo_bank.clear();
+    if (brain->bank_guard && brain->bank_guard->get() && brain->bank_guard->get()->base_ptr) {
+        void* base = brain->bank_guard->get()->base_ptr;
+        bank_alloc_init(base);
+        bank_clear_owner_pages(base, ALLOC_REGION_FACT, kAssocLexiconOwnerId);
+    }
+}
+
+void assoc_rebuild_holo_from_4kb(PopCountBrain* brain) {
+    if (!brain) return;
+    brain->holo_bank.clear();
+    assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+        AssocFact f{};
+        assoc_slot_to_fact(sl, &f);
+        brain->holo_bank.add_fact(static_cast<size_t>(sl.fact_idx), f);
+        return false;
+    });
+}
 
 uint32_t assoc_fnv1a32(const std::string& s) {
     uint32_t h = 2166136261U;
@@ -11618,56 +12555,101 @@ void assoc_store_in_bank(PopCountBrain* brain, const AssocFact& f) {
         return;
     }
     void* base = brain->bank_guard->get()->base_ptr;
+    uint64_t bound_val[hsaa_assoc::kW];
     if (!f.subject_norm.empty()) {
-        bank_store_rule(base, ALLOC_REGION_FACT, assoc_subj_owner_id(f.subject_norm), f.rkey, f.okey);
+        vsa_bind_xnor_512(f.rkey, f.okey, bound_val);
+        bank_store_rule(base, ALLOC_REGION_FACT, assoc_subj_owner_id(f.subject_norm), f.rkey, bound_val);
     }
     if (!f.relation_norm.empty()) {
-        bank_store_rule(base, ALLOC_REGION_FACT, assoc_rel_owner_id(f.relation_norm), f.skey, f.okey);
+        vsa_bind_xnor_512(f.skey, f.okey, bound_val);
+        bank_store_rule(base, ALLOC_REGION_FACT, assoc_rel_owner_id(f.relation_norm), f.skey, bound_val);
     }
     if (f.subject_norm.size() >= 6 && f.relation_norm.size() >= 6) {
         uint64_t jkey[hsaa_assoc::kW];
         assoc_make_joint_key(f.skey, f.rkey, jkey);
-        bank_store_rule(base, ALLOC_REGION_FACT, kAssocJointOwnerId, jkey, f.okey);
+        vsa_bind_xnor_512(jkey, f.okey, bound_val);
+        bank_store_rule(base, ALLOC_REGION_FACT, kAssocJointOwnerId, jkey, bound_val);
     }
 }
 
-void assoc_upsert(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
+// Returns true when active_rules should increment (new fact or identical raw duplicate call),
+// or false when an existing fact was overwritten/updated in-place via case-variant deduplication.
+bool assoc_upsert(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
+    if (!brain || !brain->bank_guard || !brain->bank_guard->get() || !brain->bank_guard->get()->base_ptr) {
+        return true;
+    }
+    void* base = brain->bank_guard->get()->base_ptr;
+    bank_alloc_init(base);
+
     const std::string sn = hsaa_assoc::normalize(subject);
     const std::string rn = hsaa_assoc::normalize(relation);
     const std::string on = hsaa_assoc::normalize(object);
-    for (AssocFact& f : brain->assoc_facts) {
-        const bool exact_raw = (f.subject_raw == subject && f.relation_raw == relation);
-        const bool same_norm = (!sn.empty() && !rn.empty() && f.subject_norm == sn && f.relation_norm == rn);
-        if (exact_raw || same_norm) {
-            if (!exact_raw) {
-                auto sit = brain->direct_facts.find(f.subject_raw);
-                if (sit != brain->direct_facts.end()) {
-                    sit->second.erase(f.relation_raw);
-                    if (sit->second.empty()) brain->direct_facts.erase(sit);
+
+    const uint64_t akey = bank_alloc_key(ALLOC_REGION_FACT, kAssocLexiconOwnerId);
+    const AllocEntry* dir = bank_alloc_dir(base);
+    const uint32_t start = bank_alloc_slot(akey);
+    auto* raw_pages = static_cast<AssocFactPage4KB*>(base);
+
+    AssocFactSlot4KB* free_slot = nullptr;
+    for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+        const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+        const AllocEntry& e = dir[idx];
+        if (e.key == 0) break;
+        if (e.key != akey) continue;
+        if (!bank_page_in_region(e.page, ALLOC_REGION_FACT) || e.page >= BANK_TOTAL_BLOCKS) continue;
+        AssocFactPage4KB& page = raw_pages[e.page];
+        for (size_t s = 0; s < ASSOC_SLOTS_PER_PAGE; ++s) {
+            AssocFactSlot4KB& sl = page.slots[s];
+            if (sl.magic == ASSOC_FACT_SLOT_MAGIC) {
+                const bool exact_raw = (std::strncmp(sl.subject_raw, subject, sizeof(sl.subject_raw) - 1) == 0 &&
+                                        std::strncmp(sl.relation_raw, relation, sizeof(sl.relation_raw) - 1) == 0);
+                const std::string sl_sn = hsaa_assoc::normalize(sl.subject_raw);
+                const std::string sl_rn = hsaa_assoc::normalize(sl.relation_raw);
+                const bool same_norm = (!sn.empty() && !rn.empty() && sl_sn == sn && sl_rn == rn);
+                if (exact_raw || same_norm) {
+                    const bool identical_call = exact_raw &&
+                        (std::strncmp(sl.object, object, sizeof(sl.object) - 1) == 0);
+                    assoc_copy_str_trunc(sl.subject_raw,  sizeof(sl.subject_raw),  subject);
+                    assoc_copy_str_trunc(sl.relation_raw, sizeof(sl.relation_raw), relation);
+                    assoc_copy_str_trunc(sl.object,       sizeof(sl.object),       object);
+                    hsaa_assoc::sketch(on.empty() ? std::string(sl.object) : on, sl.okey);
+
+                    AssocFact updated{};
+                    assoc_slot_to_fact(sl, &updated);
+                    assoc_store_in_bank(brain, updated);
+                    assoc_rebuild_holo_from_4kb(brain);
+                    return identical_call;
                 }
-                f.subject_raw = subject;
-                f.relation_raw = relation;
+            } else if (!free_slot) {
+                free_slot = &sl;
             }
-            f.object = object;
-            hsaa_assoc::sketch(on.empty() ? f.object : on, f.okey);
-            assoc_store_in_bank(brain, f);
-            brain->holo_bank.rebuild(brain->assoc_facts);
-            return;
         }
     }
-    AssocFact f;
-    f.subject_raw = subject;
-    f.relation_raw = relation;
-    f.object = object;
-    f.subject_norm = sn;
-    f.relation_norm = rn;
-    hsaa_assoc::sketch(f.subject_norm, f.skey);
-    hsaa_assoc::sketch(f.relation_norm, f.rkey);
-    hsaa_assoc::sketch(on.empty() ? f.object : on, f.okey);
+
+    if (!free_slot) {
+        uint32_t new_pid = bank_alloc_new_page(base, ALLOC_REGION_FACT, kAssocLexiconOwnerId);
+        if (new_pid == ALLOC_NO_PAGE || new_pid >= BANK_TOTAL_BLOCKS) return false;
+        std::memset(&raw_pages[new_pid], 0, sizeof(AssocFactPage4KB));
+        free_slot = &raw_pages[new_pid].slots[0];
+    }
+
+    const uint32_t new_idx = brain->assoc_fact_count++;
+    std::memset(free_slot, 0, sizeof(AssocFactSlot4KB));
+    free_slot->magic    = ASSOC_FACT_SLOT_MAGIC;
+    free_slot->fact_idx = new_idx;
+    free_slot->flags    = 1U;
+    assoc_copy_str_trunc(free_slot->subject_raw,  sizeof(free_slot->subject_raw),  subject);
+    assoc_copy_str_trunc(free_slot->relation_raw, sizeof(free_slot->relation_raw), relation);
+    assoc_copy_str_trunc(free_slot->object,       sizeof(free_slot->object),       object);
+    hsaa_assoc::sketch(sn, free_slot->skey);
+    hsaa_assoc::sketch(rn, free_slot->rkey);
+    hsaa_assoc::sketch(on.empty() ? std::string(free_slot->object) : on, free_slot->okey);
+
+    AssocFact f{};
+    assoc_slot_to_fact(*free_slot, &f);
     assoc_store_in_bank(brain, f);
-    const size_t new_idx = brain->assoc_facts.size();
-    brain->assoc_facts.push_back(std::move(f));
-    brain->holo_bank.add_fact(new_idx, brain->assoc_facts.back());
+    brain->holo_bank.add_fact(static_cast<size_t>(new_idx), f);
+    return true;
 }
 
 bool is_hierarchy_or_causal_relation(const std::string& rn) {
@@ -11685,8 +12667,7 @@ bool is_hierarchy_or_causal_relation(const std::string& rn) {
 }
 
 // Multi-Hop Transitive & Taxonomic Deduction (2..3 hops: S -[R1]-> M1 -[R2]-> M2 -[R_target]-> O)
-// Enables true multi-step logical inference and property inheritance across entity hierarchies
-// without any false positives on flat 1-hop relation tables.
+// Reads fact chains directly from the 4 KB AssocFactPage4KB pages in ALLOC_REGION_FACT.
 const AssocFact* assoc_deduce_multihop(
     const PopCountBrain* brain,
     const std::string& sn,
@@ -11694,11 +12675,13 @@ const AssocFact* assoc_deduce_multihop(
     const uint64_t* qs,
     const uint64_t* qr
 ) {
-    if (!brain || brain->assoc_facts.size() < 2 || sn.empty() || rn.empty()) return nullptr;
+    if (!brain || brain->assoc_fact_count < 2 || sn.empty() || rn.empty()) return nullptr;
 
-    // Collect 1-hop outgoing edges from subject S (exact or high-confidence morphological match)
+    std::vector<AssocFact> page_facts = assoc_collect_all_4kb(brain);
+    if (page_facts.size() < 2) return nullptr;
+
     std::vector<const AssocFact*> hop1_edges;
-    for (const AssocFact& f1 : brain->assoc_facts) {
+    for (const AssocFact& f1 : page_facts) {
         const bool subj_match = (f1.subject_norm == sn) ||
                                 (sn.size() >= 5 && f1.subject_norm.size() >= 5 && hsaa_assoc::dot512(qs, f1.skey) >= 280);
         if (subj_match) {
@@ -11720,7 +12703,7 @@ const AssocFact* assoc_deduce_multihop(
         const bool f1_hier = is_hierarchy_or_causal_relation(f1->relation_norm);
         if (!f1_hier && !f1_same_rel) continue;
 
-        for (const AssocFact& f2 : brain->assoc_facts) {
+        for (const AssocFact& f2 : page_facts) {
             if (&f2 == f1) continue;
             const bool m1_match = (f2.subject_norm == mid1_norm) ||
                                   (mid1_norm.size() >= 5 && f2.subject_norm.size() >= 5 && hsaa_assoc::dot512(m1_sk, f2.skey) >= 340);
@@ -11729,9 +12712,6 @@ const AssocFact* assoc_deduce_multihop(
             const int32_t dr2 = hsaa_assoc::dot512(qr, f2.rkey);
             const bool f2_matches_query_rel = (f2.relation_norm == rn) || (dr2 >= 240);
 
-            // 2-Hop Deduction:
-            // Case A: Taxonomic/Causal Property Inheritance (S -[is_a/part_of/connects]-> M1 -[R_query]-> O)
-            // Case B: Transitive Chain (S -[R_query]-> M1 -[R_query]-> O)
             if ((f1_hier || f1_same_rel) && f2_matches_query_rel) {
                 int32_t sc = dr2 + (f1_hier ? 512 : 256) + (f1_same_rel ? 256 : 0);
                 if (sc > best_deduced_score) {
@@ -11740,7 +12720,6 @@ const AssocFact* assoc_deduce_multihop(
                 }
             }
 
-            // 3-Hop Deduction: S -> M1 -> M2 -[R_query]-> O (requires intermediate hop f2 to also be hierarchical/causal or same_rel)
             const bool f2_hier = is_hierarchy_or_causal_relation(f2.relation_norm);
             if (!f2_hier && !f2_matches_query_rel) continue;
 
@@ -11749,7 +12728,7 @@ const AssocFact* assoc_deduce_multihop(
             uint64_t m2_sk[hsaa_assoc::kW];
             hsaa_assoc::sketch(mid2_norm, m2_sk);
 
-            for (const AssocFact& f3 : brain->assoc_facts) {
+            for (const AssocFact& f3 : page_facts) {
                 if (&f3 == f1 || &f3 == &f2) continue;
                 const bool m2_match = (f3.subject_norm == mid2_norm) ||
                                       (mid2_norm.size() >= 5 && f3.subject_norm.size() >= 5 && hsaa_assoc::dot512(m2_sk, f3.skey) >= 340);
@@ -11777,6 +12756,21 @@ const AssocFact* assoc_deduce_multihop(
 }
 
 const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, const char* relation) {
+    if (!brain || !subject || !relation) return nullptr;
+
+    // 0. Exact raw-string slot check in 4 KB AssocFactPage4KB pages (covers symbolic/punctuation strings too)
+    bool exact_raw_hit = false;
+    assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+        if (std::strncmp(sl.subject_raw, subject, sizeof(sl.subject_raw) - 1) == 0 &&
+            std::strncmp(sl.relation_raw, relation, sizeof(sl.relation_raw) - 1) == 0) {
+            assoc_slot_to_fact(sl, &brain->resolved_fact_cache);
+            exact_raw_hit = true;
+            return true;
+        }
+        return false;
+    });
+    if (exact_raw_hit) return &brain->resolved_fact_cache;
+
     const std::string sn = hsaa_assoc::normalize(subject);
     const std::string rn = hsaa_assoc::normalize(relation);
     uint64_t qs[hsaa_assoc::kW];
@@ -11784,94 +12778,126 @@ const AssocFact* assoc_lookup(const PopCountBrain* brain, const char* subject, c
     hsaa_assoc::sketch(sn, qs);
     hsaa_assoc::sketch(rn, qr);
 
-    // 1. Primary path: hardware-backed 4 KB VSA bank associative lookup via bank_query_rule
-    if (brain && brain->bank_guard && brain->bank_guard->get() && brain->bank_guard->get()->base_ptr) {
+    // 1. Primary path: hardware-backed 4 KB VSA bank lookup across all open-addressed pages in ALLOC_REGION_FACT
+    if (brain->bank_guard && brain->bank_guard->get() && brain->bank_guard->get()->base_ptr) {
         const void* base = brain->bank_guard->get()->base_ptr;
-        const AssocFact* best_bank_fact = nullptr;
+        const AllocHeader* hdr = bank_alloc_header(const_cast<void*>(base));
+        bool found_bank_fact = false;
         int32_t best_bank_score = -2147483647;
 
-        auto resolve_from_val_bits = [&](const uint64_t* val_bits, int mode) {
-            for (const AssocFact& f : brain->assoc_facts) {
-                const int32_t do_sim = vsa_bipolar_dot_512(val_bits, f.okey);
-                if (do_sim < 480) continue;
-                const int32_t ds = hsaa_assoc::dot512(qs, f.skey);
-                const int32_t dr = hsaa_assoc::dot512(qr, f.rkey);
+        auto resolve_from_val_bits = [&](const uint64_t* val_bits, int32_t key_sim, int mode) {
+            assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+                const int32_t do_sim = vsa_bipolar_dot_512(val_bits, sl.okey);
+                if (do_sim < 480) return false;
+                const std::string f_sn = hsaa_assoc::normalize(sl.subject_raw);
+                const std::string f_rn = hsaa_assoc::normalize(sl.relation_raw);
+                const int32_t ds = hsaa_assoc::dot512(qs, sl.skey);
+                const int32_t dr = hsaa_assoc::dot512(qr, sl.rkey);
                 bool eligible = false;
                 if (mode == 0) {
-                    eligible = (sn == f.subject_norm) && (dr >= kAssocMinRelationDot);
+                    eligible = (sn == f_sn) && (dr >= kAssocMinRelationDot);
                 } else if (mode == 1) {
-                    eligible = (rn == f.relation_norm) && (ds >= kAssocMinSubjectDot);
+                    eligible = (rn == f_rn) && (ds >= kAssocMinSubjectDot);
                 } else {
                     eligible = (sn.size() >= 6 && rn.size() >= 6 &&
-                                f.subject_norm.size() >= 6 && f.relation_norm.size() >= 6 &&
+                                f_sn.size() >= 6 && f_rn.size() >= 6 &&
                                 ds >= 320 && dr >= 320);
                 }
-                if (!eligible) continue;
-                const int32_t score = ds + dr + (do_sim == 512 ? 2048 : do_sim);
+                if (!eligible) return false;
+                const int32_t exact_bonus = (sn == f_sn && rn == f_rn) ? 4096 : 0;
+                const int32_t score = exact_bonus + ds + dr + key_sim + (do_sim == 512 ? 2048 : do_sim);
                 if (score > best_bank_score) {
                     best_bank_score = score;
-                    best_bank_fact = &f;
+                    assoc_slot_to_fact(sl, &brain->resolved_fact_cache);
+                    found_bank_fact = true;
+                }
+                return false;
+            });
+        };
+
+        auto scan_owner_4kb_pages = [&](uint32_t owner_id, const uint64_t* query_key, int32_t min_dot, int mode) {
+            if (hdr->magic != ALLOC_MAGIC || hdr->version != ALLOC_VERSION) return;
+            const uint64_t akey = bank_alloc_key(ALLOC_REGION_FACT, owner_id);
+            const AllocEntry* dir = bank_alloc_dir(const_cast<void*>(base));
+            const uint32_t start = bank_alloc_slot(akey);
+            const auto* bank_pages = static_cast<const TernaryMLPExpertPage*>(base);
+
+            for (uint32_t i = 0; i < ALLOC_DIR_SLOTS; ++i) {
+                const uint32_t idx = (start + i) & (ALLOC_DIR_SLOTS - 1);
+                const AllocEntry& e = dir[idx];
+                if (e.key == 0) break;
+                if (e.key != akey) continue;
+                if (!bank_page_in_region(e.page, ALLOC_REGION_FACT) || e.page >= BANK_TOTAL_BLOCKS) continue;
+                const auto& page = bank_pages[e.page];
+                for (size_t r = 0; r < D_BOTTLENECK; ++r) {
+                    if ((page.w_down_pos[r][0] | page.w_down_neg[r][0]) == 0ULL) continue;
+                    const int32_t ksim = vsa_bipolar_dot_512(query_key, page.w_down_pos[r]);
+                    if (ksim >= min_dot) {
+                        uint64_t unbound_okey[hsaa_assoc::kW];
+                        vsa_bind_xnor_512(page.w_down_pos[r], page.w_up_pos[r], unbound_okey);
+                        resolve_from_val_bits(unbound_okey, ksim, mode);
+                    }
                 }
             }
         };
 
-        uint64_t val_bits[WORDS_PER_VEC];
-        int32_t sim = 0;
-        uint32_t pid = ALLOC_NO_PAGE;
-        if (!sn.empty() &&
-            bank_query_rule(base, ALLOC_REGION_FACT, assoc_subj_owner_id(sn),
-                            qr, kAssocMinRelationDot, val_bits, &sim, &pid)) {
-            resolve_from_val_bits(val_bits, 0);
+        if (!sn.empty()) {
+            scan_owner_4kb_pages(assoc_subj_owner_id(sn), qr, kAssocMinRelationDot, 0);
         }
-        if (!rn.empty() &&
-            bank_query_rule(base, ALLOC_REGION_FACT, assoc_rel_owner_id(rn),
-                            qs, kAssocMinSubjectDot, val_bits, &sim, &pid)) {
-            resolve_from_val_bits(val_bits, 1);
+        if (!rn.empty() && !found_bank_fact) {
+            scan_owner_4kb_pages(assoc_rel_owner_id(rn), qs, kAssocMinSubjectDot, 1);
         }
-        if (sn.size() >= 6 && rn.size() >= 6) {
+        if (sn.size() >= 6 && rn.size() >= 6 && !found_bank_fact) {
             uint64_t jkey[hsaa_assoc::kW];
             assoc_make_joint_key(qs, qr, jkey);
-            if (bank_query_rule(base, ALLOC_REGION_FACT, kAssocJointOwnerId,
-                                jkey, 320, val_bits, &sim, &pid)) {
-                resolve_from_val_bits(val_bits, 2);
-            }
+            scan_owner_4kb_pages(kAssocJointOwnerId, jkey, 320, 2);
         }
-        if (best_bank_fact) return best_bank_fact;
+        if (found_bank_fact) return &brain->resolved_fact_cache;
     }
 
     // 2. Partitioned Holographic Superposition Clean-Up with Iterative Interference Cancellation
-    if (brain) {
-        const AssocFact* holo_hit = brain->holo_bank.query_clean_up(brain->assoc_facts, sn, rn, qs, qr);
-        if (holo_hit) {
-            const int32_t ds = hsaa_assoc::dot512(qs, holo_hit->skey);
-            const int32_t dr = hsaa_assoc::dot512(qr, holo_hit->rkey);
-            const bool valid_holo = ((sn == holo_hit->subject_norm) && dr >= kAssocMinRelationDot) ||
-                                    ((rn == holo_hit->relation_norm) && ds >= kAssocMinSubjectDot) ||
+    if (brain->assoc_fact_count > 0) {
+        AssocFact holo_hit{};
+        auto get_fact_fn = [&](size_t fidx, AssocFact* out_f) -> bool {
+            return assoc_get_slot_by_idx_4kb(brain, fidx, out_f);
+        };
+        if (brain->holo_bank.query_clean_up(get_fact_fn, sn, rn, qs, qr, &holo_hit)) {
+            const int32_t ds = hsaa_assoc::dot512(qs, holo_hit.skey);
+            const int32_t dr = hsaa_assoc::dot512(qr, holo_hit.rkey);
+            const bool valid_holo = ((sn == holo_hit.subject_norm) && dr >= kAssocMinRelationDot) ||
+                                    ((rn == holo_hit.relation_norm) && ds >= kAssocMinSubjectDot) ||
                                     (sn.size() >= 6 && rn.size() >= 6 && ds >= 320 && dr >= 320);
-            if (valid_holo) return holo_hit;
+            if (valid_holo) {
+                brain->resolved_fact_cache = std::move(holo_hit);
+                return &brain->resolved_fact_cache;
+            }
         }
     }
 
-    // 3. Direct VSA resonance scan
-    const AssocFact* best = nullptr;
+    // 3. Direct VSA resonance scan over 4 KB AssocFactPage4KB pages
+    bool found_res = false;
     int32_t best_score = -2147483647;
-    for (const AssocFact& f : brain->assoc_facts) {
-        const int32_t ds = hsaa_assoc::dot512(qs, f.skey);
-        const int32_t dr = hsaa_assoc::dot512(qr, f.rkey);
-        const bool same_subject = (sn == f.subject_norm) && dr >= kAssocMinRelationDot;
-        const bool same_relation = (rn == f.relation_norm) && ds >= kAssocMinSubjectDot;
+    assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+        const std::string f_sn = hsaa_assoc::normalize(sl.subject_raw);
+        const std::string f_rn = hsaa_assoc::normalize(sl.relation_raw);
+        const int32_t ds = hsaa_assoc::dot512(qs, sl.skey);
+        const int32_t dr = hsaa_assoc::dot512(qr, sl.rkey);
+        const bool same_subject = (sn == f_sn) && dr >= kAssocMinRelationDot;
+        const bool same_relation = (rn == f_rn) && ds >= kAssocMinSubjectDot;
         const bool high_joint_resonance =
             (sn.size() >= 6 && rn.size() >= 6 &&
-             f.subject_norm.size() >= 6 && f.relation_norm.size() >= 6 &&
+             f_sn.size() >= 6 && f_rn.size() >= 6 &&
              ds >= 320 && dr >= 320);
-        if (!same_subject && !same_relation && !high_joint_resonance) continue;
+        if (!same_subject && !same_relation && !high_joint_resonance) return false;
         const int32_t score = ds + dr;
         if (score > best_score) {
             best_score = score;
-            best = &f;
+            assoc_slot_to_fact(sl, &brain->resolved_fact_cache);
+            found_res = true;
         }
-    }
-    if (best) return best;
+        return false;
+    });
+    if (found_res) return &brain->resolved_fact_cache;
 
     // 4. Multi-Hop Transitive & Taxonomic Deduction (2..3 hops across entity chains)
     return assoc_deduce_multihop(brain, sn, rn, qs, qr);
@@ -12081,6 +13107,7 @@ int PopCountGenerativeLLM::generate(
     }
     out_text[0] = '\0';
 
+    std::vector<AssocFact> page_facts = assoc_collect_all_4kb(brain);
     struct FactTokens {
         std::vector<int> s_toks;
         std::vector<int> r_toks;
@@ -12088,8 +13115,8 @@ int PopCountGenerativeLLM::generate(
         const AssocFact* assoc_ptr;
     };
     std::vector<FactTokens> live_facts;
-    live_facts.reserve(brain->assoc_facts.size() * 2);
-    for (const AssocFact& af : brain->assoc_facts) {
+    live_facts.reserve(page_facts.size() * 2);
+    for (const AssocFact& af : page_facts) {
         FactTokens ft;
         ft.s_toks = tokenizer.tokenize_segment(af.subject_raw, true, false);
         ft.r_toks = tokenizer.tokenize_segment(af.relation_raw, true, false);
@@ -12579,14 +13606,83 @@ int PopCountGenerativeLLM::generate(
         }
     }
 
+    ensure_continuous_representation_space();
     if (sublinear_net) {
-        ensure_continuous_representation_space();
         sublinear_net->reset_state();
         for (size_t i = 0; i + 1 < ctx.size(); ++i) {
             if (ctx[i] >= 0 && ctx[i] < sublinear_net->vocab_size) {
                 uint32_t eids[16];
                 int32_t escores[16];
                 sublinear_net->step_mlgru_and_route(ctx[i], false, eids, escores);
+            }
+        }
+    }
+
+    // Initialize Inline Gated DeltaNet Recurrent Fast-Weight State (8 heads x 64 x 64)
+    InlineDeltaNetState dn_state;
+    dn_state.reset();
+    for (size_t i = 0; i + 1 < ctx.size(); ++i) {
+        int ct = ctx[i];
+        if (ct >= 0 && static_cast<size_t>(ct) < tok_cont_emb.size()) {
+            dn_state.step_and_predict(tok_cont_emb[ct].data(), sgd_transition_gain.data(), nullptr, true);
+        }
+    }
+
+    // Initialize Incremental Code Symbol & Type Scope Tracker
+    std::unordered_map<int, CodeVarType> scope_var_types;
+    std::unordered_map<int, int> scope_var_depth;
+    auto update_code_symbol_from_window = [&](const std::vector<int>& seq, size_t pos, int cur_brace_d) {
+        if (pos == 0 || pos >= seq.size()) return;
+        int t = seq[pos];
+        if (t < 0 || static_cast<size_t>(t) >= tokenizer.id_to_word.size()) return;
+        const std::string& w = tokenizer.id_to_word[t];
+        if (!CodeProseTokenizer::is_identifier_str(w) ||
+            CodeProseTokenizer::is_code_keyword(w) ||
+            CodeProseTokenizer::is_type_starter(w)) {
+            return;
+        }
+        int prev1 = seq[pos - 1];
+        const std::string& p1w = (prev1 >= 0 && static_cast<size_t>(prev1) < tokenizer.id_to_word.size())
+            ? tokenizer.id_to_word[prev1] : "";
+        int prev2 = (pos >= 2) ? seq[pos - 2] : -1;
+        const std::string& p2w = (prev2 >= 0 && static_cast<size_t>(prev2) < tokenizer.id_to_word.size())
+            ? tokenizer.id_to_word[prev2] : "";
+        int next1 = (pos + 1 < seq.size()) ? seq[pos + 1] : -1;
+        const std::string& n1w = (next1 >= 0 && static_cast<size_t>(next1) < tokenizer.id_to_word.size())
+            ? tokenizer.id_to_word[next1] : "";
+
+        if (p1w == "*" || n1w == "[" || p2w == "vector" || p1w == "arr" ||
+            w.find("buf") != std::string::npos || w.find("arr") != std::string::npos ||
+            w.find("ptr") != std::string::npos || w.find("data") != std::string::npos ||
+            w.find("vec") != std::string::npos) {
+            scope_var_types[t] = CTYPE_PTR_ARRAY;
+            if (scope_var_depth.find(t) == scope_var_depth.end()) scope_var_depth[t] = cur_brace_d;
+        } else if (p1w == "float" || p1w == "double") {
+            scope_var_types[t] = CTYPE_FLOAT_SCALAR;
+            if (scope_var_depth.find(t) == scope_var_depth.end()) scope_var_depth[t] = cur_brace_d;
+        } else if (p1w == "bool") {
+            scope_var_types[t] = CTYPE_BOOL;
+            if (scope_var_depth.find(t) == scope_var_depth.end()) scope_var_depth[t] = cur_brace_d;
+        } else if (CodeProseTokenizer::is_type_starter(p1w) || n1w == "=" ||
+                   (p1w == "," && scope_var_types.find(prev2) != scope_var_types.end())) {
+            if (scope_var_types.find(t) == scope_var_types.end()) {
+                scope_var_types[t] = CTYPE_INT_SCALAR;
+                scope_var_depth[t] = cur_brace_d;
+            }
+        }
+    };
+    {
+        int scan_bd = 0;
+        for (size_t i = 0; i < ctx.size(); ++i) {
+            if (ctx[i] == id_lbrace) ++scan_bd;
+            else if (ctx[i] == id_rbrace && scan_bd > 0) --scan_bd;
+            update_code_symbol_from_window(ctx, i, scan_bd);
+        }
+        for (size_t r = 0; r < reg_to_tok.size(); ++r) {
+            int rt = reg_to_tok[r];
+            if (rt >= 0 && scope_var_types.find(rt) == scope_var_types.end()) {
+                scope_var_types[rt] = (r == 0) ? CTYPE_PTR_ARRAY : CTYPE_INT_SCALAR;
+                scope_var_depth[rt] = (r < 4) ? 0 : 1;
             }
         }
     }
@@ -12727,29 +13823,51 @@ int PopCountGenerativeLLM::generate(
                     exact_is_ambiguous = true;
                 }
             }
-            if (exact_is_ambiguous &&
+            if ((exact_is_ambiguous || highest_exact_L <= 3) &&
                 sublinear_net && sublinear_net->multi_scale_vsa_trained &&
                 sublinear_net->bank && sublinear_net->bank->base_ptr && ctx.size() >= 2) {
                 const auto* pages = static_cast<const TernaryMLPExpertPage*>(sublinear_net->bank->base_ptr);
                 const int max_vsa_L = static_cast<int>(std::min<size_t>(ctx.size(), 4));
-                for (int L = max_vsa_L; L > highest_exact_L && L >= 2; --L) {
+                const int active_vsa_vocab = static_cast<int>(
+                    std::min<size_t>(tokenizer.id_to_word.size(), static_cast<size_t>(sublinear_net->vocab_size)));
+                for (int L = max_vsa_L; L >= 2; --L) {
                     uint64_t key_bits[WORDS_PER_VEC];
                     sublinear_net->compute_vsa_context_key_512(&ctx[ctx.size() - static_cast<size_t>(L)], L, key_bits);
                     uint32_t matched_pid = 0;
                     int matched_slot = -1;
-                    int32_t soft_dot = 0;
-                    if (sublinear_net->probe_vsa_context_soft_hamming(pages, key_bits, L, &matched_pid, &matched_slot, &soft_dot)) {
+                    // 1) Exact 4 KB VSA page slot lookup in the 1.0 GB bank
+                    if (NativeSublinearLLM::probe_vsa_context_page_slot(pages, key_bits, &matched_pid, &matched_slot)) {
                         int32_t vsim = 0;
                         int resolved_tok = vsa_resolve_token_popcnt(
                             pages[matched_pid].w_up_pos[matched_slot],
                             sublinear_net->vocab_pos.data(),
-                            static_cast<int>(std::min<size_t>(tokenizer.id_to_word.size(), static_cast<size_t>(sublinear_net->vocab_size))),
+                            active_vsa_vocab,
                             &vsim
                         );
                         if (resolved_tok >= 0 && vsim >= 480) {
-                            int64_t soft_sc = static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(soft_dot) * 8LL;
-                            cands.max_score(resolved_tok, soft_sc, L);
-                            break;
+                            if (cands.contains(resolved_tok)) {
+                                cands.add_score(resolved_tok, static_cast<int64_t>(L) * 2048LL, L);
+                            } else if (L > highest_exact_L) {
+                                cands.max_score(resolved_tok, static_cast<int64_t>(L) * 65536LL + 4096LL, L);
+                            }
+                        }
+                    }
+                    // 2) Soft Hamming LSH 4 KB VSA page lookup for unseen/OOV contexts
+                    if (exact_is_ambiguous && L > highest_exact_L) {
+                        int32_t soft_dot = 0;
+                        if (sublinear_net->probe_vsa_context_soft_hamming(pages, key_bits, L, &matched_pid, &matched_slot, &soft_dot)) {
+                            int32_t vsim = 0;
+                            int resolved_tok = vsa_resolve_token_popcnt(
+                                pages[matched_pid].w_up_pos[matched_slot],
+                                sublinear_net->vocab_pos.data(),
+                                active_vsa_vocab,
+                                &vsim
+                            );
+                            if (resolved_tok >= 0 && vsim >= 480) {
+                                int64_t soft_sc = static_cast<int64_t>(L) * 65536LL + static_cast<int64_t>(soft_dot) * 8LL;
+                                cands.max_score(resolved_tok, soft_sc, L);
+                                break;
+                            }
                         }
                     }
                 }
@@ -12986,7 +14104,11 @@ int PopCountGenerativeLLM::generate(
             pack_activation_bitplanes(deep_interp_state, sb, mp);
             has_ste_out = true;
 
-            if (used_unigram_fallback) {
+            int cur_max_L = 0;
+            for (size_t ci = 0; ci < cands.size(); ++ci) {
+                if (cands.max_L[ci] > cur_max_L) cur_max_L = cands.max_L[ci];
+            }
+            if (used_unigram_fallback || cur_max_L <= 2) {
                 int32_t ste_top_score = 0;
                 int ste_top_tok = compute_vocab_argmax_popcnt(
                     deep_interp_state,
@@ -12995,8 +14117,9 @@ int PopCountGenerativeLLM::generate(
                     static_cast<int>(std::min<size_t>(tokenizer.id_to_word.size(), static_cast<size_t>(sublinear_net->vocab_size))),
                     &ste_top_score
                 );
-                if (ste_top_tok >= 0 && ste_top_score > 0 && !cands.contains(ste_top_tok)) {
-                    cands.add_score(ste_top_tok, 128LL);
+                if (ste_top_tok >= 0 && ste_top_score > 0 && !cands.contains(ste_top_tok) &&
+                    cands.size() < SHORTLIST_CAP) {
+                    cands.add_score(ste_top_tok, 128LL + static_cast<int64_t>(ste_top_score / 4), 1);
                 }
             }
         }
@@ -13042,10 +14165,50 @@ int PopCountGenerativeLLM::generate(
             }
         }
 
+        // Step Inline Gated DeltaNet Recurrent State on ctx.back()
+        alignas(64) int8_t dn_pred_vec[D_MODEL] = {0};
+        bool has_dn_pred = false;
+        if (!ctx.empty() && ctx.back() >= 0 && static_cast<size_t>(ctx.back()) < tok_cont_emb.size()) {
+            dn_state.step_and_predict(tok_cont_emb[ctx.back()].data(), sgd_transition_gain.data(), dn_pred_vec, true);
+            has_dn_pred = true;
+        }
+
         const uint64_t g9_prefix = (ctx.size() >= 8) ? (ctx_keys[8] * 0x100000001B3ULL) : 0ULL;
         int max_cand_L = 0;
         for (size_t ci = 0; ci < cands.size(); ++ci) {
             if (cands.max_L[ci] > max_cand_L) max_cand_L = cands.max_L[ci];
+        }
+
+        // Morpho-Syntactic Inflectional Expansion:
+        // When in low-horizon regime (max_cand_L <= 2) after a Russian Adjective or Preposition,
+        // expand candidate roots via `stem_to_inflected_toks` so inflected forms agreeing in
+        // case/gender/number with `prev_tok` enter the shortlist!
+        const MorphSignature prev_ms = (prev_tok >= 0 && static_cast<size_t>(prev_tok) < tok_morph_sig.size())
+            ? tok_morph_sig[prev_tok] : MorphSignature{};
+        if (max_cand_L <= 2 && !saw_open_brace && !is_python_func &&
+            (prev_ms.pos_cat == POS_ADJ || prev_ms.pos_cat == POS_PREP)) {
+            const uint8_t req_case = (prev_ms.pos_cat == POS_PREP) ? prev_ms.governed_case : prev_ms.case_mask;
+            const uint8_t req_gn   = (prev_ms.pos_cat == POS_ADJ)  ? prev_ms.gn_mask       : static_cast<uint8_t>(GN_ANY);
+            const size_t init_n = cands.size();
+            for (size_t ci = 0; ci < init_n; ++ci) {
+                int ct = cands.toks[ci];
+                if (ct < 0 || static_cast<size_t>(ct) >= tok_morph_sig.size()) continue;
+                const MorphSignature& cms = tok_morph_sig[ct];
+                if (cms.stem_hash == 0ULL || (cms.pos_cat != POS_NOUN && cms.pos_cat != POS_ADJ)) continue;
+                if ((cms.case_mask & req_case) != 0 && (cms.gn_mask & req_gn) != 0) continue;
+                auto sit = stem_to_inflected_toks.find(cms.stem_hash);
+                if (sit != stem_to_inflected_toks.end()) {
+                    for (int sib_tok : sit->second) {
+                        if (sib_tok == ct || static_cast<size_t>(sib_tok) >= tok_morph_sig.size()) continue;
+                        const MorphSignature& sms = tok_morph_sig[sib_tok];
+                        if (sms.pos_cat == cms.pos_cat &&
+                            (sms.case_mask & req_case) != 0 &&
+                            (sms.gn_mask & req_gn) != 0) {
+                            cands.max_score(sib_tok, cands.scores[ci] + 2048LL, cands.max_L[ci]);
+                        }
+                    }
+                }
+            }
         }
 
         for (size_t ci = 0; ci < cands.size(); ++ci) {
@@ -13096,9 +14259,58 @@ int PopCountGenerativeLLM::generate(
                 }
             }
 
+            // Inline Gated DeltaNet Recurrent Readout Scoring
+            if (has_dn_pred && cand >= 0 && static_cast<size_t>(cand) < tok_cont_emb.size()) {
+                int32_t dn_dot = continuous_dot_int8_512(tok_cont_emb[cand].data(), dn_pred_vec);
+                sc += (max_cand_L <= 2 && seen_L <= 2) ? ((static_cast<int64_t>(dn_dot) * 3LL) / 4LL)
+                                                       : (static_cast<int64_t>(dn_dot) / 16LL);
+            }
+
             if (cand >= 0 && static_cast<size_t>(cand) < token_topic_sketch.size()) {
                 int32_t tdot = hsaa_assoc::dot512(prompt_topic_vec, token_topic_sketch[cand].data());
                 sc += static_cast<int64_t>(tdot) * 2LL;
+            }
+
+            // Morpho-Syntactic Case/Gender/Number Agreement & POS Transition Filter (Prose Mode)
+            if (!saw_open_brace && !is_python_func && cand >= 0 && static_cast<size_t>(cand) < tok_morph_sig.size()) {
+                const MorphSignature& cms = tok_morph_sig[cand];
+                if (prev_ms.pos_cat == POS_ADJ && (cms.pos_cat == POS_NOUN || cms.pos_cat == POS_ADJ)) {
+                    bool case_ok = (prev_ms.case_mask & cms.case_mask) != 0;
+                    bool gn_ok   = (prev_ms.gn_mask & cms.gn_mask) != 0;
+                    if (case_ok && gn_ok) {
+                        if (seen_L <= 2) sc += 3072LL;
+                    } else if (max_cand_L <= 2 && seen_L <= 2) {
+                        sc -= 12288LL;
+                    }
+                } else if (prev_ms.pos_cat == POS_PREP && (cms.pos_cat == POS_ADJ || cms.pos_cat == POS_NOUN)) {
+                    if ((prev_ms.governed_case & cms.case_mask) != 0) {
+                        if (seen_L <= 2) sc += 3072LL;
+                    } else if (max_cand_L <= 2 && seen_L <= 2) {
+                        sc -= 10240LL;
+                    }
+                } else if (prev_ms.pos_cat == POS_VERB_FIN && cms.pos_cat == POS_VERB_FIN && max_cand_L <= 2 && seen_L <= 2) {
+                    // Prevent ungrammatical consecutive finite verbs without a conjunction
+                    sc -= 16384LL;
+                }
+            }
+
+            // Code Symbol & Type Scope Compatibility Filter (Code Mode)
+            if ((saw_open_brace || is_python_func) && max_cand_L <= 2 && seen_L <= 2) {
+                auto vit = scope_var_types.find(cand);
+                if (!delim_stack.empty() && delim_stack.back() == '[' && prev_tok == id_lbrack) {
+                    // Array subscript index `[ idx ]` requires an integer scalar
+                    if (vit != scope_var_types.end()) {
+                        if (vit->second == CTYPE_INT_SCALAR) sc += 3072LL;
+                        else if (vit->second == CTYPE_PTR_ARRAY || vit->second == CTYPE_FLOAT_SCALAR) sc -= 12288LL;
+                    }
+                }
+                if (vit != scope_var_types.end()) {
+                    auto dit = scope_var_depth.find(cand);
+                    if (dit != scope_var_depth.end() && dit->second > brace_depth) {
+                        // Variable went out of scope when inner brace block closed
+                        sc -= 24576LL;
+                    }
+                }
             }
 
             if (cand == id_rparen) {
@@ -13127,13 +14339,110 @@ int PopCountGenerativeLLM::generate(
                 sc = -1000000000LL;
                 continue;
             }
-            // Only penalize repeated 9-grams when the candidate is NOT backed by a deeper
-            // long-horizon context (seen_L <= 9). When seen_L > 9, the extended horizon
-            // (up to 2048 tokens) disambiguates repeated phrases in long documents without degradation.
             if (ctx.size() >= 8 && seen_L <= 9) {
                 uint64_t g9 = g9_prefix ^ static_cast<uint64_t>(cand + 0x9E3779B9U);
                 if (visited_9grams.find(g9) != visited_9grams.end()) {
                     sc -= 5000000LL;
+                }
+            }
+        }
+
+        // 2-Step Beam Lookahead & Dead-End Pruner:
+        // When in low/medium horizon regime (max_cand_L <= 3) with competing candidates,
+        // evaluate 1-step-ahead continuation horizon L_next(ctx + cand) across exact,
+        // register, and role horizon tables to avoid dead-end branches!
+        if (cands.size() > 1 && max_cand_L <= 3) {
+            size_t top_indices[6];
+            size_t num_top = 0;
+            for (size_t k = 0; k < std::min<size_t>(6, cands.size()); ++k) {
+                int64_t best_k_sc = -50000000LL;
+                size_t best_k_idx = cands.size();
+                for (size_t ci = 0; ci < cands.size(); ++ci) {
+                    bool already = false;
+                    for (size_t j = 0; j < num_top; ++j) {
+                        if (top_indices[j] == ci) { already = true; break; }
+                    }
+                    if (already) continue;
+                    if (cands.scores[ci] > best_k_sc) {
+                        best_k_sc = cands.scores[ci];
+                        best_k_idx = ci;
+                    }
+                }
+                if (best_k_idx < cands.size()) {
+                    top_indices[num_top++] = best_k_idx;
+                } else {
+                    break;
+                }
+            }
+
+            if (num_top >= 2) {
+                const uint64_t u_prev1 = static_cast<uint64_t>(static_cast<uint32_t>(prev_tok) & 0xFFFFFU);
+                const uint64_t u_prev2 = (ctx.size() >= 2)
+                    ? static_cast<uint64_t>(static_cast<uint32_t>(ctx[ctx.size() - 2]) & 0xFFFFFU) : 0ULL;
+                const uint64_t r_prev1 = !role_ctx.empty()
+                    ? static_cast<uint64_t>(static_cast<uint32_t>(role_ctx.back()) & 0xFFFFFU) : 0ULL;
+                const uint64_t r_prev2 = (role_ctx.size() >= 2)
+                    ? static_cast<uint64_t>(static_cast<uint32_t>(role_ctx[role_ctx.size() - 2]) & 0xFFFFFU) : 0ULL;
+
+                for (size_t ti = 0; ti < num_top; ++ti) {
+                    const size_t ci = top_indices[ti];
+                    const int cand = cands.toks[ci];
+                    const int seen_L = cands.max_L[ci];
+                    if (cand == CodeProseTokenizer::TOK_EOS || cand < 0) continue;
+
+                    const uint64_t u_cand = static_cast<uint64_t>(static_cast<uint32_t>(cand) & 0xFFFFFU);
+                    const uint64_t next_k2 = (u_prev1 << 20) | u_cand;
+                    const uint64_t next_k3 = (u_prev2 << 40) | next_k2;
+
+                    int best_next_L = 0;
+                    if (ctx.size() >= 2 && horizon_tables[3].find(next_k3) != horizon_tables[3].end()) {
+                        best_next_L = 3;
+                    } else if (horizon_tables[2].find(next_k2) != horizon_tables[2].end()) {
+                        best_next_L = 2;
+                    } else if (horizon_tables[1].find(u_cand) != horizon_tables[1].end()) {
+                        best_next_L = 1;
+                    }
+
+                    if (!reg_to_tok.empty() && best_next_L < 3) {
+                        auto rit = tok_to_reg.find(cand);
+                        const uint64_t reg_cand = static_cast<uint64_t>(
+                            static_cast<uint32_t>((rit != tok_to_reg.end()) ? rit->second : cand) & 0xFFFFFU);
+                        const uint64_t reg_prev1 = !reg_ctx.empty()
+                            ? static_cast<uint64_t>(static_cast<uint32_t>(reg_ctx.back()) & 0xFFFFFU) : 0ULL;
+                        const uint64_t next_rk2 = (reg_prev1 << 20) | reg_cand;
+                        if (reg_horizon_tables[2].find(next_rk2) != reg_horizon_tables[2].end()) {
+                            best_next_L = std::max(best_next_L, 2);
+                        }
+                    }
+
+                    const int cand_role = map_token_to_role(cand);
+                    const uint64_t r_cand = static_cast<uint64_t>(static_cast<uint32_t>(cand_role) & 0xFFFFFU);
+                    const uint64_t next_role_k2 = (r_prev1 << 20) | r_cand;
+                    const uint64_t next_role_k3 = (r_prev2 << 40) | next_role_k2;
+                    int best_next_role_L = 0;
+                    if (role_ctx.size() >= 2 && role_horizon_tables[3].find(next_role_k3) != role_horizon_tables[3].end()) {
+                        best_next_role_L = 3;
+                    } else if (role_horizon_tables[2].find(next_role_k2) != role_horizon_tables[2].end()) {
+                        best_next_role_L = 2;
+                    } else if (role_horizon_tables[1].find(r_cand) != role_horizon_tables[1].end()) {
+                        best_next_role_L = 1;
+                    }
+
+                    if (seen_L <= 2) {
+                        if (best_next_L >= 3) cands.scores[ci] += 6144LL;
+                        else if (best_next_L == 2) cands.scores[ci] += 3072LL;
+                        else if (best_next_role_L >= 2) cands.scores[ci] += 2048LL;
+                        else if (best_next_L == 0 && best_next_role_L == 0) {
+                            const std::string& cw = (static_cast<size_t>(cand) < tokenizer.id_to_word.size())
+                                ? tokenizer.id_to_word[cand] : "";
+                            if (cw != "." && cw != "!" && cw != "?" && cw != ";" && cw != "}") {
+                                // Dead-end branch penalty: candidate has zero known outgoing transitions
+                                cands.scores[ci] -= 24576LL;
+                            }
+                        }
+                    } else if (seen_L == 3 && best_next_L >= 3) {
+                        cands.scores[ci] += 512LL;
+                    }
                 }
             }
         }
@@ -13205,6 +14514,7 @@ int PopCountGenerativeLLM::generate(
 
         generated_toks.push_back(chosen_tok);
         ctx.push_back(chosen_tok);
+        update_code_symbol_from_window(ctx, ctx.size() - 1, brace_depth);
         auto rit = tok_to_reg.find(chosen_tok);
         reg_ctx.push_back((rit != tok_to_reg.end()) ? rit->second : chosen_tok);
         role_ctx.push_back(map_token_to_role(chosen_tok));
@@ -13265,7 +14575,9 @@ POPCNT_BRAIN_API PopCountBrain* brain_create(size_t max_pages, const char* filep
     }
     brain->engine = std::make_unique<PureNeuralReasoningEngine>(brain->bank_guard->get());
     brain->max_pages = max_pages;
-    brain->active_rules = 0;
+    bank_alloc_init(brain->bank_guard->get()->base_ptr);
+    assoc_rebuild_holo_from_4kb(brain);
+    brain->active_rules = brain->assoc_fact_count;
     return brain;
 }
 
@@ -13278,9 +14590,9 @@ POPCNT_BRAIN_API void brain_destroy(PopCountBrain* brain) {
 POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
-    assoc_upsert(brain, subject, relation, object);
-    brain->direct_facts[subject][relation] = object;
-    brain->active_rules = brain->assoc_facts.size();
+    if (assoc_upsert(brain, subject, relation, object)) {
+        ++brain->active_rules;
+    }
 
     if (brain->engine) {
         std::string stmt = std::string(subject) + " " + relation + " " + object + " .";
@@ -13292,14 +14604,6 @@ POPCNT_BRAIN_API int brain_store_fact(PopCountBrain* brain, const char* subject,
 POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subject, const char* relation, char* out_object, size_t max_len) {
     if (!brain || !subject || !relation || !out_object || max_len == 0) return 0;
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
-    auto sit = brain->direct_facts.find(subject);
-    if (sit != brain->direct_facts.end()) {
-        auto rit = sit->second.find(relation);
-        if (rit != sit->second.end()) {
-            strncpy_s(out_object, max_len, rit->second.c_str(), _TRUNCATE);
-            return 1;
-        }
-    }
     if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
         strncpy_s(out_object, max_len, f->object.c_str(), _TRUNCATE);
         return 1;
@@ -13310,18 +14614,8 @@ POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subj
 POPCNT_BRAIN_API int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object) {
     if (!brain || !subject || !relation || !object) return 0;
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
-    auto sit = brain->direct_facts.find(subject);
-    if (sit != brain->direct_facts.end()) {
-        auto rit = sit->second.find(relation);
-        if (rit != sit->second.end()) {
-            if (rit->second != object) {
-                return 1;
-            }
-            return 0;
-        }
-    }
     if (const AssocFact* f = assoc_lookup(brain, subject, relation)) {
-        if (f->object != object) return 1;
+        return (f->object != object) ? 1 : 0;
     }
     return 0;
 }
@@ -13365,14 +14659,13 @@ POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath
     FILE* fp = fopen(filepath, "w");
     if (!fp) return 0;
 #endif
-    for (const auto& sit : brain->direct_facts) {
-        std::string esc_sub = escape_tsv_field(sit.first);
-        for (const auto& rit : sit.second) {
-            std::string esc_rel = escape_tsv_field(rit.first);
-            std::string esc_obj = escape_tsv_field(rit.second);
-            fprintf(fp, "%s\t%s\t%s\n", esc_sub.c_str(), esc_rel.c_str(), esc_obj.c_str());
-        }
-    }
+    assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+        std::string esc_sub = escape_tsv_field(sl.subject_raw);
+        std::string esc_rel = escape_tsv_field(sl.relation_raw);
+        std::string esc_obj = escape_tsv_field(sl.object);
+        fprintf(fp, "%s\t%s\t%s\n", esc_sub.c_str(), esc_rel.c_str(), esc_obj.c_str());
+        return false;
+    });
     if (brain->llm_engine && brain->llm_engine->is_trained) {
         std::string compiled_blob = brain->llm_engine->serialize_compiled_model();
         std::string hex_blob = bytes_to_hex(compiled_blob);
@@ -13396,9 +14689,7 @@ POPCNT_BRAIN_API int brain_load_state(PopCountBrain* brain, const char* filepath
 #endif
     if (!ifs) return 0;
 
-    brain->direct_facts.clear();
-    brain->assoc_facts.clear();
-    brain->holo_bank.clear();
+    assoc_clear_lexicon_4kb(brain);
     brain->active_rules = 0;
 
     std::string line;
@@ -13675,23 +14966,22 @@ bool PopCountGenerativeLLM::embed_continuous_text(
 #endif
     }
 
-    if (brain && !brain->assoc_facts.empty() && !norm_all.empty()) {
+    if (brain && brain->assoc_fact_count > 0 && !norm_all.empty()) {
         uint64_t q_sk[hsaa_assoc::kW];
         hsaa_assoc::sketch(norm_all, q_sk);
-        for (const auto& f : brain->assoc_facts) {
-            int32_t s_dot = hsaa_assoc::dot512(q_sk, f.skey);
+        assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
+            int32_t s_dot = hsaa_assoc::dot512(q_sk, sl.skey);
             if (s_dot >= kAssocMinSubjectDot) {
-                uint64_t o_sk[hsaa_assoc::kW];
-                hsaa_assoc::sketch(hsaa_assoc::normalize(f.object.c_str()), o_sk);
                 float fw = (static_cast<float>(s_dot) / 256.0f) * 2.5f;
                 for (int w = 0; w < WORDS_PER_VEC; ++w) {
-                    uint64_t word_bits = o_sk[w];
+                    uint64_t word_bits = sl.okey[w];
                     for (int b = 0; b < 64; ++b) {
                         accum[w * 64 + b] += (((word_bits >> b) & 1ULL) ? fw : -fw);
                     }
                 }
             }
-        }
+            return false;
+        });
     }
 
     // Pass accumulated phrase/token representation through the 32-Layer Non-Linear Hierarchy

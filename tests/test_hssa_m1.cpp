@@ -834,6 +834,68 @@ static bool test_6_continuous_manifold_and_deep_interpolation() {
 
 /*
  * =============================================================================
+ * Test 7: Binary Weight Checkpoint Persistence & Online Token-Step Training
+ * =============================================================================
+ */
+static bool test_7_hssa_checkpoint_and_online_training() {
+    std::cout << "\n--------------------------------------------------------------------------------\n";
+    std::cout << "[TEST 7] Binary Weight Checkpoint Persistence & Online Token-Step Training\n";
+    std::cout << "--------------------------------------------------------------------------------\n";
+
+    HssaContext* ctx = hssa_create(4);
+    TEST_ASSERT(ctx != nullptr, "hssa_create(4) failed");
+
+    alignas(64) float in_vec[HSSA_HIDDEN_DIM];
+    alignas(64) float target_vec[HSSA_HIDDEN_DIM];
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        in_vec[i] = std::sin(static_cast<float>(i + 1) * 0.04f);
+        target_vec[i] = std::cos(static_cast<float>(i + 1) * 0.03f);
+    }
+
+    float init_loss = 0.0f;
+    float final_loss = 0.0f;
+    for (int step = 0; step < 6; ++step) {
+        hssa_reset_state(ctx);
+        float mse = 0.0f;
+        TEST_ASSERT(hssa_train_token_step(ctx, in_vec, target_vec, 0.05f, &mse) == 0,
+                    "hssa_train_token_step failed");
+        if (step == 0) init_loss = mse;
+        final_loss = mse;
+    }
+    std::cout << "  [+] Online Token-Step Training MSE: initial=" << init_loss << " -> final=" << final_loss << "\n";
+    TEST_ASSERT(final_loss < init_loss, "Online HSSA training must strictly reduce MSE loss");
+
+    const char* ckpt_path = "test_hssa_ckpt.bin";
+    TEST_ASSERT(hssa_save_weights(ctx, ckpt_path) == 0, "hssa_save_weights failed");
+
+    alignas(64) float out_before[HSSA_HIDDEN_DIM];
+    TEST_ASSERT(hssa_forward_token(ctx, in_vec, out_before, nullptr) == 0, "hssa_forward_token before reload failed");
+
+    // Re-save state after forward_token so ctx2 loads identical recurrent state & TT16 weights
+    TEST_ASSERT(hssa_save_weights(ctx, ckpt_path) == 0, "hssa_save_weights second save failed");
+    TEST_ASSERT(hssa_forward_token(ctx, in_vec, out_before, nullptr) == 0, "hssa_forward_token reference step failed");
+
+    HssaContext* ctx2 = hssa_create(4);
+    TEST_ASSERT(ctx2 != nullptr, "hssa_create(4) for reload failed");
+    TEST_ASSERT(hssa_load_weights(ctx2, ckpt_path) == 0, "hssa_load_weights failed");
+
+    alignas(64) float out_after[HSSA_HIDDEN_DIM];
+    TEST_ASSERT(hssa_forward_token(ctx2, in_vec, out_after, nullptr) == 0, "hssa_forward_token after reload failed");
+
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        TEST_ASSERT(std::abs(out_before[i] - out_after[i]) < 1e-5f,
+                    "Reloaded HSSA checkpoint produced different forward output");
+    }
+
+    std::remove(ckpt_path);
+    hssa_destroy(ctx2);
+    hssa_destroy(ctx);
+    std::cout << "[PASS] Test 7: Binary Weight Checkpoint Persistence & Online Token-Step Training\n";
+    return true;
+}
+
+/*
+ * =============================================================================
  * Main Test Runner
  * =============================================================================
  */
@@ -849,7 +911,7 @@ int main(int argc, char** argv) {
     double suite_start = get_qpc_us();
 
     int passed = 0;
-    int total = 6;
+    int total = 7;
 
     if (test_1_state_memory_invariance()) passed++;
     else std::cerr << "[FAIL] Test 1 Failed\n";
@@ -868,6 +930,9 @@ int main(int argc, char** argv) {
 
     if (test_6_continuous_manifold_and_deep_interpolation()) passed++;
     else std::cerr << "[FAIL] Test 6 Failed\n";
+
+    if (test_7_hssa_checkpoint_and_online_training()) passed++;
+    else std::cerr << "[FAIL] Test 7 Failed\n";
 
     double suite_end = get_qpc_us();
     double total_ms = (suite_end - suite_start) / 1000.0;
@@ -890,3 +955,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+

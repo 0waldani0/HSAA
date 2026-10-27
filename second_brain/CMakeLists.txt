@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/O2 /Oi /Ot /EHsc /wd4068 /openmp /arch:AVX512)
+    add_compile_options(/O2 /Oi /Ot /EHsc /utf-8 /wd4068 /openmp /arch:AVX512)
 else()
     add_compile_options(-O3 -march=tigerlake -mavx512f -mavx512bw -mavx512vpopcntdq -fopenmp)
 endif()

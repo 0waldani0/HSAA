@@ -155,8 +155,23 @@ int model_forward_deep_interpolated(
     float* out_vec
 );
 
+/*
+ * Feature 3.5: Binary Weight Checkpoint Persistence & Online Layer Training
+ */
+int model_save_weights(const void* ctx, const char* filepath);
+int model_load_weights(void* ctx, const char* filepath);
+int model_train_layer_step(
+    void* ctx,
+    uint32_t layer_idx,
+    const float* in_vec,
+    const float* target_vec,
+    float lr,
+    float* out_mse_loss
+);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* MODEL_MOD_H */
+

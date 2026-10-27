@@ -46,6 +46,7 @@ static inline void strncpy_s(char* dest, size_t dest_sz, const char* src, size_t
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -82,6 +83,85 @@ static double get_qpc_time_us() {
 /* Fast sigmoid helper: 1 / (1 + exp(-x)) */
 static inline float fast_sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
+}
+
+struct alignas(64) HssaBaseLayerWeights {
+    alignas(64) float w_k_diag[HSSA_HIDDEN_DIM];
+    alignas(64) float w_k_rot[HSSA_HIDDEN_DIM];
+    alignas(64) float w_q_diag[HSSA_HIDDEN_DIM];
+    alignas(64) float w_q_rot[HSSA_HIDDEN_DIM];
+    alignas(64) float w_v_diag[HSSA_HIDDEN_DIM];
+    alignas(64) float w_v_rot[HSSA_HIDDEN_DIM];
+    alignas(64) float w_g_diag[HSSA_HIDDEN_DIM];
+    alignas(64) float w_g_rot[HSSA_HIDDEN_DIM];
+    uint64_t k_pos[HSSA_HIDDEN_DIM / 64];
+    uint64_t k_neg[HSSA_HIDDEN_DIM / 64];
+    uint64_t q_pos[HSSA_HIDDEN_DIM / 64];
+    uint64_t q_neg[HSSA_HIDDEN_DIM / 64];
+    uint64_t v_pos[HSSA_HIDDEN_DIM / 64];
+    uint64_t v_neg[HSSA_HIDDEN_DIM / 64];
+    uint64_t g_pos[HSSA_HIDDEN_DIM / 64];
+    uint64_t g_neg[HSSA_HIDDEN_DIM / 64];
+    float scale_k_rot;
+    float scale_q_rot;
+    float scale_v_rot;
+    float scale_g_rot;
+};
+
+static inline void quantize_ternary_channel_1024(
+    const float* src,
+    uint64_t* out_pos,
+    uint64_t* out_neg,
+    float* out_scale
+) noexcept {
+    float sum_abs = 0.0f;
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        sum_abs += std::fabs(src[i]);
+    }
+    const float mean_abs = sum_abs / static_cast<float>(HSSA_HIDDEN_DIM);
+    const float thresh = 0.35f * mean_abs;
+    std::memset(out_pos, 0, (HSSA_HIDDEN_DIM / 64) * sizeof(uint64_t));
+    std::memset(out_neg, 0, (HSSA_HIDDEN_DIM / 64) * sizeof(uint64_t));
+    float active_sum = 0.0f;
+    uint32_t active_cnt = 0;
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        const float v = src[i];
+        const size_t w = i >> 6;
+        const uint64_t bit = 1ULL << (i & 63);
+        if (v > thresh) {
+            out_pos[w] |= bit;
+            active_sum += v;
+            ++active_cnt;
+        } else if (v < -thresh) {
+            out_neg[w] |= bit;
+            active_sum -= v;
+            ++active_cnt;
+        }
+    }
+    *out_scale = (active_cnt > 0) ? (active_sum / static_cast<float>(active_cnt)) : mean_abs;
+}
+
+static inline void hssa_quantize_base_ternary(HssaBaseLayerWeights* bw) noexcept {
+    if (!bw) return;
+    quantize_ternary_channel_1024(bw->w_k_rot, bw->k_pos, bw->k_neg, &bw->scale_k_rot);
+    quantize_ternary_channel_1024(bw->w_q_rot, bw->q_pos, bw->q_neg, &bw->scale_q_rot);
+    quantize_ternary_channel_1024(bw->w_v_rot, bw->v_pos, bw->v_neg, &bw->scale_v_rot);
+    quantize_ternary_channel_1024(bw->w_g_rot, bw->g_pos, bw->g_neg, &bw->scale_g_rot);
+}
+
+static inline void hssa_init_base_layer_weights(HssaBaseLayerWeights* bw) noexcept {
+    if (!bw) return;
+    for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
+        bw->w_k_diag[i] = 0.85f;
+        bw->w_k_rot[i]  = 0.15f;
+        bw->w_q_diag[i] = 0.85f;
+        bw->w_q_rot[i]  = -0.15f;
+        bw->w_v_diag[i] = 0.90f;
+        bw->w_v_rot[i]  = 0.10f;
+        bw->w_g_diag[i] = 0.80f;
+        bw->w_g_rot[i]  = 0.20f;
+    }
+    hssa_quantize_base_ternary(bw);
 }
 
 /* Deterministic normalized unembedding projection weights [vocab x 1024].
@@ -134,7 +214,7 @@ HssaContext* hssa_create(uint32_t num_layers) {
         return nullptr;
     }
 
-    // Allocate 64-byte aligned recurrent state and TT16 cores per layer
+    // Allocate 64-byte aligned recurrent state, base weights, and TT16 cores per layer
     for (uint32_t l = 0; l < num_layers; ++l) {
         HssaLayer* lyr = &ctx->layers[l];
         lyr->layer_idx = l;
@@ -142,8 +222,10 @@ HssaContext* hssa_create(uint32_t num_layers) {
         lyr->deltanet_state = (float*)_aligned_malloc(HSSA_DELTANET_STATE_SIZE * sizeof(float), HSSA_ALIGNMENT);
         lyr->tt_u = (float*)_aligned_malloc(HSSA_TT16_CORE_SIZE * sizeof(float), HSSA_ALIGNMENT);
         lyr->tt_v = (float*)_aligned_malloc(HSSA_TT16_CORE_SIZE * sizeof(float), HSSA_ALIGNMENT);
+        HssaBaseLayerWeights* bw = (HssaBaseLayerWeights*)_aligned_malloc(sizeof(HssaBaseLayerWeights), HSSA_ALIGNMENT);
 
-        if (!lyr->deltanet_state || !lyr->tt_u || !lyr->tt_v) {
+        if (!lyr->deltanet_state || !lyr->tt_u || !lyr->tt_v || !bw) {
+            if (bw) _aligned_free(bw);
             hssa_destroy(ctx);
             return nullptr;
         }
@@ -151,9 +233,12 @@ HssaContext* hssa_create(uint32_t num_layers) {
         std::memset(lyr->deltanet_state, 0, HSSA_DELTANET_STATE_SIZE * sizeof(float));
         std::memset(lyr->tt_u, 0, HSSA_TT16_CORE_SIZE * sizeof(float));
         std::memset(lyr->tt_v, 0, HSSA_TT16_CORE_SIZE * sizeof(float));
+        hssa_init_base_layer_weights(bw);
 
         lyr->vsa_handle = nullptr;
         lyr->reserved[0] = nullptr;
+        lyr->reserved[1] = bw;
+        lyr->reserved[2] = nullptr;
     }
 
     // Preallocate 64-byte aligned hot-path scratchpads to guarantee zero heap allocations
@@ -270,6 +355,10 @@ void hssa_destroy(HssaContext* ctx) {
             if (lyr->deltanet_state) _aligned_free(lyr->deltanet_state);
             if (lyr->tt_u) _aligned_free(lyr->tt_u);
             if (lyr->tt_v) _aligned_free(lyr->tt_v);
+            if (lyr->reserved[1]) {
+                _aligned_free(lyr->reserved[1]);
+                lyr->reserved[1] = nullptr;
+            }
         }
         std::free(ctx->layers);
         ctx->layers = nullptr;
@@ -395,6 +484,7 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
     const float alpha = 0.95f;         // State retention decay
     const float beta  = 0.25f;         // Fast associative learning rate
     const uint32_t l_idx = layer ? layer->layer_idx : 0;
+    const HssaBaseLayerWeights* bw = layer ? static_cast<const HssaBaseLayerWeights*>(layer->reserved[1]) : nullptr;
 
     __m512 v_alpha = _mm512_set1_ps(alpha);
 
@@ -404,7 +494,7 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
         float* S_h = &layer->deltanet_state[h * D_H * D_H];
         float* out_h = &out_vec[h * D_H];
 
-        // Structured orthogonal per-head Q, K, V, Gate projections (W_q, W_k, W_v, W_g)
+        // Trainable 1.58-bit ternary + continuous STE per-head Q, K, V, Gate projections
         const size_t rot_k = ((size_t)(l_idx * 7 + h * 3 + 1)) & (D_H - 1);
         const size_t rot_q = ((size_t)(l_idx * 11 + h * 5 + 3)) & (D_H - 1);
         const size_t rot_v = ((size_t)(l_idx * 13 + h * 7 + 5)) & (D_H - 1);
@@ -413,15 +503,43 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
         alignas(64) float v_proj[HSSA_HEAD_DIM];
         alignas(64) float gate[HSSA_HEAD_DIM];
 
-        for (size_t r = 0; r < D_H; ++r) {
-            const float x0 = x_h[r];
-            const float xk = x_h[(r + rot_k) & (D_H - 1)];
-            const float xq = x_h[(r + rot_q) & (D_H - 1)];
-            const float xv = x_h[(r + rot_v) & (D_H - 1)];
-            k_proj[r] = 0.85f * x0 + 0.15f * xk;
-            q_proj[r] = 0.85f * x0 - 0.15f * xq;
-            v_proj[r] = 0.90f * x0 + 0.10f * xv;
-            gate[r]   = fast_sigmoid(0.80f * x0 + 0.20f * xq);
+        if (bw) {
+            const size_t base_off = static_cast<size_t>(h) * D_H;
+            for (size_t r = 0; r < D_H; ++r) {
+                const size_t d_idx = base_off + r;
+                const size_t w_idx = d_idx >> 6;
+                const uint64_t bit = 1ULL << (d_idx & 63);
+                const float x0 = x_h[r];
+                const float xk = x_h[(r + rot_k) & (D_H - 1)];
+                const float xq = x_h[(r + rot_q) & (D_H - 1)];
+                const float xv = x_h[(r + rot_v) & (D_H - 1)];
+
+                const float tk = ((bw->k_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->k_neg[w_idx] & bit) ? 1.0f : 0.0f);
+                const float tq = ((bw->q_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->q_neg[w_idx] & bit) ? 1.0f : 0.0f);
+                const float tv = ((bw->v_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->v_neg[w_idx] & bit) ? 1.0f : 0.0f);
+                const float tg = ((bw->g_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->g_neg[w_idx] & bit) ? 1.0f : 0.0f);
+
+                const float wk_rot = 0.5f * bw->w_k_rot[d_idx] + 0.5f * bw->scale_k_rot * tk;
+                const float wq_rot = 0.5f * bw->w_q_rot[d_idx] + 0.5f * bw->scale_q_rot * tq;
+                const float wv_rot = 0.5f * bw->w_v_rot[d_idx] + 0.5f * bw->scale_v_rot * tv;
+                const float wg_rot = 0.5f * bw->w_g_rot[d_idx] + 0.5f * bw->scale_g_rot * tg;
+
+                k_proj[r] = bw->w_k_diag[d_idx] * x0 + wk_rot * xk;
+                q_proj[r] = bw->w_q_diag[d_idx] * x0 + wq_rot * xq;
+                v_proj[r] = bw->w_v_diag[d_idx] * x0 + wv_rot * xv;
+                gate[r]   = fast_sigmoid(bw->w_g_diag[d_idx] * x0 + wg_rot * xq);
+            }
+        } else {
+            for (size_t r = 0; r < D_H; ++r) {
+                const float x0 = x_h[r];
+                const float xk = x_h[(r + rot_k) & (D_H - 1)];
+                const float xq = x_h[(r + rot_q) & (D_H - 1)];
+                const float xv = x_h[(r + rot_v) & (D_H - 1)];
+                k_proj[r] = 0.85f * x0 + 0.15f * xk;
+                q_proj[r] = 0.85f * x0 - 0.15f * xq;
+                v_proj[r] = 0.90f * x0 + 0.10f * xv;
+                gate[r]   = fast_sigmoid(0.80f * x0 + 0.20f * xq);
+            }
         }
 
         // Preload q_vec and k_raw [8 * 16 = 128 floats]
@@ -1226,6 +1344,23 @@ static int hssa_register_assertion_impl(HssaContext* ctx, uint32_t token_id, con
     strncpy_s(asst->object, sizeof(asst->object), obj, _TRUNCATE);
     asst->active = true;
 
+    // Bind the assertion's continuous prototype into the upper half of the Hopfield attractor bank
+    // (preserving the lower half orthogonal sinusoidal basis for general manifold stability).
+    if (ctx->attractor_patterns && ctx->num_attractor_patterns >= 2) {
+        const size_t half_bank = ctx->num_attractor_patterns / 2;
+        const size_t slot = half_bank + ((size_t)(ctx->assertion_count - 1) % (ctx->num_attractor_patterns - half_bank));
+        float* pat = &ctx->attractor_patterns[slot * HSSA_HIDDEN_DIM];
+        uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t)token_id;
+        for (const char* p = subj; *p; ++p) h = (h ^ (uint8_t)(*p)) * 0x100000001B3ULL;
+        for (const char* p = rel;  *p; ++p) h = (h ^ (uint8_t)(*p)) * 0x100000001B3ULL;
+        for (const char* p = obj;  *p; ++p) h = (h ^ (uint8_t)(*p)) * 0x100000001B3ULL;
+        const float norm_factor = 1.0f / std::sqrt((float)HSSA_HIDDEN_DIM);
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; ++j) {
+            h = h * 6364136223846793005ULL + 1442695040888963407ULL;
+            pat[j] = ((h >> 33) & 1ULL) ? norm_factor : -norm_factor;
+        }
+    }
+
     return 0;
 }
 
@@ -1854,3 +1989,371 @@ int hssa_forward_deep_interpolated(
     }
     return 0;
 }
+
+namespace {
+
+struct HssaCheckpointHeader {
+    char     magic[8];       // "HSSAWGT1"
+    uint32_t version;        // 1
+    uint32_t num_layers;
+    uint32_t hidden_dim;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t rank;
+    uint64_t num_attractors;
+    uint64_t vocab_size;
+    uint64_t payload_fnv1a;
+};
+
+static uint64_t fnv1a64_update(uint64_t h, const void* data, size_t len) noexcept {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+} // namespace
+
+int hssa_save_weights(const HssaContext* ctx, const char* filepath) {
+    if (!ctx || !filepath || filepath[0] == '\0' || !ctx->layers) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
+    FILE* fp = std::fopen(filepath, "wb");
+    if (!fp) return -2;
+
+    uint64_t csum = 14695981039346656037ULL;
+    const size_t tt_bytes = static_cast<size_t>(HSSA_TT16_CORE_SIZE) * sizeof(float);
+    const size_t dn_bytes = static_cast<size_t>(HSSA_DELTANET_STATE_SIZE) * sizeof(float);
+    const size_t bw_bytes = sizeof(HssaBaseLayerWeights);
+    for (uint32_t l = 0; l < ctx->config.num_layers; ++l) {
+        csum = fnv1a64_update(csum, ctx->layers[l].tt_u, tt_bytes);
+        csum = fnv1a64_update(csum, ctx->layers[l].tt_v, tt_bytes);
+        csum = fnv1a64_update(csum, ctx->layers[l].deltanet_state, dn_bytes);
+        if (ctx->layers[l].reserved[1]) {
+            csum = fnv1a64_update(csum, ctx->layers[l].reserved[1], bw_bytes);
+        }
+    }
+    const size_t att_bytes = ctx->num_attractor_patterns * HSSA_HIDDEN_DIM * sizeof(float);
+    if (att_bytes > 0 && ctx->attractor_patterns) {
+        csum = fnv1a64_update(csum, ctx->attractor_patterns, att_bytes);
+    }
+    const size_t unemb_bytes = (ctx->unembed_weights && ctx->vocab_size > 0)
+        ? (ctx->vocab_size * HSSA_HIDDEN_DIM * sizeof(float))
+        : 0;
+    if (unemb_bytes > 0) {
+        csum = fnv1a64_update(csum, ctx->unembed_weights, unemb_bytes);
+    }
+
+    HssaCheckpointHeader hdr{};
+    std::memcpy(hdr.magic, "HSSAWGT1", 8);
+    hdr.version        = 2U;
+    hdr.num_layers     = ctx->config.num_layers;
+    hdr.hidden_dim     = ctx->config.hidden_dim;
+    hdr.heads          = ctx->config.heads;
+    hdr.head_dim       = ctx->config.head_dim;
+    hdr.rank           = ctx->config.rank;
+    hdr.num_attractors = static_cast<uint64_t>(ctx->num_attractor_patterns);
+    hdr.vocab_size     = (unemb_bytes > 0) ? static_cast<uint64_t>(ctx->vocab_size) : 0ULL;
+    hdr.payload_fnv1a  = csum;
+
+    bool ok = (std::fwrite(&hdr, sizeof(hdr), 1, fp) == 1);
+    for (uint32_t l = 0; ok && l < ctx->config.num_layers; ++l) {
+        ok = ok && (std::fwrite(ctx->layers[l].tt_u, 1, tt_bytes, fp) == tt_bytes);
+        ok = ok && (std::fwrite(ctx->layers[l].tt_v, 1, tt_bytes, fp) == tt_bytes);
+        ok = ok && (std::fwrite(ctx->layers[l].deltanet_state, 1, dn_bytes, fp) == dn_bytes);
+        if (ctx->layers[l].reserved[1]) {
+            ok = ok && (std::fwrite(ctx->layers[l].reserved[1], 1, bw_bytes, fp) == bw_bytes);
+        }
+    }
+    if (ok && att_bytes > 0 && ctx->attractor_patterns) {
+        ok = (std::fwrite(ctx->attractor_patterns, 1, att_bytes, fp) == att_bytes);
+    }
+    if (ok && unemb_bytes > 0) {
+        ok = (std::fwrite(ctx->unembed_weights, 1, unemb_bytes, fp) == unemb_bytes);
+    }
+    std::fclose(fp);
+    return ok ? 0 : -3;
+}
+
+int hssa_load_weights(HssaContext* ctx, const char* filepath) {
+    if (!ctx || !filepath || filepath[0] == '\0' || !ctx->layers) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
+    FILE* fp = std::fopen(filepath, "rb");
+    if (!fp) return -2;
+
+    HssaCheckpointHeader hdr{};
+    if (std::fread(&hdr, sizeof(hdr), 1, fp) != 1) {
+        std::fclose(fp);
+        return -3;
+    }
+    if (std::memcmp(hdr.magic, "HSSAWGT1", 8) != 0 ||
+        (hdr.version != 1U && hdr.version != 2U) ||
+        hdr.num_layers != ctx->config.num_layers ||
+        hdr.hidden_dim != ctx->config.hidden_dim ||
+        hdr.heads != ctx->config.heads ||
+        hdr.head_dim != ctx->config.head_dim ||
+        hdr.rank != ctx->config.rank ||
+        hdr.num_attractors > HSSA_MAX_PATTERNS ||
+        hdr.vocab_size > HSSA_MAX_VOCAB) {
+        std::fclose(fp);
+        return -4;
+    }
+
+    const size_t tt_bytes = static_cast<size_t>(HSSA_TT16_CORE_SIZE) * sizeof(float);
+    const size_t dn_bytes = static_cast<size_t>(HSSA_DELTANET_STATE_SIZE) * sizeof(float);
+    const size_t bw_bytes = sizeof(HssaBaseLayerWeights);
+    const size_t L = ctx->config.num_layers;
+    std::vector<float> tmp_u(L * HSSA_TT16_CORE_SIZE);
+    std::vector<float> tmp_v(L * HSSA_TT16_CORE_SIZE);
+    std::vector<float> tmp_dn(L * HSSA_DELTANET_STATE_SIZE);
+    std::vector<HssaBaseLayerWeights> tmp_bw(L);
+    std::vector<float> tmp_att(static_cast<size_t>(hdr.num_attractors) * HSSA_HIDDEN_DIM);
+    std::vector<float> tmp_unemb(static_cast<size_t>(hdr.vocab_size) * HSSA_HIDDEN_DIM);
+
+    uint64_t csum = 14695981039346656037ULL;
+    bool ok = true;
+    for (size_t l = 0; ok && l < L; ++l) {
+        float* u_ptr  = &tmp_u[l * HSSA_TT16_CORE_SIZE];
+        float* v_ptr  = &tmp_v[l * HSSA_TT16_CORE_SIZE];
+        float* dn_ptr = &tmp_dn[l * HSSA_DELTANET_STATE_SIZE];
+        ok = ok && (std::fread(u_ptr, 1, tt_bytes, fp) == tt_bytes);
+        ok = ok && (std::fread(v_ptr, 1, tt_bytes, fp) == tt_bytes);
+        ok = ok && (std::fread(dn_ptr, 1, dn_bytes, fp) == dn_bytes);
+        if (ok) {
+            csum = fnv1a64_update(csum, u_ptr, tt_bytes);
+            csum = fnv1a64_update(csum, v_ptr, tt_bytes);
+            csum = fnv1a64_update(csum, dn_ptr, dn_bytes);
+        }
+        if (ok && hdr.version >= 2U) {
+            ok = (std::fread(&tmp_bw[l], 1, bw_bytes, fp) == bw_bytes);
+            if (ok) {
+                csum = fnv1a64_update(csum, &tmp_bw[l], bw_bytes);
+            }
+        } else if (ok) {
+            hssa_init_base_layer_weights(&tmp_bw[l]);
+        }
+    }
+    if (ok && !tmp_att.empty()) {
+        const size_t att_bytes = tmp_att.size() * sizeof(float);
+        ok = (std::fread(tmp_att.data(), 1, att_bytes, fp) == att_bytes);
+        if (ok) csum = fnv1a64_update(csum, tmp_att.data(), att_bytes);
+    }
+    if (ok && !tmp_unemb.empty()) {
+        const size_t unemb_bytes = tmp_unemb.size() * sizeof(float);
+        ok = (std::fread(tmp_unemb.data(), 1, unemb_bytes, fp) == unemb_bytes);
+        if (ok) csum = fnv1a64_update(csum, tmp_unemb.data(), unemb_bytes);
+    }
+    std::fclose(fp);
+
+    if (!ok || csum != hdr.payload_fnv1a) {
+        return -5;
+    }
+
+    for (size_t l = 0; l < L; ++l) {
+        std::memcpy(ctx->layers[l].tt_u, &tmp_u[l * HSSA_TT16_CORE_SIZE], tt_bytes);
+        std::memcpy(ctx->layers[l].tt_v, &tmp_v[l * HSSA_TT16_CORE_SIZE], tt_bytes);
+        std::memcpy(ctx->layers[l].deltanet_state, &tmp_dn[l * HSSA_DELTANET_STATE_SIZE], dn_bytes);
+        if (ctx->layers[l].reserved[1]) {
+            std::memcpy(ctx->layers[l].reserved[1], &tmp_bw[l], bw_bytes);
+        }
+        ctx->layers[l].reserved[0] = hssa_is_tt16_active(
+            ctx->layers[l].tt_u, ctx->layers[l].tt_v, HSSA_TT16_CORE_SIZE
+        ) ? reinterpret_cast<void*>(1) : nullptr;
+    }
+    if (!tmp_att.empty() && ctx->attractor_patterns) {
+        ctx->num_attractor_patterns = static_cast<size_t>(hdr.num_attractors);
+        std::memcpy(ctx->attractor_patterns, tmp_att.data(), tmp_att.size() * sizeof(float));
+    }
+    if (!tmp_unemb.empty()) {
+        hssa_set_unembedding_matrix(ctx, tmp_unemb.data(), static_cast<size_t>(hdr.vocab_size));
+    }
+    if (ctx->cuda_active && ctx->cuda_drv && ctx->gpu_matrix && L > 0) {
+        CudaDriverApi* drv = static_cast<CudaDriverApi*>(ctx->cuda_drv);
+        GpuQuantizedMatrix* gpu = static_cast<GpuQuantizedMatrix*>(ctx->gpu_matrix);
+        drv->cuMemcpyHtoD_v2(gpu->d_tt_u, ctx->layers[0].tt_u, tt_bytes);
+        drv->cuMemcpyHtoD_v2(gpu->d_tt_v, ctx->layers[0].tt_v, tt_bytes);
+    }
+    return 0;
+}
+
+int hssa_train_token_step(
+    HssaContext* ctx,
+    const float* in_vec,
+    const float* target_vec,
+    float lr,
+    float* out_mse_loss
+) {
+    if (!ctx || !in_vec || !target_vec || !(lr > 0.0f)) return -1;
+    std::lock_guard<std::recursive_mutex> state_guard(*static_cast<std::recursive_mutex*>(ctx->state_lock));
+
+    alignas(64) float pred_vec[HSSA_HIDDEN_DIM];
+    int rc = hssa_forward_token(ctx, in_vec, pred_vec, nullptr);
+    if (rc != 0) return rc;
+
+    alignas(64) float err_vec[HSSA_HIDDEN_DIM];
+    __m512 v_sq_err = _mm512_setzero_ps();
+    __m512 v_sq_x   = _mm512_setzero_ps();
+    for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+        __m512 vt = _mm512_loadu_ps(target_vec + j);
+        __m512 vp = _mm512_load_ps(pred_vec + j);
+        __m512 vx = _mm512_loadu_ps(in_vec + j);
+        __m512 ve = _mm512_sub_ps(vt, vp);
+        _mm512_store_ps(err_vec + j, ve);
+        v_sq_err = _mm512_fmadd_ps(ve, ve, v_sq_err);
+        v_sq_x   = _mm512_fmadd_ps(vx, vx, v_sq_x);
+    }
+    const float mse = _mm512_reduce_add_ps(v_sq_err) / static_cast<float>(HSSA_HIDDEN_DIM);
+    if (out_mse_loss) *out_mse_loss = mse;
+
+    const float x_norm_sq = std::max(1e-6f, _mm512_reduce_add_ps(v_sq_x));
+    const float x_norm    = std::sqrt(x_norm_sq);
+    const float inv_sqrt_r_x = 1.0f / (std::sqrt(static_cast<float>(HSSA_RANK)) * x_norm);
+
+    // 1. Update base layer Q/K/V/Gate projections via Straight-Through Estimator (STE)
+    //    and re-quantize 1.58-bit ternary bitplanes + coupled low-rank TT16 adapters
+    const float layer_lr = lr / static_cast<float>(std::max<uint32_t>(1U, ctx->config.num_layers));
+    const float base_lr  = (0.25f * layer_lr) / x_norm_sq;
+    for (uint32_t l = 0; l < ctx->config.num_layers; ++l) {
+        HssaLayer* layer = &ctx->layers[l];
+        HssaBaseLayerWeights* bw = static_cast<HssaBaseLayerWeights*>(layer->reserved[1]);
+        if (bw) {
+            const size_t D_H = HSSA_HEAD_DIM;
+            for (uint32_t h = 0; h < HSSA_HEADS; ++h) {
+                const size_t base_off = static_cast<size_t>(h) * D_H;
+                const size_t rot_k = ((size_t)(l * 7 + h * 3 + 1)) & (D_H - 1);
+                const size_t rot_q = ((size_t)(l * 11 + h * 5 + 3)) & (D_H - 1);
+                const size_t rot_v = ((size_t)(l * 13 + h * 7 + 5)) & (D_H - 1);
+                const float* x_h = &in_vec[base_off];
+                const float* e_h = &err_vec[base_off];
+                for (size_t r = 0; r < D_H; ++r) {
+                    const size_t d_idx = base_off + r;
+                    const float x0 = x_h[r];
+                    const float xk = x_h[(r + rot_k) & (D_H - 1)];
+                    const float xq = x_h[(r + rot_q) & (D_H - 1)];
+                    const float xv = x_h[(r + rot_v) & (D_H - 1)];
+                    const float er = e_h[r];
+
+                    bw->w_v_diag[d_idx] = std::clamp(bw->w_v_diag[d_idx] + base_lr * er * x0, -2.0f, 2.0f);
+                    bw->w_v_rot[d_idx]  = std::clamp(bw->w_v_rot[d_idx]  + base_lr * er * xv, -2.0f, 2.0f);
+                    bw->w_q_diag[d_idx] = std::clamp(bw->w_q_diag[d_idx] + 0.5f * base_lr * er * x0, -2.0f, 2.0f);
+                    bw->w_q_rot[d_idx]  = std::clamp(bw->w_q_rot[d_idx]  + 0.5f * base_lr * er * xq, -2.0f, 2.0f);
+                    bw->w_k_diag[d_idx] = std::clamp(bw->w_k_diag[d_idx] + 0.5f * base_lr * er * x0, -2.0f, 2.0f);
+                    bw->w_k_rot[d_idx]  = std::clamp(bw->w_k_rot[d_idx]  + 0.5f * base_lr * er * xk, -2.0f, 2.0f);
+                    bw->w_g_diag[d_idx] = std::clamp(bw->w_g_diag[d_idx] + 0.25f * base_lr * er * x0, -2.0f, 2.0f);
+                    bw->w_g_rot[d_idx]  = std::clamp(bw->w_g_rot[d_idx]  + 0.25f * base_lr * er * xq, -2.0f, 2.0f);
+                }
+            }
+            hssa_quantize_base_ternary(bw);
+        }
+
+        for (size_t r = 0; r < HSSA_RANK; ++r) {
+            float* u_row = &layer->tt_u[r * HSSA_HIDDEN_DIM];
+            float* v_row = &layer->tt_v[r * HSSA_HIDDEN_DIM];
+
+            __m512 acc_vx = _mm512_setzero_ps();
+            __m512 acc_ue = _mm512_setzero_ps();
+            __m512 acc_vv = _mm512_setzero_ps();
+            for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+                __m512 vu = _mm512_load_ps(u_row + j);
+                __m512 vv = _mm512_load_ps(v_row + j);
+                __m512 vx = _mm512_loadu_ps(in_vec + j);
+                __m512 ve = _mm512_load_ps(err_vec + j);
+                acc_vx = _mm512_fmadd_ps(vv, vx, acc_vx);
+                acc_ue = _mm512_fmadd_ps(vu, ve, acc_ue);
+                acc_vv = _mm512_fmadd_ps(vv, vv, acc_vv);
+            }
+            const float vv_sq = _mm512_reduce_add_ps(acc_vv);
+            if (vv_sq < 1e-10f) {
+                // Zero-initialized rank r: align v_r with normalized input x and step u_r along error e
+                const __m512 v_init_v = _mm512_set1_ps(inv_sqrt_r_x);
+                const __m512 v_step_u = _mm512_set1_ps(layer_lr * inv_sqrt_r_x);
+                for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+                    __m512 vu   = _mm512_load_ps(u_row + j);
+                    __m512 vx   = _mm512_loadu_ps(in_vec + j);
+                    __m512 verr = _mm512_load_ps(err_vec + j);
+                    _mm512_store_ps(v_row + j, _mm512_mul_ps(v_init_v, vx));
+                    _mm512_store_ps(u_row + j, _mm512_fmadd_ps(v_step_u, verr, vu));
+                }
+            } else {
+                const float z_r = _mm512_reduce_add_ps(acc_vx);
+                const float g_r = _mm512_reduce_add_ps(acc_ue);
+                const __m512 v_step_u = _mm512_set1_ps((layer_lr / x_norm_sq) * z_r);
+                const __m512 v_step_v = _mm512_set1_ps((layer_lr / x_norm_sq) * g_r);
+                for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+                    __m512 vu   = _mm512_load_ps(u_row + j);
+                    __m512 vv   = _mm512_load_ps(v_row + j);
+                    __m512 vx   = _mm512_loadu_ps(in_vec + j);
+                    __m512 verr = _mm512_load_ps(err_vec + j);
+                    _mm512_store_ps(u_row + j, _mm512_fmadd_ps(v_step_u, verr, vu));
+                    _mm512_store_ps(v_row + j, _mm512_fmadd_ps(v_step_v, vx, vv));
+                }
+            }
+        }
+        layer->reserved[0] = reinterpret_cast<void*>(1);
+    }
+    if (ctx->cuda_active && ctx->cuda_drv && ctx->gpu_matrix && ctx->config.num_layers > 0) {
+        CudaDriverApi* drv = static_cast<CudaDriverApi*>(ctx->cuda_drv);
+        GpuQuantizedMatrix* gpu = static_cast<GpuQuantizedMatrix*>(ctx->gpu_matrix);
+        const size_t tt_bytes = static_cast<size_t>(HSSA_TT16_CORE_SIZE) * sizeof(float);
+        drv->cuMemcpyHtoD_v2(gpu->d_tt_u, ctx->layers[0].tt_u, tt_bytes);
+        drv->cuMemcpyHtoD_v2(gpu->d_tt_v, ctx->layers[0].tt_v, tt_bytes);
+    }
+
+    // 2. Adapt the closest Hopfield attractor pattern along err_vec = target_vec - pred_vec
+    if (ctx->attractor_patterns && ctx->num_attractor_patterns > 0) {
+        size_t best_k = 0;
+        float best_dot = -1e30f;
+        for (size_t k = 0; k < ctx->num_attractor_patterns; ++k) {
+            const float* pat = &ctx->attractor_patterns[k * HSSA_HIDDEN_DIM];
+            __m512 acc = _mm512_setzero_ps();
+            for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+                acc = _mm512_fmadd_ps(_mm512_load_ps(pat + j), _mm512_load_ps(pred_vec + j), acc);
+            }
+            float d = _mm512_reduce_add_ps(acc);
+            if (d > best_dot) {
+                best_dot = d;
+                best_k = k;
+            }
+        }
+        float* pat = &ctx->attractor_patterns[best_k * HSSA_HIDDEN_DIM];
+        const float att_lr = std::min(0.50f, lr);
+        const __m512 v_att_lr = _mm512_set1_ps(att_lr);
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+            __m512 vp   = _mm512_load_ps(pat + j);
+            __m512 verr = _mm512_load_ps(err_vec + j);
+            _mm512_store_ps(pat + j, _mm512_fmadd_ps(v_att_lr, verr, vp));
+        }
+    }
+
+    // 3. Adapt the closest unembedding row toward target_vec so autoregressive decoding
+    //    aligns with the trained continuous representation space
+    if (ctx->unembed_weights && ctx->vocab_size > 0) {
+        size_t best_v = 0;
+        float best_dot = -1e30f;
+        for (size_t v = 0; v < ctx->vocab_size; ++v) {
+            const float* row = &ctx->unembed_weights[v * HSSA_HIDDEN_DIM];
+            __m512 acc = _mm512_setzero_ps();
+            for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+                acc = _mm512_fmadd_ps(_mm512_load_ps(row + j), _mm512_loadu_ps(target_vec + j), acc);
+            }
+            float d = _mm512_reduce_add_ps(acc);
+            if (d > best_dot) {
+                best_dot = d;
+                best_v = v;
+            }
+        }
+        float* row = &ctx->unembed_weights[best_v * HSSA_HIDDEN_DIM];
+        const __m512 v_unemb_lr = _mm512_set1_ps(std::min(0.10f, 0.05f * lr));
+        for (size_t j = 0; j < HSSA_HIDDEN_DIM; j += 16) {
+            __m512 vr   = _mm512_load_ps(row + j);
+            __m512 verr = _mm512_load_ps(err_vec + j);
+            _mm512_store_ps(row + j, _mm512_fmadd_ps(v_unemb_lr, verr, vr));
+        }
+    }
+
+    return 0;
+}
+

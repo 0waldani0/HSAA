@@ -35,7 +35,7 @@ if not exist "%OUT_DIR%ptq_cuda.lib" (
 )
 
 echo [*] Compiling Native E2E Test Suite (real modules, no mocks)...
-cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /EHsc /wd4068 ^
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /utf-8 /EHsc /wd4068 ^
     /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%legacy_ptq" ^
     "%~dp0e2e_test_runner.cpp" ^
     "%ROOT_DIR%src\bridge.cpp" ^

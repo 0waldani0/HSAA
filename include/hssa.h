@@ -349,8 +349,43 @@ int hssa_forward_deep_interpolated(
     HssaTelemetry* out_telem
 );
 
+/*
+ * =============================================================================
+ * Binary Weight Checkpoint Persistence & Online Token-Step Training (AVX-512)
+ * =============================================================================
+ */
+
+/*
+ * Save all HSSA layer weights (tt_u, tt_v, deltanet_state), Hopfield attractors,
+ * and unembedding matrix to a checksummed binary checkpoint file.
+ * Returns 0 on success, negative error code on failure.
+ */
+int hssa_save_weights(const HssaContext* ctx, const char* filepath);
+
+/*
+ * Load and verify all HSSA layer weights, Hopfield attractors, and unembedding
+ * matrix from a checksummed binary checkpoint file.
+ * Returns 0 on success, negative error code on failure or checksum mismatch.
+ */
+int hssa_load_weights(HssaContext* ctx, const char* filepath);
+
+/*
+ * Execute a single online training step on an (in_vec, target_vec) pair in R^{1024}:
+ * Runs forward propagation, computes MSE loss, and updates per-layer TT16 low-rank
+ * factors (tt_u, tt_v) and Hopfield attractor manifold via AVX-512 FMA gradients.
+ * Returns 0 on success, negative error code on invalid arguments.
+ */
+int hssa_train_token_step(
+    HssaContext* ctx,
+    const float* in_vec,
+    const float* target_vec,
+    float lr,
+    float* out_mse_loss
+);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* HSSA_H */
+

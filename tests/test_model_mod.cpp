@@ -448,6 +448,52 @@ static bool test_continuous_representation_and_deep_interpolation() {
     return true;
 }
 
+// 12. Feature 3.5: Binary Weight Checkpoint Persistence & Online Layer Training
+static bool test_weight_checkpoint_and_online_training() {
+    ModelContext* ctx = model_create_context(4);
+    TEST_ASSERT(ctx != nullptr, "Context creation failed");
+
+    std::vector<float> in_vec(MODEL_DEFAULT_DIM_N, 0.0f);
+    std::vector<float> target_vec(MODEL_DEFAULT_DIM_M, 0.0f);
+    for (size_t i = 0; i < MODEL_DEFAULT_DIM_N; ++i) {
+        in_vec[i] = std::sin(static_cast<float>(i + 1) * 0.07f);
+        target_vec[i] = std::cos(static_cast<float>(i + 1) * 0.05f);
+    }
+
+    float initial_loss = 0.0f;
+    float final_loss = 0.0f;
+    for (int step = 0; step < 8; ++step) {
+        float loss = 0.0f;
+        int rc = model_train_layer_step(ctx, 0, in_vec.data(), target_vec.data(), 0.01f, &loss);
+        TEST_ASSERT(rc == 0, "model_train_layer_step must succeed");
+        if (step == 0) initial_loss = loss;
+        final_loss = loss;
+    }
+    TEST_ASSERT(final_loss < initial_loss, "Online layer training must strictly reduce MSE loss");
+
+    const char* ckpt_path = "test_model_mod_weights.bin";
+    TEST_ASSERT(model_save_weights(ctx, ckpt_path) == 0, "model_save_weights must succeed");
+
+    std::vector<float> out_before(MODEL_DEFAULT_DIM_M, 0.0f);
+    TEST_ASSERT(model_forward_layer(ctx, 0, in_vec.data(), out_before.data()) == 0, "Forward before reload must succeed");
+
+    ModelContext* ctx2 = model_create_context(4);
+    TEST_ASSERT(ctx2 != nullptr, "Second context creation failed");
+    TEST_ASSERT(model_load_weights(ctx2, ckpt_path) == 0, "model_load_weights must succeed with valid checksum");
+
+    std::vector<float> out_after(MODEL_DEFAULT_DIM_M, 0.0f);
+    TEST_ASSERT(model_forward_layer(ctx2, 0, in_vec.data(), out_after.data()) == 0, "Forward after reload must succeed");
+
+    for (size_t i = 0; i < MODEL_DEFAULT_DIM_M; ++i) {
+        TEST_ASSERT(std::fabs(out_before[i] - out_after[i]) < 1e-6f, "Reloaded model weights must produce identical forward output");
+    }
+
+    std::remove(ckpt_path);
+    model_destroy_context(ctx2);
+    model_destroy_context(ctx);
+    return true;
+}
+
 // =============================================================================
 // Main Test Runner
 // =============================================================================
@@ -468,6 +514,7 @@ int main() {
     RUN_TEST(test_adversarial_boundaries);
     RUN_TEST(test_interleaved_swapping_and_plasticity);
     RUN_TEST(test_continuous_representation_and_deep_interpolation);
+    RUN_TEST(test_weight_checkpoint_and_online_training);
 
     std::printf("=================================================================\n");
     std::printf("Test Summary: %d Run, %d Passed, %d Failed\n", g_tests_run, g_tests_passed, g_tests_failed);
@@ -481,3 +528,4 @@ int main() {
     std::printf("[RESULT] ALL MODEL_MOD TESTS PASSED CLEANLY (Exit Code 0)\n");
     return 0;
 }
+
