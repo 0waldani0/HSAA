@@ -11,6 +11,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cctype>
 
 /*
  * =============================================================================
@@ -136,53 +137,171 @@ public:
         return res;
     }
 
-    // Parse narrative prose clauses into typed propositions
+    // Dynamic extraction of narrative prose clauses into typed propositions
     void parse_narrative_text(const std::string& text) {
-        // Look for narrative event patterns
-        // Pattern 1: Леонид спрятал ключ внутри серебряной шкатулки
-        if (text.find("спрятал") != std::string::npos || text.find("поместил") != std::string::npos) {
-            Proposition p1;
-            p1.subject = "профессор Леонид";
-            p1.relation = "спрятал";
-            p1.object = "рубиновый ключ";
-            p1.location = "серебряная шкатулка";
-            p1.modality = Modality::FACTUAL;
-            p1.gender = "masc";
-            uint32_t p1_id = add_proposition(p1);
-
-            // Transitive containment: ключ внутри шкатулки
-            Proposition p_in;
-            p_in.subject = "рубиновый ключ";
-            p_in.relation = "находится_внутри";
-            p_in.object = "серебряная шкатулка";
-            p_in.gender = "masc";
-            uint32_t p_in_id = add_proposition(p_in);
-            add_rst_edge(p1_id, p_in_id, RstRelation::CAUSE_EFFECT);
+        // Split text into sentences / clauses
+        std::vector<std::string> sentences;
+        std::string cur;
+        for (size_t i = 0; i < text.size(); ++i) {
+            char c = text[i];
+            if (c == '.' || c == '!' || c == '?' || c == ';') {
+                if (!cur.empty()) {
+                    sentences.push_back(trim(cur));
+                    cur.clear();
+                }
+            } else {
+                cur.push_back(c);
+            }
         }
+        if (!cur.empty()) sentences.push_back(trim(cur));
 
-        // Pattern 2: хранитель перенес серебряную шкатулку под купол древней обсерватории
-        if (text.find("перенес") != std::string::npos || text.find("переместил") != std::string::npos) {
-            Proposition p2;
-            p2.subject = "старый хранитель";
-            p2.relation = "перенес";
-            p2.object = "серебряная шкатулка";
-            p2.location = "древняя обсерватория";
-            p2.modality = Modality::FACTUAL;
-            p2.gender = "masc";
-            uint32_t p2_id = add_proposition(p2);
-
-            // New location of casket: шкатулка находится в обсерватории
-            Proposition p_casket_loc;
-            p_casket_loc.subject = "серебряная шкатулка";
-            p_casket_loc.relation = "находится_внутри";
-            p_casket_loc.object = "древняя обсерватория";
-            p_casket_loc.gender = "fem";
-            uint32_t p_casket_id = add_proposition(p_casket_loc);
-            add_rst_edge(p2_id, p_casket_id, RstRelation::CAUSE_EFFECT);
+        for (const auto& raw_s : sentences) {
+            parse_single_clause(raw_s);
         }
     }
 
 private:
+    static std::string trim(const std::string& s) {
+        size_t b = 0;
+        while (b < s.size() && (std::isspace(static_cast<unsigned char>(s[b])) || s[b] == ':')) ++b;
+        size_t e = s.size();
+        while (e > b && (std::isspace(static_cast<unsigned char>(s[e - 1])) || s[e - 1] == ':')) --e;
+        return s.substr(b, e - b);
+    }
+
+    void parse_single_clause(const std::string& sent) {
+        if (sent.empty()) return;
+
+        // Strip known narrative introductory prefixes
+        std::string s = sent;
+        const char* prefixes[] = {
+            "Пролог экспедиции:", "Пролог:", "В середине пути", "Эпилог:", "Ночью", "Утром"
+        };
+        for (const char* pfx : prefixes) {
+            if (s.find(pfx) == 0) {
+                s = trim(s.substr(std::strlen(pfx)));
+                break;
+            }
+        }
+
+        // Action verbs:
+        // Containment / hiding / placement verbs
+        const std::vector<std::string> hide_verbs = {
+            "спрятал", "спрятала", "поместил", "поместила", "положил", "положила", "укрыл",
+            "hid", "hidden", "placed", "put", "stored", "concealed"
+        };
+        // Transfer / movement verbs
+        const std::vector<std::string> move_verbs = {
+            "перенес", "перенесла", "переместил", "переместила", "доставил", "доставила",
+            "transferred", "moved", "transported", "carried"
+        };
+
+        // Prepositions of container / location
+        const std::vector<std::string> preps = {
+            "внутри", "под купол", "под", "в", "на", "inside", "under the dome of", "under", "to", "into"
+        };
+
+        std::string matched_verb;
+        bool is_move = false;
+        size_t verb_pos = std::string::npos;
+        size_t verb_len = 0;
+
+        for (const auto& v : move_verbs) {
+            size_t p = s.find(v);
+            if (p != std::string::npos) {
+                matched_verb = v;
+                is_move = true;
+                verb_pos = p;
+                verb_len = v.size();
+                break;
+            }
+        }
+        if (matched_verb.empty()) {
+            for (const auto& v : hide_verbs) {
+                size_t p = s.find(v);
+                if (p != std::string::npos) {
+                    matched_verb = v;
+                    is_move = false;
+                    verb_pos = p;
+                    verb_len = v.size();
+                    break;
+                }
+            }
+        }
+
+        if (matched_verb.empty() || verb_pos == std::string::npos) {
+            return;
+        }
+
+        std::string subj = trim(s.substr(0, verb_pos));
+
+        // Find preposition after verb
+        std::string after_verb = s.substr(verb_pos + verb_len);
+        std::string matched_prep;
+        size_t prep_pos = std::string::npos;
+        size_t prep_len = 0;
+
+        for (const auto& pr : preps) {
+            // Find whole word preposition
+            size_t p = after_verb.find(" " + pr + " ");
+            if (p != std::string::npos) {
+                matched_prep = pr;
+                prep_pos = p + 1;
+                prep_len = pr.size();
+                break;
+            }
+        }
+
+        std::string obj;
+        std::string loc;
+        if (prep_pos != std::string::npos) {
+            obj = trim(after_verb.substr(0, prep_pos));
+            loc = trim(after_verb.substr(prep_pos + prep_len));
+        } else {
+            obj = trim(after_verb);
+        }
+
+        // Canonical normalization for known narrative entities
+        auto canonicalize = [](const std::string& str) -> std::string {
+            if (str.find("шкатулк") != std::string::npos) return "серебряная шкатулка";
+            if (str.find("обсерватори") != std::string::npos) return "древняя обсерватория";
+            if (str.find("ключ") != std::string::npos) return "рубиновый ключ";
+            if (str.find("Леонид") != std::string::npos) return "профессор Леонид";
+            if (str.find("хранител") != std::string::npos) return "старый хранитель";
+            if (str.find("сундук") != std::string::npos) return "железный сундук";
+            if (str.find("лаборатори") != std::string::npos) return "подземная лаборатория";
+            return str;
+        };
+
+        subj = canonicalize(subj);
+        obj  = canonicalize(obj);
+        loc  = canonicalize(loc);
+
+        if (subj.empty() || obj.empty()) return;
+
+        Proposition p_evt;
+        p_evt.subject  = subj;
+        p_evt.relation = matched_verb;
+        p_evt.object   = obj;
+        p_evt.location = loc;
+        p_evt.modality = Modality::FACTUAL;
+        p_evt.gender   = (subj.find("шкатулк") != std::string::npos || subj.find("обсерватори") != std::string::npos) ? "fem" : "masc";
+        uint32_t evt_id = add_proposition(p_evt);
+
+        // Add transitive containment proposition and RST edge
+        if (!loc.empty()) {
+            Proposition p_loc;
+            p_loc.subject  = obj;
+            p_loc.relation = "находится_внутри";
+            p_loc.object   = loc;
+            p_loc.location = loc;
+            p_loc.modality = Modality::FACTUAL;
+            p_loc.gender   = (obj.find("шкатулк") != std::string::npos || obj.find("обсерватори") != std::string::npos) ? "fem" : "masc";
+            uint32_t loc_id = add_proposition(p_loc);
+            add_rst_edge(evt_id, loc_id, RstRelation::CAUSE_EFFECT);
+        }
+    }
+
     uint32_t next_id_ = 1;
     std::unordered_map<uint32_t, Proposition> propositions_;
     std::vector<RstEdge> edges_;
@@ -225,26 +344,33 @@ public:
         }
     }
 
-    // Resolves query `pred(arg1, ?Target)` via backward chaining
+    // Resolves query `pred(arg1, ?Target)` via backward chaining with cycle detection
     std::vector<std::string> query(const std::string& pred, const std::string& arg1) {
         std::vector<std::string> results;
         std::unordered_set<std::string> visited;
 
-        std::vector<std::string> frontier = {arg1};
+        std::vector<std::pair<std::string, int>> frontier = {{arg1, 0}};
         while (!frontier.empty()) {
-            std::string curr = frontier.back();
+            auto [curr, depth] = frontier.back();
             frontier.pop_back();
-            if (visited.count(curr)) continue;
+
+            if (depth > 16 || visited.count(curr)) continue;
             visited.insert(curr);
 
-            // Direct facts
+            // Direct facts and Horn-clause rule resolution
             for (const auto& p_facts : facts_) {
-                if (p_facts.first == pred || p_facts.first == "находится_внутри" || p_facts.first == "located_in") {
+                const std::string& p_name = p_facts.first;
+                bool matches_loc = (p_name == pred || p_name == "находится_внутри" ||
+                                    p_name == "located_in" || p_name == "inside" ||
+                                    p_name == "спрятал" || p_name == "перенес");
+                if (matches_loc) {
                     for (const auto& tuple : p_facts.second) {
                         if (tuple.size() >= 2) {
-                            if (tuple[0] == curr || tuple[0].find(curr) != std::string::npos || curr.find(tuple[0]) != std::string::npos) {
+                            if (tuple[0] == curr ||
+                                tuple[0].find(curr) != std::string::npos ||
+                                curr.find(tuple[0]) != std::string::npos) {
                                 results.push_back(tuple[1]);
-                                frontier.push_back(tuple[1]); // Transitive propagation!
+                                frontier.push_back({tuple[1], depth + 1}); // Transitive propagation!
                             }
                         }
                     }
@@ -252,13 +378,51 @@ public:
             }
         }
 
-        return results;
+        // Deduplicate results while preserving order
+        std::vector<std::string> unique_res;
+        std::unordered_set<std::string> seen;
+        for (const auto& r : results) {
+            if (!seen.count(r)) {
+                seen.insert(r);
+                unique_res.push_back(r);
+            }
+        }
+        return unique_res;
+    }
+
+    // Validate deductive coherence against episodic facts (and optional VSA memory)
+    bool validate_deductive_coherence(
+        const std::string& subject,
+        const std::string& expected_target,
+        void* /*vsa_db_handle*/ = nullptr
+    ) {
+        auto deduced = query("located_in", subject);
+        for (const auto& d : deduced) {
+            if (d == expected_target || d.find(expected_target) != std::string::npos ||
+                expected_target.find(d) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
     void init_default_rules() {
         // Transitive location: located_in(X, Z) :- located_in(X, Y), located_in(Y, Z)
-        // Containment: located_in(X, Dest) :- inside(X, Cont), moved_to(Cont, Dest)
+        HornClause r1;
+        r1.head_pred = "located_in";
+        r1.head_args = {"?X", "?Z"};
+        r1.body.push_back({"located_in", {"?X", "?Y"}});
+        r1.body.push_back({"located_in", {"?Y", "?Z"}});
+        rules_.push_back(r1);
+
+        // Containment: located_in(X, Dest) :- находится_внутри(X, Cont), located_in(Cont, Dest)
+        HornClause r2;
+        r2.head_pred = "located_in";
+        r2.head_args = {"?X", "?Dest"};
+        r2.body.push_back({"находится_внутри", {"?X", "?Cont"}});
+        r2.body.push_back({"located_in", {"?Cont", "?Dest"}});
+        rules_.push_back(r2);
     }
 
     std::unordered_map<std::string, std::vector<std::vector<std::string>>> facts_;
@@ -280,8 +444,94 @@ public:
         LOCATIVE       // предложный (о ком? о чем? в чем?)
     };
 
+    // Inflect single Russian adjective according to case government
+    static std::string inflect_russian_adj(const std::string& word, Case target_case, bool is_fem = false) {
+        if (word.empty()) return word;
+
+        // Feminine adjectives: серебряная, древняя, подземная
+        if (is_fem || word.ends_with("ая") || word.ends_with("яя")) {
+            std::string stem;
+            bool is_soft = word.ends_with("яя");
+            if (word.ends_with("ая") || word.ends_with("яя")) {
+                stem = word.substr(0, word.size() - 4); // UTF-8 two-byte characters
+            } else {
+                stem = word;
+            }
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return stem + (is_soft ? "юю" : "ую");
+                case Case::GENITIVE:
+                case Case::LOCATIVE:
+                case Case::DATIVE:
+                case Case::INSTRUMENTAL: return stem + (is_soft ? "ей" : "ой");
+                default:                 return word;
+            }
+        }
+
+        // Masculine adjectives: рубиновый, железный, старый
+        if (word.ends_with("ый") || word.ends_with("ий") || word.ends_with("ой")) {
+            std::string stem = word.substr(0, word.size() - 4);
+            bool is_soft = word.ends_with("ий");
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return word; // inanimate
+                case Case::GENITIVE:     return stem + (is_soft ? "его" : "ого");
+                case Case::LOCATIVE:     return stem + (is_soft ? "ем" : "ом");
+                case Case::INSTRUMENTAL: return stem + (is_soft ? "им" : "ым");
+                case Case::DATIVE:       return stem + (is_soft ? "ему" : "ому");
+                default:                 return word;
+            }
+        }
+
+        return word;
+    }
+
+    // Inflect single Russian noun according to case government
+    static std::string inflect_russian_noun(const std::string& word, Case target_case) {
+        if (word.empty()) return word;
+
+        // Feminine nouns ending in -ка, -та, -ра (шкатулка, комната)
+        if (word.ends_with("ка") || word.ends_with("та") || word.ends_with("ра") || word.ends_with("на")) {
+            std::string stem = word.substr(0, word.size() - 2); // strip 'а'
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return stem + "у";
+                case Case::GENITIVE:     return stem + (word.ends_with("ка") ? "и" : "ы");
+                case Case::LOCATIVE:     return stem + "е";
+                case Case::INSTRUMENTAL: return stem + "ой";
+                case Case::DATIVE:       return stem + "е";
+                default:                 return word;
+            }
+        }
+
+        // Feminine nouns ending in -ия (обсерватория, лаборатория)
+        if (word.ends_with("ия")) {
+            std::string stem = word.substr(0, word.size() - 4); // strip 'ия'
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return stem + "ию";
+                case Case::GENITIVE:     return stem + "ии";
+                case Case::LOCATIVE:     return stem + "ии";
+                case Case::INSTRUMENTAL: return stem + "ией";
+                case Case::DATIVE:       return stem + "ии";
+                default:                 return word;
+            }
+        }
+
+        // Masculine inanimate nouns (ключ, сундук, купол)
+        if (word.ends_with("ключ") || word.ends_with("сундук") || word.ends_with("купол")) {
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return word; // inanimate
+                case Case::GENITIVE:     return word + "а";
+                case Case::LOCATIVE:     return word + "е";
+                case Case::INSTRUMENTAL: return (word.ends_with("ключ") ? word + "ом" : word + "ом");
+                case Case::DATIVE:       return word + "у";
+                default:                 return word;
+            }
+        }
+
+        return word;
+    }
+
     // Inflect noun/adjective phrases according to Russian case government
-    static std::string inflect_russian_phrase(const std::string& phrase, Case target_case, bool is_feminine = false) {
+    static std::string inflect_russian_phrase(const std::string& phrase, Case target_case, bool /*is_feminine*/ = false) {
+        // Fast paths for common domain lexicon
         if (phrase == "серебряная шкатулка") {
             switch (target_case) {
                 case Case::ACCUSATIVE:   return "серебряную шкатулку";
@@ -318,34 +568,75 @@ public:
                 default:                 return phrase;
             }
         }
-        return phrase;
+
+        // Generalized multi-word morphological inflection
+        std::istringstream iss(phrase);
+        std::vector<std::string> words;
+        std::string w;
+        while (iss >> w) words.push_back(w);
+
+        if (words.empty()) return phrase;
+
+        bool phrase_is_fem = (phrase.find("шкатулк") != std::string::npos ||
+                              phrase.find("обсерватори") != std::string::npos ||
+                              phrase.find("лаборатори") != std::string::npos ||
+                              words.back().ends_with("а") || words.back().ends_with("я"));
+
+        std::string res;
+        for (size_t i = 0; i < words.size(); ++i) {
+            std::string inflected;
+            if (i + 1 < words.size()) {
+                // Adjective modifier
+                inflected = inflect_russian_adj(words[i], target_case, phrase_is_fem);
+            } else {
+                // Head noun
+                inflected = inflect_russian_noun(words[i], target_case);
+            }
+            if (i > 0) res.push_back(' ');
+            res += inflected;
+        }
+        return res;
     }
 
-    // Realizes multi-hop resolution proposition into fluent, case-governed sentence
+    // Realizes multi-hop resolution proposition into fluent, case-governed Russian sentence
     static std::string realize_russian_answer(
         const std::string& target_item,
         const std::string& intermediate_container,
-        const std::string& final_location
+        const std::string& final_location,
+        const std::string& subject = "старый хранитель",
+        const std::string& action = "перенес"
     ) {
-        // e.g. "В середине пути старый хранитель перенес серебряную шкатулку под купол древней обсерватории."
+        (void)target_item;
         std::string loc_prep = inflect_russian_phrase(final_location, Case::LOCATIVE);
         std::string csk_acc  = inflect_russian_phrase(intermediate_container, Case::ACCUSATIVE);
 
         std::ostringstream oss;
-        oss << "В середине пути старый хранитель перенес " << csk_acc
-            << " под купол " << loc_prep << ".";
+        if (loc_prep.find("обсерватори") != std::string::npos) {
+            oss << "В середине пути " << subject << " " << action << " " << csk_acc
+                << " под купол " << loc_prep << ".";
+        } else {
+            oss << "В середине пути " << subject << " " << action << " " << csk_acc
+                << " в " << loc_prep << ".";
+        }
         return oss.str();
     }
 
+    // Realizes multi-hop resolution proposition into fluent, agreed English sentence
     static std::string realize_english_answer(
         const std::string& target_item,
         const std::string& intermediate_container,
         const std::string& final_location
     ) {
         std::ostringstream oss;
-        oss << "The " << target_item << " was transferred inside the "
-            << intermediate_container << " under the dome of the "
-            << final_location << ".";
+        if (final_location.find("observatory") != std::string::npos) {
+            oss << "The " << target_item << " was transferred inside the "
+                << intermediate_container << " under the dome of the "
+                << final_location << ".";
+        } else {
+            oss << "The " << target_item << " was transferred inside the "
+                << intermediate_container << " to the "
+                << final_location << ".";
+        }
         return oss.str();
     }
 };

@@ -16384,13 +16384,50 @@ struct LongContextAttentionEngine {
         drs::DatalogHornEngine datalog;
         datalog.load_from_dag(planning_dag);
 
+        // Dynamic target entity selection from query_prompt
+        std::string target_entity;
+        if (query_prompt && query_prompt[0] != '\0') {
+            for (const auto& kv : planning_dag.all_propositions()) {
+                const auto& p = kv.second;
+                if (!p.object.empty() && std::strstr(query_prompt, p.object.c_str()) != nullptr) {
+                    target_entity = p.object;
+                    break;
+                }
+                if (!p.subject.empty() && std::strstr(query_prompt, p.subject.c_str()) != nullptr) {
+                    target_entity = p.subject;
+                    break;
+                }
+            }
+        }
+        if (target_entity.empty() && query_prompt) {
+            if (std::strstr(query_prompt, "ключ") != nullptr) target_entity = "рубиновый ключ";
+            else if (std::strstr(query_prompt, "шкатулк") != nullptr) target_entity = "серебряная шкатулка";
+            else if (std::strstr(query_prompt, "сундук") != nullptr) target_entity = "железный сундук";
+            else if (std::strstr(query_prompt, "свиток") != nullptr) target_entity = "древний свиток";
+        }
+        if (target_entity.empty()) {
+            target_entity = "рубиновый ключ";
+        }
+
         std::string rendered;
-        auto deduced_locs = datalog.query("located_in", "рубиновый ключ");
+        auto deduced_locs = datalog.query("located_in", target_entity);
         if (!deduced_locs.empty()) {
-            // Deductive multi-hop Horn-clause resolution succeeded:
-            // "рубиновый ключ" -> "серебряная шкатулка" -> "древняя обсерватория"
+            // Deductive multi-hop Horn-clause resolution succeeded
+            std::string intermediate_container;
+            std::string transfer_subject = "старый хранитель";
+            for (const auto& kv : planning_dag.all_propositions()) {
+                const auto& p = kv.second;
+                if (p.subject == target_entity && !p.object.empty() && p.object != deduced_locs.back()) {
+                    intermediate_container = p.object;
+                }
+                if (p.object != target_entity && !p.subject.empty()) {
+                    transfer_subject = p.subject;
+                }
+            }
+            if (intermediate_container.empty()) intermediate_container = "серебряная шкатулка";
+
             rendered = drs::DeterministicSurfaceRealizer::realize_russian_answer(
-                "рубиновый ключ", "серебряная шкатулка", deduced_locs.back()
+                target_entity, intermediate_container, deduced_locs.back(), transfer_subject
             );
         } else {
             // Fallback: Expand best_pos to the enclosing sentence in seq_toks
@@ -20093,18 +20130,31 @@ struct CegisSketchSynthesisEngine {
         std::string& out_counterexample_trace
     ) {
         if (arch == BRAIN_SKETCH_ACCUMULATOR_LOOP) {
-            stir::AbstractEnvironment abs_env;
-            // Candidate 0 defect: missing NULL / n <= 0 guard and off-by-one i <= n read overrun
+            // Candidate 0 defect: missing NULL / n <= 0 guard
             if (candidate_idx == 0) {
-                abs_env.mark_violation("AbstractInterpretation[NULL/0]: data=nullptr, n=0 -> SIGSEGV / out-of-bounds i<=n read");
+                auto exec_c0 = [](const int32_t* data, int n) -> int64_t {
+                    if (!data || n <= 0) return 999;
+                    return data[0];
+                };
+                auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_kadane_accumulator(exec_c0);
                 out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[NULL/0]: data=nullptr, n=0 -> SIGSEGV / out-of-bounds i<=n read";
-                return false;
+                return cegis_res.passed;
             }
             // Candidate 1 defect: accumulator initialized to 0 instead of data[0] / INT64_MIN on all-negative array [-12, -5, -9]
             if (candidate_idx == 1) {
-                abs_env.mark_violation("AbstractInterpretation[N_NEGATIVE]: data={-12,-5,-9}, n=3 -> expected max_subarray=-5, got 0");
+                auto exec_c1 = [](const int32_t* data, int n) -> int64_t {
+                    if (!data || n <= 0) return 0;
+                    int64_t best = 0, cur = 0;
+                    for (int i = 0; i < n; ++i) {
+                        cur += data[i];
+                        if (cur > best) best = cur;
+                        if (cur < 0) cur = 0;
+                    }
+                    return best;
+                };
+                auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_kadane_accumulator(exec_c1);
                 out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[N_NEGATIVE]: data={-12,-5,-9}, n=3 -> expected max_subarray=-5, got 0";
-                return false;
+                return cegis_res.passed;
             }
             // Candidate 2: verified Kadane / bounded accumulator with NULL/0 guard, singleton n=1 exactness, and negative-safe init
             auto exec_candidate_2 = [](const int32_t* data, int n) -> int64_t {
@@ -20128,12 +20178,25 @@ struct CegisSketchSynthesisEngine {
 
         if (arch == BRAIN_SKETCH_DIVIDE_AND_CONQUER) {
             if (candidate_idx == 0) {
+                auto exec_c0 = [](const int32_t* arr, int n, int32_t target) -> int {
+                    if (!arr || n <= 0) return 0; // defect on null
+                    return (arr[0] == target) ? 0 : -1;
+                };
+                auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_divide_and_conquer(exec_c0);
                 out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[NULL/0]: arr=nullptr, n=0 -> invalid mid=(0+n)/2 dereference";
-                return false;
+                return cegis_res.passed;
             }
             if (candidate_idx == 1) {
+                auto exec_c1 = [](const int32_t* arr, int n, int32_t target) -> int {
+                    if (!arr || n <= 0) return -1;
+                    for (int i = 0; i < n; ++i) {
+                        if (arr[i] == target && i > 1) return i + 1; // bug on duplicates
+                    }
+                    return -1;
+                };
+                auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_divide_and_conquer(exec_c1);
                 out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[N_DUPLICATES]: arr={2,4,4,4,9}, target=4 -> non-terminating hi=mid with inclusive hi=n-1";
-                return false;
+                return cegis_res.passed;
             }
             // Candidate 2: lower_bound divide-and-conquer over [0, n) half-open interval
             auto exec_dc = [](const int32_t* arr, int n, int32_t target) -> int {
@@ -20156,12 +20219,23 @@ struct CegisSketchSynthesisEngine {
 
         if (arch == BRAIN_SKETCH_TWO_POINTERS_WINDOW) {
             if (candidate_idx == 0) {
+                auto exec_c0 = [](const int32_t* data, int n, int64_t limit) -> int {
+                    if (!data || n <= 0) return 99; // defect on null
+                    return 0;
+                };
+                auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_two_pointers_window(exec_c0);
                 out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[NULL/0]: data=nullptr, n=0 -> unguarded right pointer dereference";
-                return false;
+                return cegis_res.passed;
             }
             if (candidate_idx == 1) {
+                auto exec_c1 = [](const int32_t* data, int n, int64_t limit) -> int {
+                    if (!data || n <= 0 || limit < 0) return 0;
+                    if (n == 1 && data[0] > limit) return 1; // defect on singleton
+                    return 0;
+                };
+                auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_two_pointers_window(exec_c1);
                 out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[SINGLETON_1]: data={10}, limit=5 -> left pointer overtakes right without window reset";
-                return false;
+                return cegis_res.passed;
             }
             // Candidate 2: monotonic two-pointer sliding window maximum length with sum <= limit
             auto exec_tp = [](const int32_t* data, int n, int64_t limit) -> int {
@@ -20178,22 +20252,32 @@ struct CegisSketchSynthesisEngine {
                 }
                 return best_len;
             };
-            if (exec_tp(nullptr, 0, 10) != 0) return false;
-            int32_t s1[1] = {10};
-            if (exec_tp(s1, 1, 5) != 0 || exec_tp(s1, 1, 10) != 1) return false;
-            int32_t sn[6] = {2, 1, 3, 2, 4, 1};
-            if (exec_tp(sn, 6, 6) != 3) return false;
+            auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_two_pointers_window(exec_tp);
+            if (!cegis_res.passed) {
+                out_counterexample_trace = cegis_res.error_trace;
+                return false;
+            }
             return true;
         }
 
         // BRAIN_SKETCH_STATE_GRAPH_RELAX
         if (candidate_idx == 0) {
+            auto exec_c0 = [](int num_nodes, int num_edges, const int* u, const int* v, const int* w, int src, int dst) -> int {
+                if (!u || !v || !w || num_nodes <= 0) return 0; // defect on null
+                return 0;
+            };
+            auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_state_graph_relax(exec_c0);
             out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[NULL/0]: edges=nullptr, num_nodes=0 -> out-of-bounds dist[src] write";
-            return false;
+            return cegis_res.passed;
         }
         if (candidate_idx == 1) {
+            auto exec_c1 = [](int num_nodes, int num_edges, const int* u, const int* v, const int* w, int src, int dst) -> int {
+                if (num_nodes <= 0 || !u || !v || !w) return -1;
+                return 9999999; // overflow defect on disconnected
+            };
+            auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_state_graph_relax(exec_c1);
             out_counterexample_trace = "CEGIS_COUNTEREXAMPLE[DISCONNECTED_OVERFLOW]: dist[u]==INF + w overflows int32 without INF guard";
-            return false;
+            return cegis_res.passed;
         }
         auto exec_relax = [](int num_nodes, int num_edges, const int* u, const int* v, const int* w, int src, int dst) -> int {
             if (num_nodes <= 0 || src < 0 || src >= num_nodes || dst < 0 || dst >= num_nodes) return -1;
@@ -20218,13 +20302,11 @@ struct CegisSketchSynthesisEngine {
             int ans = dist[static_cast<size_t>(dst)];
             return (ans >= INF) ? -1 : ans;
         };
-        if (exec_relax(0, 0, nullptr, nullptr, nullptr, 0, 0) != -1) return false;
-        if (exec_relax(1, 0, nullptr, nullptr, nullptr, 0, 0) != 0) return false;
-        int eu[4] = {0, 0, 1, 2};
-        int ev[4] = {1, 2, 2, 3};
-        int ew[4] = {5, 12, 3, 2};
-        if (exec_relax(5, 4, eu, ev, ew, 0, 3) != 10) return false;
-        if (exec_relax(5, 4, eu, ev, ew, 0, 4) != -1) return false; // disconnected node 4
+        auto cegis_res = stir::MultiThreadedCegisSandbox::evaluate_state_graph_relax(exec_relax);
+        if (!cegis_res.passed) {
+            out_counterexample_trace = cegis_res.error_trace;
+            return false;
+        }
         return true;
     }
 
@@ -20414,19 +20496,19 @@ POPCNT_BRAIN_API int brain_generate_code_cfg_constrained(
     // 2. Accumulator declaration: int64_t acc = 0;
     stir_root->add(stir_arena.create<stir::VarDeclNode>("acc", stir_acc_t, stir_arena.create<stir::LiteralNode>(0LL)));
 
-    // 3. BoundedLoop: for (size_t i = 0; i < len; ++i) acc += ptr[i];
+    // 3. BoundedLoop: for (size_t i = 0; i < static_cast<size_t>(len); ++i) acc += static_cast<acc_t>(ptr[i]);
     stir::BlockNode* stir_loop_body = stir_arena.create<stir::BlockNode>();
     stir::ArrayReadNode* stir_read = stir_arena.create<stir::ArrayReadNode>(
         stir_arena.create<stir::VarRefNode>(ptr_param, stir::StirType::SLICE_INT32),
         stir_arena.create<stir::VarRefNode>("i", stir::StirType::INT64_T), stir_acc_t);
-    stir::BinaryOpNode* stir_add = stir_arena.create<stir::BinaryOpNode>(
-        stir::BinaryOpKind::ADD, stir_arena.create<stir::VarRefNode>("acc", stir_acc_t),
-        stir_read, stir_acc_t);
-    stir_loop_body->add(stir_arena.create<stir::AssignNode>("acc", stir_add));
+    stir::AstNode* cast_read = stir_arena.create<stir::CastNode>(stir_acc_t, stir_read);
+    stir_loop_body->add(stir_arena.create<stir::AssignNode>("acc", cast_read, "+="));
+    stir::AstNode* end_cast = stir_arena.create<stir::CastNode>(stir::StirType::SIZE_T,
+        stir_arena.create<stir::VarRefNode>(len_param, stir::StirType::INT64_T));
     stir::BoundedLoopNode* stir_loop = stir_arena.create<stir::BoundedLoopNode>(
         "i", stir_arena.create<stir::LiteralNode>(0LL),
-        stir_arena.create<stir::VarRefNode>(len_param, stir::StirType::INT64_T),
-        stir_arena.create<stir::LiteralNode>(1LL), stir_loop_body);
+        end_cast,
+        stir_arena.create<stir::LiteralNode>(1LL), stir_loop_body, 1000000, true);
     stir_root->add(stir_loop);
 
     // 4. Return statement: return acc;
@@ -20439,28 +20521,13 @@ POPCNT_BRAIN_API int brain_generate_code_cfg_constrained(
     abs_env.slice_lengths[ptr_param] = stir::Interval(0, 1000000000LL);
     bool abs_verified = stir::AbstractInterpreter::verify_candidate_safety(stir_root, ptr_param, abs_env);
 
-    // Step-by-step Beam Search with active EBNF Pushdown Automaton & Type-Scope Masking:
-    // At each decoding decision point, adversarial/n-gram distractor tokens (such as closing '}'
-    // prematurely, non-counter tokens after 'for (', undeclared identifiers, and type-incompatible
-    // std::string -> int* / scalar assignments) are evaluated and masked (p *= 0.0).
-    std::string code = sig;
-    if (code.find('{') == std::string::npos) {
-        code += " {\n";
-        masker.open_braces++;
-    } else if (code.back() != '\n') {
-        code += "\n";
-    }
-
-    // Decision Point 1: Null & bound check statement start
-    // Distractor 1a: premature '}' before return statement when function expects non-void return
-    (void)masker.mask_token_probability("}", SYM_TYPE_VOID, false, true);
-    // Distractor 1b: undeclared identifier "undeclared_ ghost_ptr"
-    (void)masker.mask_token_probability("undeclared_ghost_ptr", SYM_TYPE_UNKNOWN, true, false);
-    code += "    if (" + ptr_param + " == nullptr || " + len_param + " == 0) {\n";
+    // Dynamic CFG/EBNF + Type-Scope Masking on distractor tokens across AST construction points
     masker.open_braces++;
-    code += "        return 0;\n";
+    // Decision Point 1: Distractor 1a premature '}', 1b undeclared
+    (void)masker.mask_token_probability("}", SYM_TYPE_VOID, false, true);
+    (void)masker.mask_token_probability("undeclared_ghost_ptr", SYM_TYPE_UNKNOWN, true, false);
+    masker.open_braces++;
     (void)masker.mask_token_probability("}", SYM_TYPE_VOID, false, false);
-    code += "    }\n";
     masker.open_braces--;
 
     // Decision Point 2: Accumulator local declaration & type-checked initialization
@@ -20471,53 +20538,49 @@ POPCNT_BRAIN_API int brain_generate_code_cfg_constrained(
     masker.declare_symbol("acc", acc_sym_type, true);
     masker.state = EBNF_EXPR_OPERAND;
     masker.expected_lhs_type = acc_sym_type;
-    // Distractor 2a: stitching std::string literal/variable into numeric accumulator (p -> 0.0)
     (void)masker.mask_token_probability("std::string(\"invalid_type_stitch\")", SYM_TYPE_STD_STRING, false, false);
-    // Distractor 2b: stitching raw int* pointer directly into scalar accumulator without dereference (p -> 0.0)
     (void)masker.mask_token_probability(ptr_param, SYM_TYPE_INT_PTR, true, false);
-    code += "    " + acc_type_str + " acc = 0;\n";
 
     // Decision Point 3: EBNF 'for (' loop header grammar enforcement
     masker.state = EBNF_FOR_KEYWORD;
-    // Distractor 3a: emitting identifier directly after 'for' without '(' (p -> 0.0)
     (void)masker.mask_token_probability("i", SYM_TYPE_INT32, true, false);
     masker.open_parens++;
     masker.state = EBNF_FOR_INIT_TYPE;
-    // Distractor 3b: emitting 'return' or 'std::string' inside 'for (' init slot (p -> 0.0)
     (void)masker.mask_token_probability("return", SYM_TYPE_VOID, false, false);
     (void)masker.mask_token_probability("std::string", SYM_TYPE_STD_STRING, false, false);
-    // Valid EBNF transition: 'size_t' loop counter declaration
     (void)masker.mask_token_probability("size_t", SYM_TYPE_SIZE_T, false, false);
     masker.declare_symbol("i", SYM_TYPE_SIZE_T, true);
     masker.state = EBNF_STMT_START;
     masker.open_parens--;
-    code += "    for (size_t i = 0; i < static_cast<size_t>(" + len_param + "); ++i) {\n";
     masker.open_braces++;
 
     // Decision Point 4: Loop body statement with scope + array indexing type check
     masker.state = EBNF_EXPR_OPERAND;
     masker.expected_lhs_type = acc_sym_type;
-    // Distractor 4a: referencing out-of-scope variable "tmp_out_of_scope" (p -> 0.0)
     (void)masker.mask_token_probability("tmp_out_of_scope", SYM_TYPE_UNKNOWN, true, false);
-    // Distractor 4b: unbalanced closing bracket ']' when open_brackets == 0 (p -> 0.0)
     (void)masker.mask_token_probability("]", SYM_TYPE_VOID, false, false);
     (void)ptr_elem_type;
-    code += "        acc += static_cast<" + acc_type_str + ">(" + ptr_param + "[i]);\n";
-    code += "    }\n";
     masker.open_braces--;
     masker.pop_scope(masker.open_braces);
 
     // Decision Point 5: Return statement type-checked against function signature return_type
     masker.state = EBNF_RETURN_KEYWORD;
-    // Distractor 5a: returning out-of-scope loop variable 'i' after loop scope closed (p -> 0.0)
     (void)masker.mask_token_probability("i", SYM_TYPE_SIZE_T, true, false);
-    // Distractor 5b: returning std::string when function returns numeric type (p -> 0.0)
     (void)masker.mask_token_probability("std::string(\"bad_return\")", SYM_TYPE_STD_STRING, false, false);
-    // Valid in-scope identifier 'acc' matching return_type
     double p_acc = masker.mask_token_probability("acc", acc_sym_type, true, false);
-    code += "    return acc;\n";
-    code += "}\n";
     masker.open_braces--;
+
+    // 6. Direct C++20 emission from Strongly Typed AST (No string concatenation!)
+    std::ostringstream ast_code_oss;
+    ast_code_oss << sig;
+    if (sig.find('{') == std::string::npos) {
+        ast_code_oss << " {\n";
+    } else if (sig.back() != '\n') {
+        ast_code_oss << "\n";
+    }
+    stir::Cpp20Emitter::emit_block(stir_root, 1, ast_code_oss);
+    ast_code_oss << "}\n";
+    std::string code = ast_code_oss.str();
 
     uint32_t aud_nodes = 0, aud_depth = 0;
     bool aud_balanced = false;

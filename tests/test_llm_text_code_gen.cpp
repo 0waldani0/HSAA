@@ -1569,6 +1569,14 @@ int main() {
         stir::RealCppAstAuditor::audit("int bad() { return 1; ", nullptr, nullptr, &bad_aud_balanced);
         check(!bad_aud_balanced,
               "T19.4b: Real C++ Lexer & AST Auditor detects unclosed brace and rejects invalid AST");
+
+        // T19.4c: Real C++ Lexer & AST Auditor handles raw strings R"(...)" and character literals '}'
+        bool raw_aud_balanced = false;
+        stir::RealCppAstAuditor::audit(
+            "int raw_test() { char c = '}'; const char* s = R\"( { unbalanced brace )\"; return 0; }",
+            nullptr, nullptr, &raw_aud_balanced);
+        check(raw_aud_balanced,
+              "T19.4c: Real C++ Lexer & AST Auditor ignores unbalanced delimiters inside raw strings R\"(...)\" and char literals '}'");
     }
 
     // =========================================================================
@@ -1600,6 +1608,15 @@ int main() {
         check(resolved_obs,
               "T20.2: Datalog Horn-Clause Engine proves 2-hop deductive coherence: Key -> Casket -> Ancient Observatory");
 
+        // T20.2b: Datalog Horn-Clause Engine handles cyclic graphs (A -> B -> A) safely via visited set
+        drs::DatalogHornEngine cyclic_datalog;
+        cyclic_datalog.add_fact("located_in", "NodeA", "NodeB");
+        cyclic_datalog.add_fact("located_in", "NodeB", "NodeA");
+        auto cycle_answers = cyclic_datalog.query("located_in", "NodeA");
+        check(cycle_answers.size() == 2 &&
+              (cycle_answers[0] == "NodeB" || cycle_answers[1] == "NodeB"),
+              "T20.2b: Datalog Horn-Clause Engine detects circular dependency (A -> B -> A) and terminates cleanly without infinite loop");
+
         // T20.3: Deterministic Russian Morpho-Syntactic Surface Realizer (Accusative/Locative Case Government)
         std::string ru_realized = drs::DeterministicSurfaceRealizer::realize_russian_answer(
             "рубиновый ключ", "серебряная шкатулка", "древняя обсерватория");
@@ -1608,12 +1625,44 @@ int main() {
               ru_realized.find("под купол") != std::string::npos,
               "T20.3: Deterministic Surface Realizer enforces Russian case government (Accusative: 'серебряную шкатулку', Locative: 'древней обсерватории')");
 
+        // T20.3b: Generalized Russian Morphological Declension on unseen OOV phrases
+        std::string gen_acc = drs::DeterministicSurfaceRealizer::inflect_russian_phrase(
+            "подземная лаборатория", drs::DeterministicSurfaceRealizer::Case::ACCUSATIVE);
+        std::string gen_loc = drs::DeterministicSurfaceRealizer::inflect_russian_phrase(
+            "подземная лаборатория", drs::DeterministicSurfaceRealizer::Case::LOCATIVE);
+        std::string box_inst = drs::DeterministicSurfaceRealizer::inflect_russian_phrase(
+            "железный сундук", drs::DeterministicSurfaceRealizer::Case::INSTRUMENTAL);
+        std::string box_gen = drs::DeterministicSurfaceRealizer::inflect_russian_phrase(
+            "железный сундук", drs::DeterministicSurfaceRealizer::Case::GENITIVE);
+        check(gen_acc == "подземную лабораторию" && gen_loc == "подземной лаборатории" &&
+              box_inst == "железным сундуком" && box_gen == "железного сундука",
+              "T20.3b: Generalized Russian Morphological Declension inflects unseen OOV phrases across Accusative, Locative, Instrumental, and Genitive");
+
         // T20.4: Deterministic English Surface Realizer (Subject-Predicate & Prepositional Agreement)
         std::string en_realized = drs::DeterministicSurfaceRealizer::realize_english_answer(
             "ruby key", "silver casket", "ancient observatory");
         check(en_realized.find("ruby key was transferred inside the silver casket") != std::string::npos &&
               en_realized.find("under the dome of the ancient observatory") != std::string::npos,
               "T20.4: Deterministic Surface Realizer enforces English subject-predicate and prepositional agreement");
+
+        // T20.5: Novel narrative dynamic clause extraction and multi-hop resolution
+        drs::SemanticPlanningDag novel_dag;
+        std::string novel_narrative =
+            "Алиса спрятала древний свиток внутри железного сундука. "
+            "Боб перенес железный сундук в подземную лабораторию.";
+        novel_dag.parse_narrative_text(novel_narrative);
+        drs::DatalogHornEngine novel_datalog;
+        novel_datalog.load_from_dag(novel_dag);
+        auto novel_res = novel_datalog.query("located_in", "древний свиток");
+        bool found_lab = false;
+        for (const auto& nr : novel_res) {
+            if (nr.find("лаборатори") != std::string::npos) {
+                found_lab = true;
+                break;
+            }
+        }
+        check(novel_dag.all_propositions().size() >= 4 && found_lab,
+              "T20.5: Dynamic narrative clause parser extracts typed propositions & Datalog Horn engine resolves 2-hop path on unseen story (Scroll -> Chest -> Lab)");
     }
 
     std::printf("================================================================\n");

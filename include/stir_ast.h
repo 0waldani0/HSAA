@@ -281,9 +281,10 @@ struct VarDeclNode : public AstNode {
 struct AssignNode : public AstNode {
     std::string var_name;
     AstNode* expr;
+    std::string op;
 
-    AssignNode(const std::string& n, AstNode* e)
-        : AstNode(NodeKind::ASSIGN, StirType::VOID_T), var_name(n), expr(e) {}
+    AssignNode(const std::string& n, AstNode* e, const std::string& o = "=")
+        : AstNode(NodeKind::ASSIGN, StirType::VOID_T), var_name(n), expr(e), op(o) {}
 };
 
 struct BoundedLoopNode : public AstNode {
@@ -293,12 +294,21 @@ struct BoundedLoopNode : public AstNode {
     AstNode* step_expr;
     BlockNode* body;
     int64_t max_iterations;
+    bool use_pre_increment;
 
     BoundedLoopNode(const std::string& var, AstNode* start, AstNode* end,
-                    AstNode* step, BlockNode* b, int64_t max_it = 1000000)
+                    AstNode* step, BlockNode* b, int64_t max_it = 1000000, bool pre_inc = false)
         : AstNode(NodeKind::BOUNDED_LOOP, StirType::VOID_T),
           counter_var(var), start_expr(start), end_expr(end),
-          step_expr(step), body(b), max_iterations(max_it) {}
+          step_expr(step), body(b), max_iterations(max_it), use_pre_increment(pre_inc) {}
+};
+
+struct CastNode : public AstNode {
+    StirType target_type;
+    AstNode* expr;
+
+    CastNode(StirType t, AstNode* e)
+        : AstNode(NodeKind::UNARY_OP, t), target_type(t), expr(e) {}
 };
 
 struct BranchNode : public AstNode {
@@ -358,9 +368,19 @@ public:
             }
             case NodeKind::BINARY_OP: {
                 auto b = static_cast<const BinaryOpNode*>(node);
+                if (b->op == BinaryOpKind::LOGICAL_OR || b->op == BinaryOpKind::LOGICAL_AND ||
+                    b->op == BinaryOpKind::EQ || b->op == BinaryOpKind::NE ||
+                    b->op == BinaryOpKind::LT || b->op == BinaryOpKind::LE ||
+                    b->op == BinaryOpKind::GT || b->op == BinaryOpKind::GE) {
+                    return emit_expression(b->lhs) + " " + binary_op_symbol(b->op) + " " + emit_expression(b->rhs);
+                }
                 return "(" + emit_expression(b->lhs) + " " +
                        binary_op_symbol(b->op) + " " +
                        emit_expression(b->rhs) + ")";
+            }
+            case NodeKind::UNARY_OP: {
+                auto c = static_cast<const CastNode*>(node);
+                return "static_cast<" + std::string(stir_type_name(c->target_type)) + ">(" + emit_expression(c->expr) + ")";
             }
             case NodeKind::ARRAY_READ: {
                 auto ar = static_cast<const ArrayReadNode*>(node);
@@ -395,7 +415,7 @@ public:
             }
             case NodeKind::ASSIGN: {
                 auto a = static_cast<const AssignNode*>(stmt);
-                oss << pad << a->var_name << " = " << emit_expression(a->expr) << ";\n";
+                oss << pad << a->var_name << " " << (a->op.empty() ? "=" : a->op) << " " << emit_expression(a->expr) << ";\n";
                 break;
             }
             case NodeKind::ARRAY_WRITE: {
@@ -410,9 +430,11 @@ public:
                 std::string start_s = emit_expression(loop->start_expr);
                 std::string end_s   = emit_expression(loop->end_expr);
                 std::string step_s  = emit_expression(loop->step_expr);
+                std::string inc_s   = loop->use_pre_increment ? ("++" + loop->counter_var)
+                                                               : (loop->counter_var + " += " + step_s);
                 oss << pad << "for (size_t " << loop->counter_var << " = " << start_s
                     << "; " << loop->counter_var << " < " << end_s << "; "
-                    << loop->counter_var << " += " << step_s << ") {\n";
+                    << inc_s << ") {\n";
                 emit_block(loop->body, indent + 1, oss);
                 oss << pad << "}\n";
                 break;
@@ -935,6 +957,186 @@ public:
         return res;
     }
 
+    template<typename CandidateFn>
+    static CegisTestResult evaluate_two_pointers_window(CandidateFn&& fn) {
+        CegisTestResult res;
+        res.passed = true;
+
+        // Vector 1: NULL
+        try {
+            if (fn(nullptr, 0, 10) != 0) {
+                res.passed = false;
+                res.failed_vector = BoundaryVectorKind::VEC_NULL;
+                res.error_trace = "CEGIS_FAIL[NULL]: expected 0 on nullptr";
+                return res;
+            }
+        } catch (...) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_NULL;
+            res.error_trace = "CEGIS_CRASH[NULL]: exception/SEGV on nullptr";
+            return res;
+        }
+
+        // Vector 2: ZERO
+        int32_t dummy = 0;
+        if (fn(&dummy, 0, 10) != 0) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_ZERO;
+            res.error_trace = "CEGIS_FAIL[0]: expected 0 on n=0";
+            return res;
+        }
+
+        // Vector 3: ONE
+        int32_t s1[1] = {10};
+        if (fn(s1, 1, 5) != 0 || fn(s1, 1, 10) != 1) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_ONE;
+            res.error_trace = "CEGIS_FAIL[1]: mismatch on singleton window";
+            return res;
+        }
+
+        // Vector 4: N_SMALL
+        int32_t sn[6] = {2, 1, 3, 2, 4, 1};
+        if (fn(sn, 6, 6) != 3) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_N_SMALL;
+            res.error_trace = "CEGIS_FAIL[N_SMALL]: expected 3 for limit 6, got " + std::to_string(fn(sn, 6, 6));
+            return res;
+        }
+
+        // Vector 5: N_LARGE
+        std::vector<int32_t> ln(1024, 1);
+        if (fn(ln.data(), 1024, 100) != 100) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_N_LARGE;
+            res.error_trace = "CEGIS_FAIL[N_LARGE]: expected 100 on N=1024 ones with limit 100";
+            return res;
+        }
+
+        // Vector 6: REVERSED
+        int32_t rev[4] = {10, 5, 2, 1};
+        if (fn(rev, 4, 3) != 2) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_REVERSED;
+            res.error_trace = "CEGIS_FAIL[REVERSED]: expected 2 on reversed array";
+            return res;
+        }
+
+        // Vector 7: DUPLICATES
+        int32_t dup[4] = {2, 2, 2, 2};
+        if (fn(dup, 4, 5) != 2) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_DUPLICATES;
+            res.error_trace = "CEGIS_FAIL[DUPLICATES]: expected 2 on duplicates with limit 5";
+            return res;
+        }
+
+        // Vector 8: OVERFLOW
+        int32_t ovf[3] = {1000000000, 1000000000, 1000000000};
+        if (fn(ovf, 3, 2500000000LL) != 2) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_OVERFLOW;
+            res.error_trace = "CEGIS_FAIL[OVERFLOW]: overflow on 64-bit window sum limit";
+            return res;
+        }
+
+        return res;
+    }
+
+    template<typename CandidateFn>
+    static CegisTestResult evaluate_state_graph_relax(CandidateFn&& fn) {
+        CegisTestResult res;
+        res.passed = true;
+
+        // Vector 1: NULL
+        try {
+            if (fn(0, 0, nullptr, nullptr, nullptr, 0, 0) != -1) {
+                res.passed = false;
+                res.failed_vector = BoundaryVectorKind::VEC_NULL;
+                res.error_trace = "CEGIS_FAIL[NULL]: expected -1 on null edges";
+                return res;
+            }
+        } catch (...) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_NULL;
+            res.error_trace = "CEGIS_CRASH[NULL]: exception/SEGV on null";
+            return res;
+        }
+
+        // Vector 2: ZERO
+        if (fn(0, 0, nullptr, nullptr, nullptr, 0, 0) != -1) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_ZERO;
+            res.error_trace = "CEGIS_FAIL[0]: expected -1 on 0 nodes";
+            return res;
+        }
+
+        // Vector 3: ONE
+        if (fn(1, 0, nullptr, nullptr, nullptr, 0, 0) != 0) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_ONE;
+            res.error_trace = "CEGIS_FAIL[1]: expected 0 on single node to itself";
+            return res;
+        }
+
+        // Vector 4: N_SMALL
+        int eu[4] = {0, 0, 1, 2};
+        int ev[4] = {1, 2, 2, 3};
+        int ew[4] = {5, 12, 3, 2};
+        if (fn(5, 4, eu, ev, ew, 0, 3) != 10) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_N_SMALL;
+            res.error_trace = "CEGIS_FAIL[N_SMALL]: expected shortest path 10, got " + std::to_string(fn(5, 4, eu, ev, ew, 0, 3));
+            return res;
+        }
+
+        // Vector 5: N_LARGE
+        const int N = 64;
+        std::vector<int> leu(N - 1), lev(N - 1), lew(N - 1, 2);
+        for (int i = 0; i < N - 1; ++i) {
+            leu[i] = i;
+            lev[i] = i + 1;
+        }
+        if (fn(N, N - 1, leu.data(), lev.data(), lew.data(), 0, N - 1) != (N - 1) * 2) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_N_LARGE;
+            res.error_trace = "CEGIS_FAIL[N_LARGE]: mismatch on N=64 linear graph";
+            return res;
+        }
+
+        // Vector 6: REVERSED (disconnected destination)
+        if (fn(5, 4, eu, ev, ew, 0, 4) != -1) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_REVERSED;
+            res.error_trace = "CEGIS_FAIL[REVERSED]: expected -1 on disconnected node 4";
+            return res;
+        }
+
+        // Vector 7: DUPLICATES (parallel edges with different weights)
+        int dup_u[3] = {0, 0, 1};
+        int dup_v[3] = {1, 1, 2};
+        int dup_w[3] = {10, 4, 3}; // parallel edge 0->1 weight 10 vs 4
+        if (fn(3, 3, dup_u, dup_v, dup_w, 0, 2) != 7) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_DUPLICATES;
+            res.error_trace = "CEGIS_FAIL[DUPLICATES]: expected 7 with parallel edge, got " + std::to_string(fn(3, 3, dup_u, dup_v, dup_w, 0, 2));
+            return res;
+        }
+
+        // Vector 8: OVERFLOW
+        int ovf_u[2] = {0, 1};
+        int ovf_v[2] = {1, 2};
+        int ovf_w[2] = {1000000, 1000000};
+        if (fn(3, 2, ovf_u, ovf_v, ovf_w, 0, 2) != 2000000) {
+            res.passed = false;
+            res.failed_vector = BoundaryVectorKind::VEC_OVERFLOW;
+            res.error_trace = "CEGIS_FAIL[OVERFLOW]: large edge weight overflow";
+            return res;
+        }
+
+        return res;
+    }
+
     // Run parallel candidate evaluations across host threads
     template<typename EvalFunc>
     static std::vector<CegisTestResult> evaluate_candidates_parallel(
@@ -1040,6 +1242,42 @@ public:
                 }
                 tokens.push_back({CppToken::NUMBER, code.substr(start, i - start), line});
                 continue;
+            }
+            // Character literals '...'
+            if (c == '\'') {
+                size_t start = i++;
+                while (i < code.size() && code[i] != '\'') {
+                    if (code[i] == '\\' && i + 1 < code.size()) ++i;
+                    ++i;
+                }
+                if (i < code.size()) ++i;
+                tokens.push_back({CppToken::STRING_LITERAL, code.substr(start, i - start), line});
+                continue;
+            }
+            // Raw string literals R"delim(...)delim"
+            if (c == 'R' && i + 1 < code.size() && code[i + 1] == '"') {
+                size_t start = i;
+                i += 2; // skip R"
+                size_t delim_start = i;
+                while (i < code.size() && code[i] != '(' && code[i] != '\n') ++i;
+                if (i < code.size() && code[i] == '(') {
+                    std::string delim = code.substr(delim_start, i - delim_start);
+                    ++i; // skip '('
+                    std::string closing = ")" + delim + "\"";
+                    size_t end_pos = code.find(closing, i);
+                    if (end_pos != std::string::npos) {
+                        for (size_t p = i; p < end_pos; ++p) {
+                            if (code[p] == '\n') ++line;
+                        }
+                        i = end_pos + closing.size();
+                    } else {
+                        i = code.size();
+                    }
+                    tokens.push_back({CppToken::STRING_LITERAL, code.substr(start, i - start), line});
+                    continue;
+                } else {
+                    i = start; // back up if not raw string
+                }
             }
             // Identifiers / keywords
             if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || static_cast<unsigned char>(c) >= 0x80) {
