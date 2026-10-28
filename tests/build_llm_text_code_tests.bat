@@ -31,6 +31,7 @@ if not exist "%BUILD_DIR%\popcnt_brain_lib.obj" (
 )
 echo [*] Compiling test_llm_text_code_gen.exe...
 cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /wd4996 ^
+    /I"%ROOT_DIR%\include" /I"%ROOT_DIR%\second_brain" ^
     "%ROOT_DIR%\tests\test_llm_text_code_gen.cpp" ^
     "%BUILD_DIR%\popcnt_brain_lib.obj" ^
     /Fe:"%BUILD_DIR%\test_llm_text_code_gen.exe" ^

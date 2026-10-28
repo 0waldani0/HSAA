@@ -1,6 +1,8 @@
 #include "unified_engine.h"
 #include "simd_common.h"
 #include "bench_runner.h"
+#include "stir_ast.h"
+#include "drs_engine.h"
 
 #include <cstring>
 #include <cstdio>
@@ -757,31 +759,7 @@ static void audit_cpp_ast_structure(
     uint32_t* out_max_depth,
     bool* out_balanced
 ) {
-    int brace = 0, paren = 0, bracket = 0;
-    int max_depth = 0;
-    bool ok = true;
-    for (char c : code) {
-        if (c == '{') { ++brace; if (brace > max_depth) max_depth = brace; }
-        else if (c == '}') { --brace; if (brace < 0) ok = false; }
-        else if (c == '(') ++paren;
-        else if (c == ')') { --paren; if (paren < 0) ok = false; }
-        else if (c == '[') ++bracket;
-        else if (c == ']') { --bracket; if (bracket < 0) ok = false; }
-    }
-    if (brace != 0 || paren != 0 || bracket != 0) ok = false;
-
-    uint32_t nodes = 0;
-    const char* kw[] = {"for", "while", "if", "else", "return", "float", "double", "int", "size_t", "std::", "struct"};
-    for (const char* k : kw) {
-        size_t pos = 0;
-        while ((pos = code.find(k, pos)) != std::string::npos) {
-            ++nodes;
-            pos += std::strlen(k);
-        }
-    }
-    if (out_ast_nodes) *out_ast_nodes = std::max<uint32_t>(1U, nodes);
-    if (out_max_depth) *out_max_depth = static_cast<uint32_t>(std::max(1, max_depth));
-    if (out_balanced)  *out_balanced  = ok && !code.empty();
+    stir::RealCppAstAuditor::audit(code, out_ast_nodes, out_max_depth, out_balanced);
 }
 
 // Fit a 5-basis analytical model y(x) = c0 + c1*x + c2*x^2 + c3*sin(x) + c4*cos(x)

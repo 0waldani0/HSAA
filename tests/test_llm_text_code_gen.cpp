@@ -8,6 +8,8 @@
 #include <chrono>
 #include <fstream>
 #include "../second_brain/popcnt_brain.h"
+#include "stir_ast.h"
+#include "drs_engine.h"
 
 static int g_passed = 0;
 static int g_failed = 0;
@@ -1448,6 +1450,170 @@ int main() {
         brain_destroy(z_brain);
         std::filesystem::remove("build/test_zeroshot_scale.bin", ec);
         std::filesystem::remove("build/test_zeroshot_scale.bin.llm_bank", ec);
+    }
+
+    // =========================================================================
+    // SUITE 19: STRONGLY TYPED INTERMEDIATE REPRESENTATION (ST-IR),
+    //           ABSTRACT INTERPRETATION PRE-FILTER & MULTI-THREADED 8-VECTOR CEGIS
+    // =========================================================================
+    std::printf("\n--- Suite 19: ST-IR AST, Abstract Interpretation Pre-Filter & Multi-Threaded 8-Vector CEGIS ---\n");
+    {
+        // T19.1: Strongly Typed AST construction with Arena Allocation & C++20 emission
+        stir::ArenaAllocator arena;
+        stir::BlockNode* root = arena.create<stir::BlockNode>();
+
+        // Slice<int32_t> and BoundedLoop
+        stir::VarDeclNode* s_decl = arena.create<stir::VarDeclNode>(
+            "slice", stir::StirType::SLICE_INT32, nullptr);
+        root->add(s_decl);
+
+        stir::BlockNode* loop_body = arena.create<stir::BlockNode>();
+        stir::ArrayReadNode* read = arena.create<stir::ArrayReadNode>(
+            arena.create<stir::VarRefNode>("slice", stir::StirType::SLICE_INT32),
+            arena.create<stir::VarRefNode>("i", stir::StirType::INT64_T),
+            stir::StirType::INT32_T);
+        loop_body->add(arena.create<stir::AssignNode>("total", read));
+
+        stir::BoundedLoopNode* b_loop = arena.create<stir::BoundedLoopNode>(
+            "i", arena.create<stir::LiteralNode>(0LL),
+            arena.create<stir::LiteralNode>(10LL),
+            arena.create<stir::LiteralNode>(1LL),
+            loop_body);
+        root->add(b_loop);
+
+        std::ostringstream emitted;
+        stir::Cpp20Emitter::emit_block(root, 0, emitted);
+        std::string code_out = emitted.str();
+        check(!code_out.empty() &&
+              code_out.find("for (size_t i = 0; i < 10; i += 1)") != std::string::npos &&
+              code_out.find("slice[i]") != std::string::npos,
+              "T19.1: ST-IR ArenaAllocator constructs Slice<T>, BoundedLoop, ArrayRead & emits valid C++20 code");
+
+        // T19.2: Differentiable Abstract Interpretation Pre-Filter in CPU registers
+        // Safe case: loop counter strictly within [0, 10), slice length is 10
+        stir::AbstractEnvironment env_safe;
+        env_safe.set_null_state("slice", stir::NullState::DEFINITELY_NOT_NULL);
+        env_safe.slice_lengths["slice"] = stir::Interval(10, 10);
+        bool safe_ok = stir::AbstractInterpreter::verify_candidate_safety(root, "slice", env_safe);
+        check(safe_ok && !env_safe.has_safety_violation,
+              "T19.2a: Abstract Interpretation analytically proves bounded loop index within [0, N-1] & non-null slice");
+
+        // Unsafe case 1: Unguarded null pointer dereference
+        stir::AbstractEnvironment env_null;
+        env_null.set_null_state("slice", stir::NullState::UNKNOWN);
+        bool null_caught = !stir::AbstractInterpreter::verify_candidate_safety(root, "slice", env_null);
+        check(null_caught && env_null.has_safety_violation,
+              "T19.2b: Abstract Interpretation detects unguarded nullable slice dereference in CPU registers");
+
+        // Unsafe case 2: Negative array indexing
+        stir::BlockNode* bad_read_block = arena.create<stir::BlockNode>();
+        bad_read_block->add(arena.create<stir::ArrayReadNode>(
+            arena.create<stir::VarRefNode>("slice", stir::StirType::SLICE_INT32),
+            arena.create<stir::LiteralNode>(-1LL),
+            stir::StirType::INT32_T));
+        stir::AbstractEnvironment env_neg;
+        env_neg.set_null_state("slice", stir::NullState::DEFINITELY_NOT_NULL);
+        bool neg_caught = !stir::AbstractInterpreter::verify_candidate_safety(bad_read_block, "slice", env_neg);
+        check(neg_caught && env_neg.has_safety_violation,
+              "T19.2c: Abstract Interpretation detects negative array index (idx < 0) before sandbox execution");
+
+        // T19.3: Multi-Threaded CEGIS Execution Sandbox across 8 boundary test vectors
+        // Candidate with 32-bit overflow bug fails vector 8 (VEC_OVERFLOW)
+        auto buggy_overflow_fn = [](const int32_t* data, int n) -> int64_t {
+            if (!data || n <= 0) return 0;
+            int32_t best = data[0], cur = data[0]; // 32-bit int causes signed overflow on large sums!
+            for (int i = 1; i < n; ++i) {
+                int32_t v = data[i];
+                cur = (v > cur + v) ? v : (cur + v);
+                if (cur > best) best = cur;
+            }
+            return best;
+        };
+        auto res_ovf = stir::MultiThreadedCegisSandbox::evaluate_kadane_accumulator(buggy_overflow_fn);
+        check(!res_ovf.passed && res_ovf.failed_vector == stir::BoundaryVectorKind::VEC_OVERFLOW,
+              "T19.3a: Multi-Threaded CEGIS Sandbox detects 32-bit accumulator overflow on VEC_OVERFLOW vector");
+
+        // Verified 64-bit candidate passes all 8 boundary vectors in parallel worker threads
+        auto verified_kadane_fn = [](const int32_t* data, int n) -> int64_t {
+            if (!data || n <= 0) return 0;
+            int64_t best = data[0], cur = data[0];
+            for (int i = 1; i < n; ++i) {
+                int64_t v = data[i];
+                cur = (v > cur + v) ? v : (cur + v);
+                if (cur > best) best = cur;
+            }
+            return best;
+        };
+        auto res_kadane = stir::MultiThreadedCegisSandbox::evaluate_kadane_accumulator(verified_kadane_fn);
+        check(res_kadane.passed,
+              "T19.3b: Multi-Threaded CEGIS Sandbox verifies candidate across all 8 boundary vectors [NULL, 0, 1, N_SMALL, N_LARGE, REVERSED, DUPLICATES, OVERFLOW]");
+
+        // Parallel multi-candidate evaluation
+        auto results = stir::MultiThreadedCegisSandbox::evaluate_candidates_parallel(4, [&](int idx) {
+            if (idx == 0) return stir::MultiThreadedCegisSandbox::evaluate_kadane_accumulator(buggy_overflow_fn);
+            return stir::MultiThreadedCegisSandbox::evaluate_kadane_accumulator(verified_kadane_fn);
+        });
+        check(results.size() == 4 && !results[0].passed && results[1].passed && results[2].passed && results[3].passed,
+              "T19.3c: Multi-threaded CEGIS sandbox concurrently evaluates candidates across host threads");
+
+        // T19.4: Real C++ Lexer & Recursive-Descent AST Structural Auditor
+        uint32_t aud_nodes = 0, aud_depth = 0;
+        bool aud_balanced = false;
+        stir::RealCppAstAuditor::audit(
+            "int foo(int x) { if (x > 0) { for (int i = 0; i < x; ++i) { total += i; } } return total; }",
+            &aud_nodes, &aud_depth, &aud_balanced);
+        check(aud_balanced && aud_nodes >= 6 && aud_depth == 3,
+              "T19.4a: Real C++ Lexer & AST Auditor computes exact nesting depth (3) and balances delimiters");
+
+        bool bad_aud_balanced = true;
+        stir::RealCppAstAuditor::audit("int bad() { return 1; ", nullptr, nullptr, &bad_aud_balanced);
+        check(!bad_aud_balanced,
+              "T19.4b: Real C++ Lexer & AST Auditor detects unclosed brace and rejects invalid AST");
+    }
+
+    // =========================================================================
+    // SUITE 20: DISCOURSE REPRESENTATION STRUCTURE (DRS) & MORPHO-SYNTACTIC REALIZATION
+    // =========================================================================
+    std::printf("\n--- Suite 20: DRS Semantic Planning DAG, Datalog Horn Resolution & Surface Realizer ---\n");
+    {
+        // T20.1: DRS Semantic Planning DAG construction with typed propositions & RST relations
+        drs::SemanticPlanningDag dag;
+        std::string narrative =
+            "Пролог экспедиции: профессор Леонид спрятал рубиновый ключ внутри серебряной шкатулки. "
+            "В середине пути старый хранитель перенес серебряную шкатулку под купол древней обсерватории.";
+        dag.parse_narrative_text(narrative);
+
+        check(dag.all_propositions().size() >= 4 && dag.all_edges().size() >= 2,
+              "T20.1: DRS Semantic Planning DAG parses typed propositions (S, R, O, Modality, Polarity) & RST Cause-Effect edges");
+
+        // T20.2: Datalog Horn-Clause Engine deductive resolution
+        drs::DatalogHornEngine datalog;
+        datalog.load_from_dag(dag);
+        auto answers = datalog.query("located_in", "рубиновый ключ");
+        bool resolved_obs = false;
+        for (const auto& a : answers) {
+            if (a.find("обсерватория") != std::string::npos || a.find("обсерватории") != std::string::npos) {
+                resolved_obs = true;
+                break;
+            }
+        }
+        check(resolved_obs,
+              "T20.2: Datalog Horn-Clause Engine proves 2-hop deductive coherence: Key -> Casket -> Ancient Observatory");
+
+        // T20.3: Deterministic Russian Morpho-Syntactic Surface Realizer (Accusative/Locative Case Government)
+        std::string ru_realized = drs::DeterministicSurfaceRealizer::realize_russian_answer(
+            "рубиновый ключ", "серебряная шкатулка", "древняя обсерватория");
+        check(ru_realized.find("серебряную шкатулку") != std::string::npos &&
+              ru_realized.find("древней обсерватории") != std::string::npos &&
+              ru_realized.find("под купол") != std::string::npos,
+              "T20.3: Deterministic Surface Realizer enforces Russian case government (Accusative: 'серебряную шкатулку', Locative: 'древней обсерватории')");
+
+        // T20.4: Deterministic English Surface Realizer (Subject-Predicate & Prepositional Agreement)
+        std::string en_realized = drs::DeterministicSurfaceRealizer::realize_english_answer(
+            "ruby key", "silver casket", "ancient observatory");
+        check(en_realized.find("ruby key was transferred inside the silver casket") != std::string::npos &&
+              en_realized.find("under the dome of the ancient observatory") != std::string::npos,
+              "T20.4: Deterministic Surface Realizer enforces English subject-predicate and prepositional agreement");
     }
 
     std::printf("================================================================\n");

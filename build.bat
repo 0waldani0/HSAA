@@ -140,23 +140,23 @@ REM 6. Target: Second Brain PopCount Module
 REM ============================================================================
 :build_second_brain
 echo [*] Compiling Second Brain (AVX-512 VPOPCNTDQ)...
-cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%second_brain" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" %LINK_FLAGS%
+cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%include" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" %LINK_FLAGS%
 if %ERRORLEVEL% NEQ 0 (
     echo [!] AVX-512 popcnt_brain failed, attempting AVX2 fallback...
-    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX2 /openmp /EHsc /utf-8 /wd4068 /I"%ROOT_DIR%second_brain" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" %LINK_FLAGS%
+    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX2 /openmp /EHsc /utf-8 /wd4068 /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%include" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" %LINK_FLAGS%
     if errorlevel 1 exit /b 1
 )
 echo [+] PopCount Second Brain built: "%BUILD_DIR%\popcnt_brain.exe"
 
 echo [*] Creating popcnt_brain.lib static library...
-cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_LIB /I"%ROOT_DIR%second_brain" /c "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
+cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_LIB /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%include" /c "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
 if errorlevel 1 exit /b 1
 lib.exe /nologo /OUT:"%BUILD_DIR%\popcnt_brain.lib" "%BUILD_DIR%\popcnt_brain_lib.obj"
 if errorlevel 1 exit /b 1
 
 :build_dll
 echo [*] Compiling popcnt_brain.dll shared library...
-cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_DLL /LD /I"%ROOT_DIR%second_brain" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.dll" /Fo:"%BUILD_DIR%\popcnt_brain_dll.obj" %LINK_FLAGS%
+cl.exe %MSVC_CXX_FLAGS% /DBUILDING_POPCNT_BRAIN_DLL /LD /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%include" "%ROOT_DIR%second_brain\popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.dll" /Fo:"%BUILD_DIR%\popcnt_brain_dll.obj" %LINK_FLAGS%
 if errorlevel 1 exit /b 1
 if not exist "%ROOT_DIR%second_brain\build" mkdir "%ROOT_DIR%second_brain\build"
 copy /y "%BUILD_DIR%\popcnt_brain.dll" "%ROOT_DIR%second_brain\build\popcnt_brain.dll" >nul
