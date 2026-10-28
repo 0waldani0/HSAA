@@ -9842,19 +9842,40 @@ struct PopCountGenerativeLLM {
     static inline float dense_cosine_f32_4096(const float* a, const float* b) {
         if (!a || !b) return 0.0f;
 #if defined(__AVX512F__)
-        __m512 vdot = _mm512_setzero_ps();
-        __m512 vna  = _mm512_setzero_ps();
-        __m512 vnb  = _mm512_setzero_ps();
-        for (int d = 0; d < D_DENSE_4096; d += 16) {
-            __m512 va = _mm512_loadu_ps(a + d);
-            __m512 vb = _mm512_loadu_ps(b + d);
-            vdot = _mm512_fmadd_ps(va, vb, vdot);
-            vna  = _mm512_fmadd_ps(va, va, vna);
-            vnb  = _mm512_fmadd_ps(vb, vb, vnb);
+        __m512 vdot0 = _mm512_setzero_ps(), vdot1 = _mm512_setzero_ps();
+        __m512 vdot2 = _mm512_setzero_ps(), vdot3 = _mm512_setzero_ps();
+        __m512 vna0  = _mm512_setzero_ps(), vna1  = _mm512_setzero_ps();
+        __m512 vna2  = _mm512_setzero_ps(), vna3  = _mm512_setzero_ps();
+        __m512 vnb0  = _mm512_setzero_ps(), vnb1  = _mm512_setzero_ps();
+        __m512 vnb2  = _mm512_setzero_ps(), vnb3  = _mm512_setzero_ps();
+        for (int d = 0; d < D_DENSE_4096; d += 64) {
+            __m512 va0 = _mm512_loadu_ps(a + d);
+            __m512 vb0 = _mm512_loadu_ps(b + d);
+            __m512 va1 = _mm512_loadu_ps(a + d + 16);
+            __m512 vb1 = _mm512_loadu_ps(b + d + 16);
+            __m512 va2 = _mm512_loadu_ps(a + d + 32);
+            __m512 vb2 = _mm512_loadu_ps(b + d + 32);
+            __m512 va3 = _mm512_loadu_ps(a + d + 48);
+            __m512 vb3 = _mm512_loadu_ps(b + d + 48);
+
+            vdot0 = _mm512_fmadd_ps(va0, vb0, vdot0);
+            vdot1 = _mm512_fmadd_ps(va1, vb1, vdot1);
+            vdot2 = _mm512_fmadd_ps(va2, vb2, vdot2);
+            vdot3 = _mm512_fmadd_ps(va3, vb3, vdot3);
+
+            vna0  = _mm512_fmadd_ps(va0, va0, vna0);
+            vna1  = _mm512_fmadd_ps(va1, va1, vna1);
+            vna2  = _mm512_fmadd_ps(va2, va2, vna2);
+            vna3  = _mm512_fmadd_ps(va3, va3, vna3);
+
+            vnb0  = _mm512_fmadd_ps(vb0, vb0, vnb0);
+            vnb1  = _mm512_fmadd_ps(vb1, vb1, vnb1);
+            vnb2  = _mm512_fmadd_ps(vb2, vb2, vnb2);
+            vnb3  = _mm512_fmadd_ps(vb3, vb3, vnb3);
         }
-        float dot = _mm512_reduce_add_ps(vdot);
-        float na  = _mm512_reduce_add_ps(vna);
-        float nb  = _mm512_reduce_add_ps(vnb);
+        float dot = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(vdot0, vdot1), _mm512_add_ps(vdot2, vdot3)));
+        float na  = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(vna0, vna1),   _mm512_add_ps(vna2, vna3)));
+        float nb  = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(vnb0, vnb1),   _mm512_add_ps(vnb2, vnb3)));
 #elif defined(__AVX2__) && defined(__FMA__)
         __m256 vdot = _mm256_setzero_ps();
         __m256 vna  = _mm256_setzero_ps();
@@ -10262,30 +10283,66 @@ struct PopCountGenerativeLLM {
             }
 
             for (int i = 0; i < D_HID; ++i) {
-                float s = b1[i];
                 const float* row = &W1[i * D_LAT];
+#if defined(__AVX512F__)
+                __m512 acc0 = _mm512_mul_ps(_mm512_loadu_ps(row),      _mm512_loadu_ps(x_ctx.data()));
+                __m512 acc1 = _mm512_mul_ps(_mm512_loadu_ps(row + 16), _mm512_loadu_ps(x_ctx.data() + 16));
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 32), _mm512_loadu_ps(x_ctx.data() + 32), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 48), _mm512_loadu_ps(x_ctx.data() + 48), acc1);
+                float s = b1[i] + _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#else
+                float s = b1[i];
                 for (int j = 0; j < D_LAT; ++j) s += row[j] * x_ctx[j];
+#endif
                 z1[i] = s;
                 a1[i] = silu(s);
             }
             for (int d = 0; d < D_LAT; ++d) {
-                float s = x_ctx[d] + b1_proj[d];
                 const float* row = &W1_proj[d * D_HID];
+#if defined(__AVX512F__)
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+                for (int i = 0; i < D_HID; i += 32) {
+                    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(row + i),      _mm512_loadu_ps(a1.data() + i),      acc0);
+                    acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(row + i + 16), _mm512_loadu_ps(a1.data() + i + 16), acc1);
+                }
+                u1[d] = x_ctx[d] + b1_proj[d] + _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#else
+                float s = x_ctx[d] + b1_proj[d];
                 for (int i = 0; i < D_HID; ++i) s += row[i] * a1[i];
                 u1[d] = s;
+#endif
             }
             for (int i = 0; i < D_HID; ++i) {
-                float s = b2[i];
                 const float* row = &W2[i * D_LAT];
+#if defined(__AVX512F__)
+                __m512 acc0 = _mm512_mul_ps(_mm512_loadu_ps(row),      _mm512_loadu_ps(u1.data()));
+                __m512 acc1 = _mm512_mul_ps(_mm512_loadu_ps(row + 16), _mm512_loadu_ps(u1.data() + 16));
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 32), _mm512_loadu_ps(u1.data() + 32), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 48), _mm512_loadu_ps(u1.data() + 48), acc1);
+                float s = b2[i] + _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#else
+                float s = b2[i];
                 for (int j = 0; j < D_LAT; ++j) s += row[j] * u1[j];
+#endif
                 z2[i] = s;
                 a2[i] = silu(s);
             }
             float h_nsq = 0.0f;
             for (int d = 0; d < D_LAT; ++d) {
-                float s = u1[d] + b2_proj[d];
                 const float* row = &W2_proj[d * D_HID];
+#if defined(__AVX512F__)
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+                for (int i = 0; i < D_HID; i += 32) {
+                    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(row + i),      _mm512_loadu_ps(a2.data() + i),      acc0);
+                    acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(row + i + 16), _mm512_loadu_ps(a2.data() + i + 16), acc1);
+                }
+                float s = u1[d] + b2_proj[d] + _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#else
+                float s = u1[d] + b2_proj[d];
                 for (int i = 0; i < D_HID; ++i) s += row[i] * a2[i];
+#endif
                 h_out[d] = s;
                 h_nsq += s * s;
             }
@@ -13951,13 +14008,17 @@ struct ContinuousVsaFunctionApproximator {
         std::string rkey = hsaa_assoc::normalize(rel);
         if (rkey.empty()) rkey = rel;
         auto& pts = incremental_scalar_pts[rkey];
+        bool updated = false;
         for (auto& p : pts) {
             if (std::fabs(p.first - xv) < 1e-6f) {
                 p.second = yv;
+                updated = true;
                 break;
             }
         }
-        pts.push_back({xv, yv});
+        if (!updated) {
+            pts.push_back({xv, yv});
+        }
         if (pts.size() >= 3) {
             std::vector<float> xs(pts.size()), ys(pts.size());
             for (size_t i = 0; i < pts.size(); ++i) {
@@ -14075,12 +14136,15 @@ void assoc_clear_lexicon_4kb(PopCountBrain* brain) {
 void assoc_rebuild_holo_from_4kb(PopCountBrain* brain) {
     if (!brain) return;
     brain->holo_bank.clear();
+    uint32_t count = 0;
     assoc_for_each_slot_4kb(brain, [&](const AssocFactSlot4KB& sl) -> bool {
         AssocFact f{};
         assoc_slot_to_fact(sl, &f);
         brain->holo_bank.add_fact(static_cast<size_t>(sl.fact_idx), f);
+        ++count;
         return false;
     });
+    brain->assoc_fact_count = count;
 }
 
 uint32_t assoc_fnv1a32(const std::string& s) {

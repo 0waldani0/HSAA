@@ -34,27 +34,27 @@ include_directories(
 )
 
 # ==============================================================================
-# CUDA sm_86 CUBIN Target (Custom Command via NVCC)
+# CUDA sm_86 CUBIN Target (Optional Custom Command via NVCC)
 # ==============================================================================
-find_program(CUDA_NVCC nvcc HINTS "$ENV{CUDA_PATH}/bin")
-if(NOT CUDA_NVCC)
-    message(FATAL_ERROR "NVCC CUDA compiler driver not found in PATH or CUDA_PATH.")
-endif()
+find_program(CUDA_NVCC nvcc HINTS "$ENV{CUDA_PATH}/bin" "/usr/local/cuda/bin")
 
 set(KERNEL_CU "${CMAKE_CURRENT_SOURCE_DIR}/legacy_ptq/kernel.cu")
 set(KERNEL_CUBIN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/build/kernel.cubin")
 set(KERNEL_CUBIN_BIN "${CMAKE_BINARY_DIR}/kernel.cubin")
 
-add_custom_command(
-    OUTPUT "${KERNEL_CUBIN_BIN}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}"
-    COMMAND ${CUDA_NVCC} -cubin -arch=sm_86 -O3 "${KERNEL_CU}" -o "${KERNEL_CUBIN_BIN}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KERNEL_CUBIN_BIN}" "${KERNEL_CUBIN_ROOT}"
-    DEPENDS "${KERNEL_CU}"
-    COMMENT "Compiling CUDA sm_86 kernel into standalone ${KERNEL_CUBIN_BIN}..."
-)
-
-add_custom_target(generate_kernel_cubin ALL DEPENDS "${KERNEL_CUBIN_BIN}")
+if(CUDA_NVCC)
+    add_custom_command(
+        OUTPUT "${KERNEL_CUBIN_BIN}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}"
+        COMMAND ${CUDA_NVCC} -cubin -arch=sm_86 -O3 "${KERNEL_CU}" -o "${KERNEL_CUBIN_BIN}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KERNEL_CUBIN_BIN}" "${KERNEL_CUBIN_ROOT}"
+        DEPENDS "${KERNEL_CU}"
+        COMMENT "Compiling CUDA sm_86 kernel into standalone ${KERNEL_CUBIN_BIN}..."
+    )
+    add_custom_target(generate_kernel_cubin ALL DEPENDS "${KERNEL_CUBIN_BIN}")
+else()
+    message(STATUS "NVCC not found; building with dynamic CUDA driver probe + AVX-512 CPU fallback.")
+endif()
 
 # ==============================================================================
 # Legacy PTQ CUDA Engine Executable & Library
@@ -62,16 +62,25 @@ add_custom_target(generate_kernel_cubin ALL DEPENDS "${KERNEL_CUBIN_BIN}")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/legacy_ptq/ptq_cuda.c")
     add_library(ptq_cuda STATIC legacy_ptq/ptq_cuda.c)
     target_include_directories(ptq_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/legacy_ptq)
-    add_dependencies(ptq_cuda generate_kernel_cubin)
+    if(NOT MSVC)
+        target_link_libraries(ptq_cuda PUBLIC dl m)
+    endif()
+    if(TARGET generate_kernel_cubin)
+        add_dependencies(ptq_cuda generate_kernel_cubin)
+    endif()
 
     add_executable(legacy_ptq legacy_ptq/engine.c)
     target_include_directories(legacy_ptq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/legacy_ptq)
     target_link_libraries(legacy_ptq PRIVATE ptq_cuda)
-    add_dependencies(legacy_ptq generate_kernel_cubin)
+    if(TARGET generate_kernel_cubin)
+        add_dependencies(legacy_ptq generate_kernel_cubin)
+    endif()
 else()
     add_executable(legacy_ptq legacy_ptq/engine.c)
     target_include_directories(legacy_ptq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/legacy_ptq)
-    add_dependencies(legacy_ptq generate_kernel_cubin)
+    if(TARGET generate_kernel_cubin)
+        add_dependencies(legacy_ptq generate_kernel_cubin)
+    endif()
 endif()
 
 # ==============================================================================
@@ -88,7 +97,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bridge.cpp" AND EXISTS "${CMAK
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/legacy_ptq
     )
-    add_dependencies(test_bridge generate_kernel_cubin)
+    if(NOT MSVC)
+        target_link_libraries(test_bridge PRIVATE dl pthread)
+    endif()
+    if(TARGET generate_kernel_cubin)
+        add_dependencies(test_bridge generate_kernel_cubin)
+    endif()
 endif()
 
 # ==============================================================================
@@ -100,6 +114,7 @@ set(CORE_SOURCES
     src/model_mod.cpp
     src/hssa.cpp
     src/bench_runner.cpp
+    src/unified_engine.cpp
 )
 
 set(ALL_CORE_EXIST TRUE)
@@ -112,7 +127,12 @@ endforeach()
 if(ALL_CORE_EXIST)
     add_library(upgrade_core STATIC ${CORE_SOURCES})
     target_link_libraries(upgrade_core PUBLIC popcnt_brain_static ptq_cuda)
-    add_dependencies(upgrade_core generate_kernel_cubin)
+    if(NOT MSVC)
+        target_link_libraries(upgrade_core PUBLIC pthread dl gomp)
+    endif()
+    if(TARGET generate_kernel_cubin)
+        add_dependencies(upgrade_core generate_kernel_cubin)
+    endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main_lab.cpp")
         add_executable(upgrade_lab src/main_lab.cpp)
@@ -147,5 +167,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_test_runner.cpp")
     else()
         target_link_libraries(e2e_test_runner PRIVATE popcnt_brain_static)
     endif()
-    add_dependencies(e2e_test_runner generate_kernel_cubin)
+    if(TARGET generate_kernel_cubin)
+        add_dependencies(e2e_test_runner generate_kernel_cubin)
+    endif()
 endif()

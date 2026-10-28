@@ -29,6 +29,7 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
+#include <immintrin.h>
 
 namespace hsaa_assoc {
 
@@ -83,8 +84,7 @@ inline std::string normalize(const char* s) {
 }
 
 inline void sketch(const std::string& text, std::uint64_t out[kW]) {
-    std::int32_t acc[kDim];
-    for (int i = 0; i < kDim; ++i) acc[i] = 0;
+    alignas(64) std::int32_t acc[kDim] = {};
 
     // Boundary markers make leading/trailing trigrams position-distinct.
     std::string padded;
@@ -95,6 +95,36 @@ inline void sketch(const std::string& text, std::uint64_t out[kW]) {
 
     const unsigned char* p = reinterpret_cast<const unsigned char*>(padded.data());
     const std::size_t n = padded.size();
+
+#if defined(__AVX512F__)
+    const __m512i v_pos = _mm512_set1_epi32(1);
+    const __m512i v_neg = _mm512_set1_epi32(-1);
+    for (std::size_t i = 0; i + 3 <= n; ++i) {
+        const std::uint64_t h = fnv1a3(p + i);
+        for (int w = 0; w < kW; ++w) {
+            const std::uint64_t r =
+                mix64(h ^ (0x9E3779B97F4A7C15ULL * static_cast<std::uint64_t>(w + 1)));
+            std::int32_t* dst = &acc[w * 64];
+            for (int g = 0; g < 4; ++g) {
+                __mmask16 m = static_cast<__mmask16>((r >> (g * 16)) & 0xFFFFU);
+                __m512i va = _mm512_load_si512(reinterpret_cast<const void*>(dst + g * 16));
+                __m512i vd = _mm512_mask_mov_epi32(v_neg, m, v_pos);
+                _mm512_store_si512(reinterpret_cast<void*>(dst + g * 16), _mm512_add_epi32(va, vd));
+            }
+        }
+    }
+    const __m512i v_zero = _mm512_setzero_si512();
+    for (int w = 0; w < kW; ++w) {
+        std::uint64_t bits = 0;
+        const std::int32_t* src = &acc[w * 64];
+        for (int g = 0; g < 4; ++g) {
+            __m512i va = _mm512_load_si512(reinterpret_cast<const void*>(src + g * 16));
+            __mmask16 m = _mm512_cmpgt_epi32_mask(va, v_zero);
+            bits |= (static_cast<std::uint64_t>(m) << (g * 16));
+        }
+        out[w] = bits;
+    }
+#else
     for (std::size_t i = 0; i + 3 <= n; ++i) {
         const std::uint64_t h = fnv1a3(p + i);
         for (int w = 0; w < kW; ++w) {
@@ -111,14 +141,24 @@ inline void sketch(const std::string& text, std::uint64_t out[kW]) {
     for (int b = 0; b < kDim; ++b) {
         if (acc[b] > 0) out[b >> 6] |= (1ULL << (b & 63));
     }
+#endif
 }
 
 inline std::int32_t dot512(const std::uint64_t a[kW], const std::uint64_t b[kW]) {
+#if defined(__AVX512F__) && defined(__AVX512VPOPCNTDQ__)
+    __m512i va = _mm512_loadu_si512(reinterpret_cast<const void*>(a));
+    __m512i vb = _mm512_loadu_si512(reinterpret_cast<const void*>(b));
+    __m512i vxor = _mm512_xor_si512(va, vb);
+    __m512i vpop = _mm512_popcnt_epi64(vxor);
+    int hd = static_cast<int>(_mm512_reduce_add_epi64(vpop));
+    return static_cast<std::int32_t>(kDim - 2 * hd);
+#else
     int matches = 0;
     for (int w = 0; w < kW; ++w) {
         matches += popcount64(~(a[w] ^ b[w]));
     }
     return static_cast<std::int32_t>(matches) * 2 - kDim;
+#endif
 }
 
 } // namespace hsaa_assoc

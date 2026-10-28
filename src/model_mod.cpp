@@ -682,10 +682,16 @@ int model_forward_layer(void* ctx, uint32_t layer_idx, const float* in_vec, floa
                              : (current_prec == QUANT_3BIT) ? 7.0f
                              : (current_prec == QUANT_DELTA_24) ? 11.0f : 13.0f;
         const float inv_q = 1.0f / q_levels;
-        for (size_t j = 0; j < MODEL_DEFAULT_DIM_N; ++j) {
-            float delta = out_vec[j] - src_vec[j];
-            float q_delta = std::nearbyint(delta * q_levels) * inv_q;
-            out_vec[j] = src_vec[j] + 0.85f * delta + 0.15f * q_delta;
+        const __m512 v_ql = _mm512_set1_ps(q_levels);
+        const __m512 v_iq = _mm512_set1_ps(0.15f * inv_q);
+        const __m512 v_85 = _mm512_set1_ps(0.85f);
+        for (size_t j = 0; j < MODEL_DEFAULT_DIM_N; j += 16) {
+            const __m512 v_src = _mm512_loadu_ps(src_vec + j);
+            const __m512 v_out = _mm512_loadu_ps(out_vec + j);
+            const __m512 v_delta = _mm512_sub_ps(v_out, v_src);
+            const __m512 v_q = _mm512_roundscale_ps(_mm512_mul_ps(v_delta, v_ql), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            const __m512 v_res = _mm512_fmadd_ps(v_q, v_iq, _mm512_fmadd_ps(v_85, v_delta, v_src));
+            _mm512_storeu_ps(out_vec + j, v_res);
         }
     }
 
@@ -1081,7 +1087,8 @@ int model_load_weights(void* ctx, const char* filepath) {
                  metas[l].precision != static_cast<uint32_t>(QUANT_DELTA_24) &&
                  metas[l].precision != static_cast<uint32_t>(QUANT_DELTA_34)) ||
                 (metas[l].layer_type != static_cast<uint32_t>(LAYER_GQA_ATTENTION) &&
-                 metas[l].layer_type != static_cast<uint32_t>(LAYER_GATED_DELTANET))) {
+                 metas[l].layer_type != static_cast<uint32_t>(LAYER_GATED_DELTANET) &&
+                 metas[l].layer_type != static_cast<uint32_t>(LAYER_AVX512_VSA_ASSOCIATIVE))) {
                 ok = false;
             } else {
                 csum = mmod_fnv1a64(csum, &metas[l], sizeof(ModelLayerDiskMeta));

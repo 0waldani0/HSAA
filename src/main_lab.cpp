@@ -3,13 +3,17 @@
 #include "bridge.h"
 #include "vsa_db.h"
 #include "hssa.h"
+#include "unified_engine.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 #include <immintrin.h>
 
 #include <iostream>
@@ -20,7 +24,16 @@
 #include <cstring>
 #include <cstdlib>
 
-#pragma comment(lib, "psapi.lib")
+#if !defined(_WIN32)
+static inline void* _aligned_malloc(size_t size, size_t alignment) {
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) return nullptr;
+    return ptr;
+}
+static inline void _aligned_free(void* ptr) {
+    std::free(ptr);
+}
+#endif
 
 /*
  * =============================================================================
@@ -45,6 +58,7 @@ static void print_usage(const char* prog_name) {
     std::cout << "  lab      Interactive architecture mutation: precision cycling, TT16 plasticity, block swapping\n";
     std::cout << "  run      Execute end-to-end forward inference pipeline over hybrid neural architecture\n";
     std::cout << "  hssa     Execute 28-layer HSSA forward token cycle with full telemetry (AVX-512 CPU)\n";
+    std::cout << "  unified  Execute single-pass Unified Cognitive Engine (HSSA + SecondBrain + VSA + ModelMod)\n";
     std::cout << "  help     Display this help documentation\n\n";
     std::cout << "Options:\n";
     std::cout << "  --cuda   (hssa only) Also run the sm_86 GPU offload path and print the CPU/GPU\n";
@@ -299,7 +313,8 @@ static int cmd_test(int argc, char** argv) {
         RUN_CHECK("bench_get_host_ram_mb query (<= 32,768 MB)", ram > 0 && ram <= MAX_WORKSTATION_RAM_MB);
 
         size_t vram = bench_get_gpu_vram_mb();
-        RUN_CHECK("bench_get_gpu_vram_mb query (<= 4,096 MB)", vram > 0 && vram <= MAX_WORKSTATION_VRAM_MB);
+        bool vram_ok = (bridge_is_cuda_available() ? (vram > 0) : (vram == 0)) && (vram <= MAX_WORKSTATION_VRAM_MB);
+        RUN_CHECK("bench_get_gpu_vram_mb query (<= 4,096 MB)", vram_ok);
 
         float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
         float cos_ident = bench_compute_cosine_similarity(a, a, 4);
@@ -777,6 +792,181 @@ static int cmd_hssa(int argc, char** argv) {
     return 0;
 }
 
+static std::string json_escape_str(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20) continue;
+        else out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+/*
+ * =============================================================================
+ * 6. Subcommand: unified
+ * =============================================================================
+ */
+static int cmd_unified(int argc, char** argv) {
+    bool json_mode = false;
+    std::string req_mode = "all";
+    std::string custom_prompt;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--json") == 0) {
+            json_mode = true;
+            if (i + 1 < argc) req_mode = argv[++i];
+            if (i + 1 < argc) custom_prompt = argv[++i];
+            break;
+        }
+    }
+
+    UnifiedEngineConfig cfg;
+    unified_engine_default_config(&cfg);
+    UnifiedEngine* eng = unified_engine_create(&cfg);
+    if (!eng) {
+        if (json_mode) {
+            std::cout << "{\"error\":\"Failed to initialize UnifiedEngine\"}\n";
+        } else {
+            std::cerr << "[ERROR] Failed to initialize UnifiedEngine.\n";
+        }
+        return 1;
+    }
+
+    UnifiedObserveTelemetry obs_t{};
+    unified_engine_observe(eng, "Модуль_Орион | использует_ядро | Квантовый_Кластер", &obs_t);
+    unified_engine_observe(eng, "Квантовый_Кластер | обеспечивает_режим | Сверхпроводящий_Резонанс_5D", &obs_t);
+    unified_engine_observe(eng, "Модуль_Вега | использует_архитектуру | Оптический_Тороид", &obs_t);
+    unified_engine_observe(
+        eng,
+        "Нейроморфный сопроцессор вычисляет градиентный тензор и ускоряет глубокий трансформер. "
+        "Квантовый ускоритель формирует плотный вектор и оптимизирует быстрый индекс. "
+        "Голографический модуль анализирует разреженный граф и синхронизирует когерентный поток.",
+        &obs_t
+    );
+    for (int i = 0; i <= 16; ++i) {
+        float x = static_cast<float>(i) * 0.20f;
+        float y = std::sin(x) + 0.25f * x * x;
+        char fbuf[128];
+        std::snprintf(fbuf, sizeof(fbuf), "nonlinear_law(%.5f) = %.6f", static_cast<double>(x), static_cast<double>(y));
+        unified_engine_observe(eng, fbuf, &obs_t);
+    }
+
+    if (json_mode) {
+        std::string p_text = (!custom_prompt.empty() && req_mode == "text")
+            ? custom_prompt
+            : "Нейроморфные сопроцессоры вычисляют";
+        std::string p_code = (!custom_prompt.empty() && req_mode == "code")
+            ? custom_prompt
+            : "Synthesize C++20 analytical function for nonlinear_law(x)";
+        std::string p_idea = (!custom_prompt.empty() && req_mode == "idea")
+            ? custom_prompt
+            : "Модуль_Вега";
+
+        char text_out[2048] = {0};
+        UnifiedTextGenTelemetry tg{};
+        unified_engine_generate_text_deep(eng, p_text.c_str(), text_out, sizeof(text_out), 20, 4, &tg);
+
+        char code_out[4096] = {0};
+        UnifiedCodeSynthTelemetry cs{};
+        unified_engine_synthesize_code(eng, p_code.c_str(), code_out, sizeof(code_out), &cs);
+
+        char algo_out[4096] = {0};
+        UnifiedCodeSynthTelemetry cs_algo{};
+        unified_engine_synthesize_code(eng, "Dijkstra shortest path on Red-Black Tree", algo_out, sizeof(algo_out), &cs_algo);
+
+        char idea_out[4096] = {0};
+        UnifiedIdeaSynthTelemetry id_t{};
+        unified_engine_synthesize_ideas(eng, p_idea.c_str(), true, idea_out, sizeof(idea_out), &id_t);
+
+        char recalled_idea[256] = {0};
+        UnifiedForwardTelemetry fwd_rec{};
+        unified_engine_forward(eng, "Модуль_Вега | использует_ядро ?", recalled_idea, sizeof(recalled_idea), nullptr, &fwd_rec);
+
+        std::cout << "{\n"
+                  << "  \"text_gen\": {\n"
+                  << "    \"prompt\": \"" << json_escape_str(p_text) << "\",\n"
+                  << "    \"output\": \"" << json_escape_str(text_out) << "\",\n"
+                  << "    \"tokens\": " << tg.generated_tokens << ",\n"
+                  << "    \"beams\": " << tg.beam_candidates_evaluated << ",\n"
+                  << "    \"subword_stems\": " << tg.subword_stems_matched << ",\n"
+                  << "    \"hssa_cosine\": " << tg.hssa_alignment_cosine << ",\n"
+                  << "    \"rope_attn\": " << tg.max_long_range_rope_attn << ",\n"
+                  << "    \"hopfield_dE\": " << tg.hopfield_energy_delta << ",\n"
+                  << "    \"latency_us\": " << tg.total_gen_us << "\n"
+                  << "  },\n"
+                  << "  \"code_synth\": {\n"
+                  << "    \"prompt\": \"" << json_escape_str(p_code) << "\",\n"
+                  << "    \"vsa_func_code\": \"" << json_escape_str(code_out) << "\",\n"
+                  << "    \"algo_code\": \"" << json_escape_str(algo_out) << "\",\n"
+                  << "    \"ast_nodes\": " << cs.ast_nodes_verified << ",\n"
+                  << "    \"ast_valid\": " << (cs.ast_balanced_valid ? "true" : "false") << ",\n"
+                  << "    \"sandbox_verified\": " << (cs.sandbox_exec_verified ? "true" : "false") << ",\n"
+                  << "    \"sandbox_tests\": " << cs.sandbox_test_cases_passed << ",\n"
+                  << "    \"sandbox_mse\": " << cs.sandbox_mse << ",\n"
+                  << "    \"latency_us\": " << cs.total_synth_us << "\n"
+                  << "  },\n"
+                  << "  \"idea_synth\": {\n"
+                  << "    \"prompt\": \"" << json_escape_str(p_idea) << "\",\n"
+                  << "    \"ideas\": \"" << json_escape_str(idea_out) << "\",\n"
+                  << "    \"recalled_crystallized\": \"" << json_escape_str(recalled_idea) << "\",\n"
+                  << "    \"analogies\": " << id_t.analogies_transferred << ",\n"
+                  << "    \"curiosity_gaps\": " << id_t.curiosity_gaps_filled << ",\n"
+                  << "    \"crystallized\": " << id_t.crystallized_facts << ",\n"
+                  << "    \"novelty_score\": " << id_t.manifold_novelty_score << ",\n"
+                  << "    \"structural_cosine\": " << id_t.analogy_structural_cosine << ",\n"
+                  << "    \"hopfield_dE\": " << id_t.hopfield_energy_delta << ",\n"
+                  << "    \"latency_us\": " << id_t.total_idea_us << "\n"
+                  << "  }\n"
+                  << "}\n";
+        unified_engine_destroy(eng);
+        return 0;
+    }
+
+    print_banner();
+    std::cout << "----------------------------------------------------------------------------------------\n";
+    std::cout << " [SUBCOMMAND: UNIFIED] Single-Pass Unified Cognitive Engine (HSSA + SecondBrain + VSA)\n";
+    std::cout << "----------------------------------------------------------------------------------------\n\n";
+
+    char out_rel[256] = {0};
+    UnifiedForwardTelemetry fwd_rel{};
+    unified_engine_forward(eng, "Модуль_Орион | обеспечивает_режим ?", out_rel, sizeof(out_rel), nullptr, &fwd_rel);
+
+    char out_fn[256] = {0};
+    UnifiedForwardTelemetry fwd_fn{};
+    unified_engine_forward(eng, "nonlinear_law(0.90000)", out_fn, sizeof(out_fn), nullptr, &fwd_fn);
+
+    char out_gen[512] = {0};
+    UnifiedTextGenTelemetry tg_t{};
+    unified_engine_generate_text_deep(eng, "Нейроморфные сопроцессоры вычисляют", out_gen, sizeof(out_gen), 16, 4, &tg_t);
+
+    char out_code[1024] = {0};
+    UnifiedCodeSynthTelemetry cs_t{};
+    unified_engine_synthesize_code(eng, "Synthesize C++20 function for nonlinear_law(x)", out_code, sizeof(out_code), &cs_t);
+
+    char out_ideas[2048] = {0};
+    UnifiedIdeaSynthTelemetry id_t{};
+    unified_engine_synthesize_ideas(eng, "Модуль_Вега", true, out_ideas, sizeof(out_ideas), &id_t);
+
+    std::cout << "  [1] Multi-Hop Relational Query ('Модуль_Орион | обеспечивает_режим ?'):\n"
+              << "      -> Resolved: " << out_rel << " (" << fwd_rel.total_forward_us << " us, dE=" << fwd_rel.hopfield_energy_delta << ")\n";
+    std::cout << "  [2] Continuous Function Query ('nonlinear_law(0.90000)'):\n"
+              << "      -> Resolved: " << out_fn << " (exact=" << (std::sin(0.9f) + 0.25f * 0.81f) << ")\n";
+    std::cout << "  [3] Deep 28-Layer Beam + Subword Stem Generation ('Нейроморфные сопроцессоры вычисляют'):\n"
+              << "      -> Output:   " << out_gen << " (beams=" << tg_t.beam_candidates_evaluated << ", stems=" << tg_t.subword_stems_matched << ")\n";
+    std::cout << "  [4] VSA Function-to-C++20 Code Synthesis (sandbox MSE=" << cs_t.sandbox_mse << "):\n"
+              << out_code << "\n";
+    std::cout << "  [5] System-2 Cross-Domain VSA Analogy & Curiosity Hypotheses:\n"
+              << out_ideas << "\n\n";
+
+    unified_engine_destroy(eng);
+    return 0;
+}
+
 /*
  * =============================================================================
  * Main CLI Router
@@ -799,6 +989,8 @@ int main(int argc, char** argv) {
         return cmd_run(argc, argv);
     } else if (cmd == "hssa") {
         return cmd_hssa(argc, argv);
+    } else if (cmd == "unified") {
+        return cmd_unified(argc, argv);
     } else if (cmd == "help" || cmd == "--help" || cmd == "-h") {
         print_usage(argv[0]);
         return 0;

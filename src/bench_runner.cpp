@@ -3,12 +3,19 @@
 #include "bridge.h"
 #include "vsa_db.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#else
+#include <time.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#endif
 #include <immintrin.h>
 
 #include <cmath>
@@ -20,17 +27,16 @@
 #include <algorithm>
 #include <mutex>
 
-#pragma comment(lib, "psapi.lib")
-
 /*
  * =============================================================================
  * Milestone M4: Automated Experiment Runner & Empirical Benchmarking Suite
- * Pure Native C++20 / AVX-512 / Win32 Implementation
+ * Pure Native C++20 / AVX-512 / Cross-Platform Win32 & POSIX Implementation
  * =============================================================================
  */
 
-// High-resolution Win32 QPC timestamp in microseconds
+// High-resolution Win32 QPC / POSIX CLOCK_MONOTONIC timestamp in microseconds
 double bench_get_qpc_us(void) {
+#if defined(_WIN32)
     static LARGE_INTEGER freq = {0};
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);
@@ -38,16 +44,37 @@ double bench_get_qpc_us(void) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return (static_cast<double>(now.QuadPart) * 1000000.0) / static_cast<double>(freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000000.0 + static_cast<double>(ts.tv_nsec) * 0.001;
+#endif
 }
 
-// Win32 GetProcessMemoryInfo working set in megabytes
+// Host process working set in megabytes
 size_t bench_get_host_ram_mb(void) {
+#if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS_EX pmc;
     std::memset(&pmc, 0, sizeof(pmc));
     if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
         return pmc.WorkingSetSize / (1024 * 1024);
     }
     return 0;
+#else
+    FILE* fp = std::fopen("/proc/self/statm", "r");
+    if (fp) {
+        unsigned long size_pages = 0, rss_pages = 0;
+        if (std::fscanf(fp, "%lu %lu", &size_pages, &rss_pages) == 2) {
+            std::fclose(fp);
+            long page_sz = sysconf(_SC_PAGESIZE);
+            if (page_sz <= 0) page_sz = 4096;
+            size_t mb = static_cast<size_t>((rss_pages * static_cast<unsigned long>(page_sz)) / (1024ULL * 1024ULL));
+            return (mb == 0) ? 1 : mb;
+        }
+        std::fclose(fp);
+    }
+    return 1;
+#endif
 }
 
 // CUDA Driver API cuMemGetInfo_v2 active VRAM in megabytes (returns 0 on no GPU / error)
@@ -56,37 +83,56 @@ size_t bench_get_gpu_vram_mb(void) {
     typedef int CUdevice;
     typedef void* CUcontext;
 
-    typedef CUresult (__stdcall *PFN_cuInit)(unsigned int);
-    typedef CUresult (__stdcall *PFN_cuDeviceGet)(CUdevice*, int);
-    typedef CUresult (__stdcall *PFN_cuCtxGetCurrent)(CUcontext*);
-    typedef CUresult (__stdcall *PFN_cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
-    typedef CUresult (__stdcall *PFN_cuCtxSetCurrent)(CUcontext);
-    typedef CUresult (__stdcall *PFN_cuCtxCreate_v2)(CUcontext*, unsigned int, CUdevice);
-    typedef CUresult (__stdcall *PFN_cuMemGetInfo_v2)(size_t*, size_t*);
+#if defined(_WIN32)
+#define BENCH_CUDA_API __stdcall
+#else
+#define BENCH_CUDA_API
+#endif
 
+    typedef CUresult (BENCH_CUDA_API *PFN_cuInit)(unsigned int);
+    typedef CUresult (BENCH_CUDA_API *PFN_cuDeviceGet)(CUdevice*, int);
+    typedef CUresult (BENCH_CUDA_API *PFN_cuCtxGetCurrent)(CUcontext*);
+    typedef CUresult (BENCH_CUDA_API *PFN_cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
+    typedef CUresult (BENCH_CUDA_API *PFN_cuCtxSetCurrent)(CUcontext);
+    typedef CUresult (BENCH_CUDA_API *PFN_cuCtxCreate_v2)(CUcontext*, unsigned int, CUdevice);
+    typedef CUresult (BENCH_CUDA_API *PFN_cuMemGetInfo_v2)(size_t*, size_t*);
+
+#if defined(_WIN32)
     static HMODULE hCuda = NULL;
+#else
+    static void* hCuda = NULL;
+#endif
     static PFN_cuMemGetInfo_v2 pfnMemGetInfo = NULL;
     static std::once_flag s_vram_init_once;
     static bool supported = false;
 
     std::call_once(s_vram_init_once, []() {
+#if defined(_WIN32)
         hCuda = LoadLibraryA("nvcuda.dll");
+        auto load_sym = [](const char* name) -> void* {
+            return hCuda ? reinterpret_cast<void*>(GetProcAddress(hCuda, name)) : nullptr;
+        };
+#else
+        hCuda = dlopen("libcuda.so.1", RTLD_NOW);
+        if (!hCuda) hCuda = dlopen("libcuda.so", RTLD_NOW);
+        auto load_sym = [](const char* name) -> void* {
+            return hCuda ? dlsym(hCuda, name) : nullptr;
+        };
+#endif
         if (hCuda) {
-            PFN_cuInit pfnInit = (PFN_cuInit)GetProcAddress(hCuda, "cuInit");
-            PFN_cuDeviceGet pfnDeviceGet = (PFN_cuDeviceGet)GetProcAddress(hCuda, "cuDeviceGet");
-            PFN_cuCtxGetCurrent pfnCtxGetCurrent = (PFN_cuCtxGetCurrent)GetProcAddress(hCuda, "cuCtxGetCurrent");
-            PFN_cuDevicePrimaryCtxRetain pfnPrimaryCtxRetain = (PFN_cuDevicePrimaryCtxRetain)GetProcAddress(hCuda, "cuDevicePrimaryCtxRetain");
-            PFN_cuCtxSetCurrent pfnCtxSetCurrent = (PFN_cuCtxSetCurrent)GetProcAddress(hCuda, "cuCtxSetCurrent");
-            PFN_cuCtxCreate_v2 pfnCtxCreate = (PFN_cuCtxCreate_v2)GetProcAddress(hCuda, "cuCtxCreate_v2");
-            pfnMemGetInfo = (PFN_cuMemGetInfo_v2)GetProcAddress(hCuda, "cuMemGetInfo_v2");
+            PFN_cuInit pfnInit = (PFN_cuInit)load_sym("cuInit");
+            PFN_cuDeviceGet pfnDeviceGet = (PFN_cuDeviceGet)load_sym("cuDeviceGet");
+            PFN_cuCtxGetCurrent pfnCtxGetCurrent = (PFN_cuCtxGetCurrent)load_sym("cuCtxGetCurrent");
+            PFN_cuDevicePrimaryCtxRetain pfnPrimaryCtxRetain = (PFN_cuDevicePrimaryCtxRetain)load_sym("cuDevicePrimaryCtxRetain");
+            PFN_cuCtxSetCurrent pfnCtxSetCurrent = (PFN_cuCtxSetCurrent)load_sym("cuCtxSetCurrent");
+            PFN_cuCtxCreate_v2 pfnCtxCreate = (PFN_cuCtxCreate_v2)load_sym("cuCtxCreate_v2");
+            pfnMemGetInfo = (PFN_cuMemGetInfo_v2)load_sym("cuMemGetInfo_v2");
 
             if (pfnInit && pfnDeviceGet && pfnMemGetInfo && pfnInit(0) == 0) {
-                // Tier 1: Check if a CUDA context is already active on this thread
                 CUcontext cur = NULL;
                 if (pfnCtxGetCurrent && pfnCtxGetCurrent(&cur) == 0 && cur != NULL) {
                     supported = true;
                 } else {
-                    // Tier 2: Acquire device 0 and retain primary context or create driver context
                     CUdevice dev = 0;
                     if (pfnDeviceGet(&dev, 0) == 0) {
                         CUcontext ctx = NULL;

@@ -6,7 +6,18 @@
 #include <cassert>
 #include <cstring>
 #include <cmath>
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <time.h>
+typedef union { int64_t QuadPart; } LARGE_INTEGER;
+static inline void QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1000000000LL; }
+static inline void QueryPerformanceCounter(LARGE_INTEGER* c) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    c->QuadPart = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+#endif
 
 static uint64_t xorshift64(uint64_t* state) {
     uint64_t x = *state;

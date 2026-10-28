@@ -503,38 +503,67 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
         alignas(64) float v_proj[HSSA_HEAD_DIM];
         alignas(64) float gate[HSSA_HEAD_DIM];
 
+        alignas(64) float x_h_dup[2 * HSSA_HEAD_DIM];
+        for (size_t i = 0; i < 8; ++i) {
+            __m512 vx = _mm512_loadu_ps(x_h + i * 16);
+            _mm512_store_ps(x_h_dup + i * 16, vx);
+            _mm512_store_ps(x_h_dup + HSSA_HEAD_DIM + i * 16, vx);
+        }
+
         if (bw) {
             const size_t base_off = static_cast<size_t>(h) * D_H;
-            for (size_t r = 0; r < D_H; ++r) {
+            const __m512 v_one = _mm512_set1_ps(1.0f);
+            const __m512 v_half = _mm512_set1_ps(0.5f);
+            const __m512 v_hsk = _mm512_set1_ps(0.5f * bw->scale_k_rot);
+            const __m512 v_hsq = _mm512_set1_ps(0.5f * bw->scale_q_rot);
+            const __m512 v_hsv = _mm512_set1_ps(0.5f * bw->scale_v_rot);
+            const __m512 v_hsg = _mm512_set1_ps(0.5f * bw->scale_g_rot);
+            alignas(64) float gate_pre[HSSA_HEAD_DIM];
+
+            for (size_t c = 0; c < 8; ++c) {
+                const size_t r = c * 16;
                 const size_t d_idx = base_off + r;
                 const size_t w_idx = d_idx >> 6;
-                const uint64_t bit = 1ULL << (d_idx & 63);
-                const float x0 = x_h[r];
-                const float xk = x_h[(r + rot_k) & (D_H - 1)];
-                const float xq = x_h[(r + rot_q) & (D_H - 1)];
-                const float xv = x_h[(r + rot_v) & (D_H - 1)];
+                const unsigned int shift = static_cast<unsigned int>(d_idx & 63);
 
-                const float tk = ((bw->k_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->k_neg[w_idx] & bit) ? 1.0f : 0.0f);
-                const float tq = ((bw->q_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->q_neg[w_idx] & bit) ? 1.0f : 0.0f);
-                const float tv = ((bw->v_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->v_neg[w_idx] & bit) ? 1.0f : 0.0f);
-                const float tg = ((bw->g_pos[w_idx] & bit) ? 1.0f : 0.0f) - ((bw->g_neg[w_idx] & bit) ? 1.0f : 0.0f);
+                const __m512 vx0 = _mm512_load_ps(x_h_dup + r);
+                const __m512 vxk = _mm512_loadu_ps(x_h_dup + r + rot_k);
+                const __m512 vxq = _mm512_loadu_ps(x_h_dup + r + rot_q);
+                const __m512 vxv = _mm512_loadu_ps(x_h_dup + r + rot_v);
 
-                const float wk_rot = 0.5f * bw->w_k_rot[d_idx] + 0.5f * bw->scale_k_rot * tk;
-                const float wq_rot = 0.5f * bw->w_q_rot[d_idx] + 0.5f * bw->scale_q_rot * tq;
-                const float wv_rot = 0.5f * bw->w_v_rot[d_idx] + 0.5f * bw->scale_v_rot * tv;
-                const float wg_rot = 0.5f * bw->w_g_rot[d_idx] + 0.5f * bw->scale_g_rot * tg;
+                const __mmask16 kp = static_cast<__mmask16>((bw->k_pos[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 kn = static_cast<__mmask16>((bw->k_neg[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 qp = static_cast<__mmask16>((bw->q_pos[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 qn = static_cast<__mmask16>((bw->q_neg[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 vp = static_cast<__mmask16>((bw->v_pos[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 vn = static_cast<__mmask16>((bw->v_neg[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 gp = static_cast<__mmask16>((bw->g_pos[w_idx] >> shift) & 0xFFFFu);
+                const __mmask16 gn = static_cast<__mmask16>((bw->g_neg[w_idx] >> shift) & 0xFFFFu);
 
-                k_proj[r] = bw->w_k_diag[d_idx] * x0 + wk_rot * xk;
-                q_proj[r] = bw->w_q_diag[d_idx] * x0 + wq_rot * xq;
-                v_proj[r] = bw->w_v_diag[d_idx] * x0 + wv_rot * xv;
-                gate[r]   = fast_sigmoid(bw->w_g_diag[d_idx] * x0 + wg_rot * xq);
+                const __m512 tk = _mm512_sub_ps(_mm512_maskz_mov_ps(kp, v_one), _mm512_maskz_mov_ps(kn, v_one));
+                const __m512 tq = _mm512_sub_ps(_mm512_maskz_mov_ps(qp, v_one), _mm512_maskz_mov_ps(qn, v_one));
+                const __m512 tv = _mm512_sub_ps(_mm512_maskz_mov_ps(vp, v_one), _mm512_maskz_mov_ps(vn, v_one));
+                const __m512 tg = _mm512_sub_ps(_mm512_maskz_mov_ps(gp, v_one), _mm512_maskz_mov_ps(gn, v_one));
+
+                const __m512 wk_rot = _mm512_fmadd_ps(v_hsk, tk, _mm512_mul_ps(v_half, _mm512_load_ps(&bw->w_k_rot[d_idx])));
+                const __m512 wq_rot = _mm512_fmadd_ps(v_hsq, tq, _mm512_mul_ps(v_half, _mm512_load_ps(&bw->w_q_rot[d_idx])));
+                const __m512 wv_rot = _mm512_fmadd_ps(v_hsv, tv, _mm512_mul_ps(v_half, _mm512_load_ps(&bw->w_v_rot[d_idx])));
+                const __m512 wg_rot = _mm512_fmadd_ps(v_hsg, tg, _mm512_mul_ps(v_half, _mm512_load_ps(&bw->w_g_rot[d_idx])));
+
+                _mm512_store_ps(k_proj + r, _mm512_fmadd_ps(_mm512_load_ps(&bw->w_k_diag[d_idx]), vx0, _mm512_mul_ps(wk_rot, vxk)));
+                _mm512_store_ps(q_proj + r, _mm512_fmadd_ps(_mm512_load_ps(&bw->w_q_diag[d_idx]), vx0, _mm512_mul_ps(wq_rot, vxq)));
+                _mm512_store_ps(v_proj + r, _mm512_fmadd_ps(_mm512_load_ps(&bw->w_v_diag[d_idx]), vx0, _mm512_mul_ps(wv_rot, vxv)));
+                _mm512_store_ps(gate_pre + r, _mm512_fmadd_ps(_mm512_load_ps(&bw->w_g_diag[d_idx]), vx0, _mm512_mul_ps(wg_rot, vxq)));
+            }
+            for (size_t r = 0; r < D_H; ++r) {
+                gate[r] = fast_sigmoid(gate_pre[r]);
             }
         } else {
             for (size_t r = 0; r < D_H; ++r) {
                 const float x0 = x_h[r];
-                const float xk = x_h[(r + rot_k) & (D_H - 1)];
-                const float xq = x_h[(r + rot_q) & (D_H - 1)];
-                const float xv = x_h[(r + rot_v) & (D_H - 1)];
+                const float xk = x_h_dup[r + rot_k];
+                const float xq = x_h_dup[r + rot_q];
+                const float xv = x_h_dup[r + rot_v];
                 k_proj[r] = 0.85f * x0 + 0.15f * xk;
                 q_proj[r] = 0.85f * x0 - 0.15f * xq;
                 v_proj[r] = 0.90f * x0 + 0.10f * xv;
@@ -1947,6 +1976,18 @@ int hssa_forward_deep_interpolated(
     alignas(64) uint64_t best_vec[8];
     float similarity = 0.0f;
     VsaDbHandle* target_db = ctx->global_vsa_db;
+    if (!target_db || vsa_db_get_vector_count(target_db) == 0) {
+        for (uint32_t l = ctx->config.num_layers; l > 0; --l) {
+            VsaDbHandle* lyr_db = ctx->layers[l - 1].vsa_handle;
+            if (lyr_db) {
+                if (!target_db) target_db = lyr_db;
+                if (vsa_db_get_vector_count(lyr_db) > 0) {
+                    target_db = lyr_db;
+                    break;
+                }
+            }
+        }
+    }
     if (target_db && vsa_db_get_vector_count(target_db) > 0) {
         if (!vsa_db_query_vector(target_db, ctx->scratch_vsa, best_vec, &similarity)) {
             std::memset(best_vec, 0, sizeof(best_vec));
