@@ -259,7 +259,7 @@ int main() {
     assert(cos_ab > 0.70f && cos_ab > cos_unrel + 0.35f && "4096-D dense float32 cosine similarity failed semantic ranking");
     printf("[+] 4096-D Dense Float32 Cosine verified: cos_related=%.4f > cos_unrelated=%.4f\n", cos_ab, cos_unrel);
 
-    // 14. Verify Compositional Zero-Shot Algorithm Synthesis (Dijkstra on Red-Black Tree)
+    // 14. Verify Compositional Zero-Shot Algorithm Synthesis (Dijkstra+RBTree, Ukkonen+Hash, Tarjan Articulation)
     char synth_code[8192] = {0};
     bool exec_verified = false;
     int synth_toks = brain_synthesize_algorithm_zeroshot(
@@ -272,8 +272,30 @@ int main() {
            strstr(synth_code, "rotate_right") != NULL &&
            strstr(synth_code, "dist[u] + w < dist[v]") != NULL &&
            "Synthesized code missing Red-Black Tree rotations or Dijkstra edge relaxation");
-    printf("[+] Zero-Shot Algorithm Synthesis verified: tokens=%d, sandbox_verified=%d (RB-Tree + Dijkstra relaxation)\n",
-           synth_toks, exec_verified ? 1 : 0);
+
+    char ukk_code[8192] = {0};
+    bool ukk_verified = false;
+    int ukk_toks = brain_synthesize_algorithm_zeroshot(
+        brain,
+        "Суффиксный автомат Укконена с хешированием",
+        ukk_code, sizeof(ukk_code), &ukk_verified);
+    assert(ukk_toks > 100 && ukk_verified &&
+           strstr(ukk_code, "UkkonenSuffixAutomaton") != NULL &&
+           strstr(ukk_code, "OpenAddressedTransitionHash") != NULL &&
+           "Ukkonen + Hashing synthesis failed");
+
+    char tarjan_code[8192] = {0};
+    bool tarjan_verified = false;
+    int tarjan_toks = brain_synthesize_algorithm_zeroshot(
+        brain,
+        "Алгоритм Тарьяна поиска точек сочленения",
+        tarjan_code, sizeof(tarjan_code), &tarjan_verified);
+    assert(tarjan_toks > 100 && tarjan_verified &&
+           strstr(tarjan_code, "TarjanArticulationSolver") != NULL &&
+           strstr(tarjan_code, "low[to] >= tin[v]") != NULL &&
+           "Tarjan Articulation Points synthesis failed");
+    printf("[+] Zero-Shot Compositional Synthesis verified: RBTree+Dijkstra (%d toks), Ukkonen+Hash (%d toks), Tarjan (%d toks)\n",
+           synth_toks, ukk_toks, tarjan_toks);
 
     // 15. Verify Full O(N^2) RoPE Causal Self-Attention over Long Unstructured Narrative (>220 tokens)
     std::string long_story =
@@ -304,10 +326,52 @@ int main() {
     printf("[+] Hierarchical Continuous Manifold (>50k vocab) verified: V=%zu, clusters=%zu, loss=%.4f -> %.4f\n",
            active_vocab, num_clusters, hier_init_loss, hier_final_loss);
 
-    // 17. Destroy brain and cleanup
+    // 17. Verify CFG/EBNF Type-Scoped Constrained Decoding & Closed-Loop CEGIS with Simplex Contradiction Gate
+    char cfg_code[4096] = {0};
+    int cfg_masked = 0;
+    bool cfg_type_safe = false;
+    int cfg_toks = brain_generate_code_cfg_constrained(
+        brain,
+        "int64_t accumulate_sensor_frames(const int32_t* frames, size_t frame_count)",
+        cfg_code, sizeof(cfg_code), 128,
+        &cfg_masked, &cfg_type_safe);
+    assert(cfg_toks > 25 && cfg_masked >= 8 && cfg_type_safe &&
+           strstr(cfg_code, "std::string") == NULL &&
+           "brain_generate_code_cfg_constrained failed grammar/type safety check");
+
+    char cegis_code[8192] = {0};
+    BrainCegisSynthesisReport cegis_rep = {0};
+    int cegis_toks = brain_synthesize_cegis_sketch(
+        brain,
+        "TwoPointers sliding window: максимальное окно подотрезка с суммой не более limit",
+        3, cegis_code, sizeof(cegis_code), &cegis_rep);
+    assert(cegis_toks > 40 &&
+           cegis_rep.selected_archetype == BRAIN_SKETCH_TWO_POINTERS_WINDOW &&
+           cegis_rep.candidates_evaluated == 3 &&
+           cegis_rep.counterexamples_triggered == 2 &&
+           cegis_rep.simplex_contradictions_masked == 2 &&
+           cegis_rep.sandbox_01n_null_verified &&
+           cegis_rep.crystallized_into_vsa &&
+           "brain_synthesize_cegis_sketch failed 0-1-N-NULL CEGIS loop");
+
+    BrainCegisSynthesisReport recall_rep = {0};
+    int recall_toks = brain_synthesize_cegis_sketch(
+        brain,
+        "TwoPointers sliding window: повторный вызов после VSA кристаллизации",
+        3, cegis_code, sizeof(cegis_code), &recall_rep);
+    assert(recall_toks > 40 &&
+           recall_rep.recalled_from_crystal &&
+           recall_rep.candidates_evaluated == 1 &&
+           recall_rep.counterexamples_triggered == 0 &&
+           "CEGIS VSA crystal fast-path recall failed");
+    printf("[+] CFG/EBNF Type-Scoped Decoding (masked=%d) & Closed-Loop CEGIS (counterexamples=%d, crystal_recall=1-step) verified.\n",
+           cfg_masked, cegis_rep.counterexamples_triggered);
+
+    // 18. Destroy brain and cleanup
     brain_destroy(brain);
     printf("[+] Brain destroyed cleanly.\n");
 
     printf("[SUCCESS] All PopCount Second Brain C-ABI tests passed!\n");
     return 0;
 }
+

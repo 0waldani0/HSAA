@@ -502,6 +502,62 @@ POPCNT_BRAIN_API bool brain_manifold_scale_vocabulary(
     double* out_final_loss
 );
 
+// ============================================================================
+// 5. NEURO-SYMBOLIC CODE SYNTHESIS: CFG/EBNF TYPE-SCOPED MASKING,
+//    PROGRAM SKETCHING ARCHETYPES & CEGIS SIMPLEX CONTRADICTION LOOP
+// ============================================================================
+
+typedef enum BrainSketchArchetype {
+    BRAIN_SKETCH_ACCUMULATOR_LOOP    = 0,
+    BRAIN_SKETCH_DIVIDE_AND_CONQUER  = 1,
+    BRAIN_SKETCH_TWO_POINTERS_WINDOW = 2,
+    BRAIN_SKETCH_STATE_GRAPH_RELAX   = 3
+} BrainSketchArchetype;
+
+typedef struct BrainCegisSynthesisReport {
+    int candidates_evaluated;          // Number of candidate sketches evaluated in sandbox (1..K)
+    int counterexamples_triggered;     // Number of 0-1-N-NULL boundary counterexamples caught
+    int simplex_contradictions_masked; // Number of hole transitions zeroed (p *= 0.0) by Simplex Gate
+    int cfg_masked_invalid_tokens;     // Number of syntax/type-invalid tokens masked during decoding
+    int selected_archetype;            // BrainSketchArchetype selected for the problem
+    bool sandbox_01n_null_verified;    // True if 0, 1, N, and NULL/empty boundary tests all passed
+    bool crystallized_into_vsa;        // True if verified solution was crystallized into VSA memory
+    bool recalled_from_crystal;        // True if solution was recalled in 1 step from crystallized VSA
+    int emitted_tokens;                // Token count of the verified C++ program
+} BrainCegisSynthesisReport;
+
+// Generate C++ code under strict Context-Free Grammar (EBNF Pushdown Automaton)
+// and lexical Scope + Type-System Masking during Beam Search decoding.
+// Any candidate token that violates EBNF syntax rules (e.g. closing '}' when
+// open_braces == 0, invalid token after 'for (') or C++ type/scope compatibility
+// (e.g. passing std::string to int* or referencing an undeclared variable)
+// receives p(token) = 0.0 before beam expansion.
+// Returns the number of generated tokens (> 0) on success, 0 on failure.
+POPCNT_BRAIN_API int brain_generate_code_cfg_constrained(
+    PopCountBrain* brain,
+    const char* signature_and_prefix,
+    char* out_code,
+    size_t max_len,
+    int max_tokens,
+    int* out_cfg_masked_count,
+    bool* out_type_safe_verified
+);
+
+// Perform Closed-Loop Counterexample-Guided Inductive Synthesis (CEGIS) over
+// typed Program Sketches (AccumulatorLoop, DivideAndConquer, TwoPointersWindow,
+// StateGraphRelax) with VSA role-filler hole completion, 0-1-N-NULL boundary
+// execution sandbox verification, Simplex Contradiction Gate pruning (p *= 0.0
+// on refuted hole transitions without restarting search), and VSA crystallization.
+// Returns the number of emitted tokens (> 0) on success, 0 on failure.
+POPCNT_BRAIN_API int brain_synthesize_cegis_sketch(
+    PopCountBrain* brain,
+    const char* problem_spec,
+    int k_candidates,
+    char* out_code,
+    size_t max_len,
+    BrainCegisSynthesisReport* out_report
+);
+
 #ifdef __cplusplus
 } // extern "C"
 
@@ -515,3 +571,4 @@ static inline int brain_profile_heldout_and_scale(
     return brain_profile_heldout_and_scale(brain, heldout_text, out_profile) ? 1 : 0;
 }
 #endif
+
