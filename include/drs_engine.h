@@ -184,15 +184,15 @@ private:
             }
         }
 
-        // Action verbs:
+        // Action verbs (longer feminine forms ordered before shorter masculine prefixes):
         // Containment / hiding / placement verbs
         const std::vector<std::string> hide_verbs = {
-            "спрятал", "спрятала", "поместил", "поместила", "положил", "положила", "укрыл",
-            "hid", "hidden", "placed", "put", "stored", "concealed"
+            "спрятала", "спрятал", "поместила", "поместил", "положила", "положил", "укрыла", "укрыл",
+            "hidden", "hid", "placed", "put", "stored", "concealed"
         };
         // Transfer / movement verbs
         const std::vector<std::string> move_verbs = {
-            "перенес", "перенесла", "переместил", "переместила", "доставил", "доставила",
+            "перенесла", "перенес", "переместила", "переместил", "доставила", "доставил",
             "transferred", "moved", "transported", "carried"
         };
 
@@ -261,7 +261,7 @@ private:
             obj = trim(after_verb);
         }
 
-        // Canonical normalization for known narrative entities
+        // Canonical normalization & general Russian morphological lemmatization to Nominative singular
         auto canonicalize = [](const std::string& str) -> std::string {
             if (str.find("шкатулк") != std::string::npos) return "серебряная шкатулка";
             if (str.find("обсерватори") != std::string::npos) return "древняя обсерватория";
@@ -270,7 +270,78 @@ private:
             if (str.find("хранител") != std::string::npos) return "старый хранитель";
             if (str.find("сундук") != std::string::npos) return "железный сундук";
             if (str.find("лаборатори") != std::string::npos) return "подземная лаборатория";
-            return str;
+            if (str.find("свиток") != std::string::npos || str.find("свитк") != std::string::npos) return "древний свиток";
+
+            std::istringstream iss(str);
+            std::vector<std::string> words;
+            std::string w;
+            while (iss >> w) words.push_back(w);
+            if (words.empty()) return str;
+
+            bool is_fem_phrase = false;
+            bool is_masc_oblique = false;
+            for (size_t i = 0; i + 1 < words.size(); ++i) {
+                std::string& adj = words[i];
+                if (adj.size() >= 6 && adj.ends_with("ую")) {
+                    adj = adj.substr(0, adj.size() - 4) + "ая";
+                    is_fem_phrase = true;
+                } else if (adj.size() >= 6 && adj.ends_with("юю")) {
+                    adj = adj.substr(0, adj.size() - 4) + "яя";
+                    is_fem_phrase = true;
+                } else if (adj.size() >= 6 && adj.ends_with("ой")) {
+                    adj = adj.substr(0, adj.size() - 4) + "ая";
+                    is_fem_phrase = true;
+                } else if (adj.size() >= 6 && adj.ends_with("ей")) {
+                    adj = adj.substr(0, adj.size() - 4) + "яя";
+                    is_fem_phrase = true;
+                } else if (adj.size() >= 8 && (adj.ends_with("ого") || adj.ends_with("ому"))) {
+                    adj = adj.substr(0, adj.size() - 6) + "ый";
+                    is_masc_oblique = true;
+                } else if (adj.size() >= 8 && (adj.ends_with("его") || adj.ends_with("ему"))) {
+                    adj = adj.substr(0, adj.size() - 6) + "ий";
+                    is_masc_oblique = true;
+                } else if (adj.size() >= 6 && (adj.ends_with("ым") || adj.ends_with("ом"))) {
+                    adj = adj.substr(0, adj.size() - 4) + "ый";
+                    is_masc_oblique = true;
+                } else if (adj.size() >= 6 && (adj.ends_with("им") || adj.ends_with("ем"))) {
+                    adj = adj.substr(0, adj.size() - 4) + "ий";
+                    is_masc_oblique = true;
+                } else if (adj.ends_with("ая") || adj.ends_with("яя")) {
+                    is_fem_phrase = true;
+                }
+            }
+
+            std::string& head = words.back();
+            if (head.size() >= 6 && (head.ends_with("ию") || head.ends_with("ии"))) {
+                head = head.substr(0, head.size() - 4) + "ия";
+            } else if (head.size() >= 8 && head.ends_with("ией")) {
+                head = head.substr(0, head.size() - 6) + "ия";
+            } else if (is_fem_phrase && head.size() >= 6) {
+                if (head.ends_with("ой")) {
+                    head = head.substr(0, head.size() - 4) + "а";
+                } else if (head.ends_with("ей")) {
+                    head = head.substr(0, head.size() - 4) + "я";
+                } else if (head.ends_with("ю")) {
+                    head = head.substr(0, head.size() - 2) + "я";
+                } else if (head.ends_with("у") || head.ends_with("ы") || head.ends_with("и") || head.ends_with("е")) {
+                    head = head.substr(0, head.size() - 2) + "а";
+                }
+            } else if (is_masc_oblique && head.size() >= 6) {
+                if (head.ends_with("ком") && head.size() >= 8) {
+                    head = head.substr(0, head.size() - 4);
+                } else if (head.ends_with("ом") || head.ends_with("ем")) {
+                    head = head.substr(0, head.size() - 4);
+                } else if (head.ends_with("а") || head.ends_with("у") || head.ends_with("е")) {
+                    head = head.substr(0, head.size() - 2);
+                }
+            }
+
+            std::string out;
+            for (size_t i = 0; i < words.size(); ++i) {
+                if (i > 0) out.push_back(' ');
+                out += words[i];
+            }
+            return out;
         };
 
         subj = canonicalize(subj);
@@ -285,7 +356,7 @@ private:
         p_evt.object   = obj;
         p_evt.location = loc;
         p_evt.modality = Modality::FACTUAL;
-        p_evt.gender   = (subj.find("шкатулк") != std::string::npos || subj.find("обсерватори") != std::string::npos) ? "fem" : "masc";
+        p_evt.gender   = (subj.ends_with("а") || subj.ends_with("я")) ? "fem" : "masc";
         uint32_t evt_id = add_proposition(p_evt);
 
         // Add transitive containment proposition and RST edge
@@ -296,7 +367,7 @@ private:
             p_loc.object   = loc;
             p_loc.location = loc;
             p_loc.modality = Modality::FACTUAL;
-            p_loc.gender   = (obj.find("шкатулк") != std::string::npos || obj.find("обсерватори") != std::string::npos) ? "fem" : "masc";
+            p_loc.gender   = (obj.ends_with("а") || obj.ends_with("я")) ? "fem" : "masc";
             uint32_t loc_id = add_proposition(p_loc);
             add_rst_edge(evt_id, loc_id, RstRelation::CAUSE_EFFECT);
         }
@@ -348,13 +419,14 @@ public:
     std::vector<std::string> query(const std::string& pred, const std::string& arg1) {
         std::vector<std::string> results;
         std::unordered_set<std::string> visited;
+        if (arg1.empty()) return results;
 
         std::vector<std::pair<std::string, int>> frontier = {{arg1, 0}};
         while (!frontier.empty()) {
             auto [curr, depth] = frontier.back();
             frontier.pop_back();
 
-            if (depth > 16 || visited.count(curr)) continue;
+            if (curr.empty() || depth > 16 || visited.count(curr)) continue;
             visited.insert(curr);
 
             // Direct facts and Horn-clause rule resolution
@@ -365,7 +437,7 @@ public:
                                     p_name == "спрятал" || p_name == "перенес");
                 if (matches_loc) {
                     for (const auto& tuple : p_facts.second) {
-                        if (tuple.size() >= 2) {
+                        if (tuple.size() >= 2 && !tuple[0].empty()) {
                             if (tuple[0] == curr ||
                                 tuple[0].find(curr) != std::string::npos ||
                                 curr.find(tuple[0]) != std::string::npos) {
@@ -488,21 +560,8 @@ public:
     static std::string inflect_russian_noun(const std::string& word, Case target_case) {
         if (word.empty()) return word;
 
-        // Feminine nouns ending in -ка, -та, -ра (шкатулка, комната)
-        if (word.ends_with("ка") || word.ends_with("та") || word.ends_with("ра") || word.ends_with("на")) {
-            std::string stem = word.substr(0, word.size() - 2); // strip 'а'
-            switch (target_case) {
-                case Case::ACCUSATIVE:   return stem + "у";
-                case Case::GENITIVE:     return stem + (word.ends_with("ка") ? "и" : "ы");
-                case Case::LOCATIVE:     return stem + "е";
-                case Case::INSTRUMENTAL: return stem + "ой";
-                case Case::DATIVE:       return stem + "е";
-                default:                 return word;
-            }
-        }
-
         // Feminine nouns ending in -ия (обсерватория, лаборатория)
-        if (word.ends_with("ия")) {
+        if (word.ends_with("ия") && word.size() >= 6) {
             std::string stem = word.substr(0, word.size() - 4); // strip 'ия'
             switch (target_case) {
                 case Case::ACCUSATIVE:   return stem + "ию";
@@ -514,15 +573,61 @@ public:
             }
         }
 
-        // Masculine inanimate nouns (ключ, сундук, купол)
-        if (word.ends_with("ключ") || word.ends_with("сундук") || word.ends_with("купол")) {
+        // Soft 1st-declension feminine nouns ending in -я (башня, земля, деревня)
+        if (word.ends_with("я") && word.size() >= 4) {
+            std::string stem = word.substr(0, word.size() - 2); // strip 'я'
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return stem + "ю";
+                case Case::GENITIVE:     return stem + "и";
+                case Case::LOCATIVE:     return stem + "е";
+                case Case::INSTRUMENTAL: return stem + "ей";
+                case Case::DATIVE:       return stem + "е";
+                default:                 return word;
+            }
+        }
+
+        // General 1st-declension feminine nouns ending in -а (шкатулка, комната, книга, монета, сумка)
+        if (word.ends_with("а") && word.size() >= 4) {
+            std::string stem = word.substr(0, word.size() - 2); // strip 'а'
+            bool velar_or_sibilant = (word.ends_with("ка") || word.ends_with("га") || word.ends_with("ха") ||
+                                      word.ends_with("жа") || word.ends_with("ша") || word.ends_with("ча") || word.ends_with("ща"));
+            switch (target_case) {
+                case Case::ACCUSATIVE:   return stem + "у";
+                case Case::GENITIVE:     return stem + (velar_or_sibilant ? "и" : "ы");
+                case Case::LOCATIVE:     return stem + "е";
+                case Case::INSTRUMENTAL: return stem + "ой";
+                case Case::DATIVE:       return stem + "е";
+                default:                 return word;
+            }
+        }
+
+        // Fleeting-vowel masculine nouns ending in -ок (свиток -> свитка/свитке/свитком, замок -> замка)
+        if (word.ends_with("ток") || word.ends_with("мок") || word.ends_with("нок")) {
+            std::string stem = word.substr(0, word.size() - 4) + "к"; // replace "ок" with "к"
             switch (target_case) {
                 case Case::ACCUSATIVE:   return word; // inanimate
-                case Case::GENITIVE:     return word + "а";
-                case Case::LOCATIVE:     return word + "е";
-                case Case::INSTRUMENTAL: return (word.ends_with("ключ") ? word + "ом" : word + "ом");
-                case Case::DATIVE:       return word + "у";
+                case Case::GENITIVE:     return stem + "а";
+                case Case::LOCATIVE:     return stem + "е";
+                case Case::INSTRUMENTAL: return stem + "ом";
+                case Case::DATIVE:       return stem + "у";
                 default:                 return word;
+            }
+        }
+
+        // General 2nd-declension masculine consonant-stem nouns (ключ, сундук, купол, храм, контейнер, etc.)
+        if (word.size() >= 4 && !word.ends_with("а") && !word.ends_with("я") &&
+            !word.ends_with("о") && !word.ends_with("е") && !word.ends_with("и") &&
+            !word.ends_with("ы") && !word.ends_with("у") && !word.ends_with("ю") && !word.ends_with("ь")) {
+            unsigned char c0 = static_cast<unsigned char>(word[word.size() - 2]);
+            if (c0 == 0xD0 || c0 == 0xD1) {
+                switch (target_case) {
+                    case Case::ACCUSATIVE:   return word; // inanimate
+                    case Case::GENITIVE:     return word + "а";
+                    case Case::LOCATIVE:     return word + "е";
+                    case Case::INSTRUMENTAL: return word + "ом";
+                    case Case::DATIVE:       return word + "у";
+                    default:                 return word;
+                }
             }
         }
 

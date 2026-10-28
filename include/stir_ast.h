@@ -45,6 +45,7 @@ enum class StirType : uint8_t {
     BOOL_T,
     INT32_T,
     INT64_T,
+    SIZE_T,
     FLOAT32_T,
     SLICE_INT32,
     SLICE_FLOAT32,
@@ -57,6 +58,7 @@ inline const char* stir_type_name(StirType t) {
         case StirType::BOOL_T:        return "bool";
         case StirType::INT32_T:       return "int32_t";
         case StirType::INT64_T:       return "int64_t";
+        case StirType::SIZE_T:        return "size_t";
         case StirType::FLOAT32_T:     return "float";
         case StirType::SLICE_INT32:   return "Slice<int32_t>";
         case StirType::SLICE_FLOAT32: return "Slice<float>";
@@ -107,17 +109,20 @@ public:
     ArenaAllocator& operator=(const ArenaAllocator&) = delete;
 
     void* allocate(size_t bytes, size_t alignment = alignof(std::max_align_t)) {
-        size_t current_addr = reinterpret_cast<size_t>(current_chunk_ + current_offset_);
-        size_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
-        size_t padding = aligned_addr - current_addr;
+        size_t padding = 0;
+        if (current_chunk_) {
+            size_t current_addr = reinterpret_cast<size_t>(current_chunk_ + current_offset_);
+            size_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+            padding = aligned_addr - current_addr;
+        }
 
         if (!current_chunk_ || current_offset_ + padding + bytes > chunk_size_) {
             size_t alloc_sz = std::max(chunk_size_, bytes + alignment);
             current_chunk_ = new char[alloc_sz];
             chunks_.push_back(current_chunk_);
             current_offset_ = 0;
-            current_addr = reinterpret_cast<size_t>(current_chunk_);
-            aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+            size_t current_addr = reinterpret_cast<size_t>(current_chunk_);
+            size_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
             padding = aligned_addr - current_addr;
         }
 
@@ -220,12 +225,19 @@ struct LiteralNode : public AstNode {
         bool    bool_val;
     };
 
-    LiteralNode(int64_t v, StirType t = StirType::INT64_T)
-        : AstNode(NodeKind::LITERAL_INT, t) { i64_val = v; }
-    LiteralNode(double v)
-        : AstNode(NodeKind::LITERAL_FLOAT, StirType::FLOAT32_T) { f64_val = v; }
-    LiteralNode(bool v)
+    template <typename IntT, std::enable_if_t<std::is_integral_v<IntT> && !std::is_same_v<std::decay_t<IntT>, bool>, int> = 0>
+    explicit LiteralNode(IntT v, StirType t = StirType::INT64_T)
+        : AstNode(NodeKind::LITERAL_INT, t) { i64_val = static_cast<int64_t>(v); }
+
+    template <typename FloatT, std::enable_if_t<std::is_floating_point_v<FloatT>, int> = 0>
+    explicit LiteralNode(FloatT v)
+        : AstNode(NodeKind::LITERAL_FLOAT, StirType::FLOAT32_T) { f64_val = static_cast<double>(v); }
+
+    explicit LiteralNode(bool v)
         : AstNode(NodeKind::LITERAL_BOOL, StirType::BOOL_T) { bool_val = v; }
+
+    explicit LiteralNode(std::nullptr_t)
+        : AstNode(NodeKind::LITERAL_INT, StirType::VOID_T) { i64_val = 0; }
 };
 
 struct VarRefNode : public AstNode {
@@ -345,11 +357,18 @@ struct ReturnNode : public AstNode {
 
 class Cpp20Emitter {
 public:
+    static bool is_slice_or_ptr_type(StirType t) noexcept {
+        return t == StirType::SLICE_INT32 || t == StirType::SLICE_FLOAT32;
+    }
+
     static std::string emit_expression(const AstNode* node) {
         if (!node) return "";
         switch (node->kind) {
             case NodeKind::LITERAL_INT: {
                 auto lit = static_cast<const LiteralNode*>(node);
+                if (lit->type == StirType::VOID_T && lit->i64_val == 0) {
+                    return "nullptr";
+                }
                 return std::to_string(lit->i64_val);
             }
             case NodeKind::LITERAL_FLOAT: {
@@ -368,15 +387,26 @@ public:
             }
             case NodeKind::BINARY_OP: {
                 auto b = static_cast<const BinaryOpNode*>(node);
+                std::string lhs_s = emit_expression(b->lhs);
+                std::string rhs_s = emit_expression(b->rhs);
+                if ((b->op == BinaryOpKind::EQ || b->op == BinaryOpKind::NE) && b->lhs && b->rhs) {
+                    if (is_slice_or_ptr_type(b->lhs->type) && b->rhs->kind == NodeKind::LITERAL_INT &&
+                        static_cast<const LiteralNode*>(b->rhs)->i64_val == 0) {
+                        rhs_s = "nullptr";
+                    } else if (is_slice_or_ptr_type(b->rhs->type) && b->lhs->kind == NodeKind::LITERAL_INT &&
+                               static_cast<const LiteralNode*>(b->lhs)->i64_val == 0) {
+                        lhs_s = "nullptr";
+                    }
+                }
                 if (b->op == BinaryOpKind::LOGICAL_OR || b->op == BinaryOpKind::LOGICAL_AND ||
                     b->op == BinaryOpKind::EQ || b->op == BinaryOpKind::NE ||
                     b->op == BinaryOpKind::LT || b->op == BinaryOpKind::LE ||
                     b->op == BinaryOpKind::GT || b->op == BinaryOpKind::GE) {
-                    return emit_expression(b->lhs) + " " + binary_op_symbol(b->op) + " " + emit_expression(b->rhs);
+                    return lhs_s + " " + binary_op_symbol(b->op) + " " + rhs_s;
                 }
-                return "(" + emit_expression(b->lhs) + " " +
+                return "(" + lhs_s + " " +
                        binary_op_symbol(b->op) + " " +
-                       emit_expression(b->rhs) + ")";
+                       rhs_s + ")";
             }
             case NodeKind::UNARY_OP: {
                 auto c = static_cast<const CastNode*>(node);
@@ -488,6 +518,9 @@ public:
 // -----------------------------------------------------------------------------
 
 struct Interval {
+    static constexpr int64_t kMinBound = INT64_MIN / 4;
+    static constexpr int64_t kMaxBound = INT64_MAX / 4;
+
     int64_t lo;
     int64_t hi;
     bool is_bottom;
@@ -500,10 +533,16 @@ struct Interval {
         return i;
     }
     static constexpr Interval top() noexcept {
-        return Interval(INT64_MIN / 4, INT64_MAX / 4);
+        return Interval(kMinBound, kMaxBound);
     }
     static constexpr Interval point(int64_t v) noexcept {
         return Interval(v, v);
+    }
+
+    static constexpr int64_t clamp_sat(double v) noexcept {
+        if (v <= static_cast<double>(kMinBound)) return kMinBound;
+        if (v >= static_cast<double>(kMaxBound)) return kMaxBound;
+        return static_cast<int64_t>(v);
     }
 
     bool contains(int64_t v) const noexcept {
@@ -512,17 +551,24 @@ struct Interval {
 
     Interval add(const Interval& o) const noexcept {
         if (is_bottom || o.is_bottom) return bottom();
-        return Interval(lo + o.lo, hi + o.hi);
+        int64_t n_lo = clamp_sat(static_cast<double>(lo) + static_cast<double>(o.lo));
+        int64_t n_hi = clamp_sat(static_cast<double>(hi) + static_cast<double>(o.hi));
+        return Interval(n_lo, n_hi);
     }
 
     Interval sub(const Interval& o) const noexcept {
         if (is_bottom || o.is_bottom) return bottom();
-        return Interval(lo - o.hi, hi - o.lo);
+        int64_t n_lo = clamp_sat(static_cast<double>(lo) - static_cast<double>(o.hi));
+        int64_t n_hi = clamp_sat(static_cast<double>(hi) - static_cast<double>(o.lo));
+        return Interval(n_lo, n_hi);
     }
 
     Interval mul(const Interval& o) const noexcept {
         if (is_bottom || o.is_bottom) return bottom();
-        int64_t p1 = lo * o.lo, p2 = lo * o.hi, p3 = hi * o.lo, p4 = hi * o.hi;
+        int64_t p1 = clamp_sat(static_cast<double>(lo) * static_cast<double>(o.lo));
+        int64_t p2 = clamp_sat(static_cast<double>(lo) * static_cast<double>(o.hi));
+        int64_t p3 = clamp_sat(static_cast<double>(hi) * static_cast<double>(o.lo));
+        int64_t p4 = clamp_sat(static_cast<double>(hi) * static_cast<double>(o.hi));
         int64_t min_p = std::min({p1, p2, p3, p4});
         int64_t max_p = std::max({p1, p2, p3, p4});
         return Interval(min_p, max_p);
@@ -592,6 +638,7 @@ public:
         const std::string& primary_slice,
         AbstractEnvironment& env
     ) {
+        (void)primary_slice;
         env.has_safety_violation = false;
         env.violation_reason.clear();
         analyze_node(root, env);
@@ -604,8 +651,18 @@ private:
         switch (node->kind) {
             case NodeKind::LITERAL_INT:
                 return Interval::point(static_cast<const LiteralNode*>(node)->i64_val);
-            case NodeKind::VAR_REF:
-                return env.get_interval(static_cast<const VarRefNode*>(node)->name);
+            case NodeKind::VAR_REF: {
+                const auto* vr = static_cast<const VarRefNode*>(node);
+                auto it = env.intervals.find(vr->name);
+                if (it != env.intervals.end()) return it->second;
+                auto sl_it = env.slice_lengths.find(vr->name);
+                if (sl_it != env.slice_lengths.end()) return sl_it->second;
+                return Interval::top();
+            }
+            case NodeKind::UNARY_OP: {
+                auto c = static_cast<const CastNode*>(node);
+                return eval_expr(c->expr, env);
+            }
             case NodeKind::BINARY_OP: {
                 auto b = static_cast<const BinaryOpNode*>(node);
                 Interval l = eval_expr(b->lhs, env);
@@ -640,6 +697,14 @@ private:
                     env.mark_violation("AbstractInterpretation: array index can be negative (idx.lo < 0)");
                     return Interval::bottom();
                 }
+                if (!s_name.empty()) {
+                    auto it_len = env.slice_lengths.find(s_name);
+                    if (it_len != env.slice_lengths.end() && it_len->second.hi > 0 &&
+                        idx_int.hi < Interval::kMaxBound && idx_int.hi >= it_len->second.hi) {
+                        env.mark_violation("AbstractInterpretation: array index exceeds slice upper bound (idx.hi >= slice.len)");
+                        return Interval::bottom();
+                    }
+                }
                 return Interval::top();
             }
             default:
@@ -664,32 +729,33 @@ private:
                 break;
             }
             case NodeKind::ARRAY_READ: {
-                auto ar = static_cast<const ArrayReadNode*>(node);
+                (void)eval_expr(node, env);
+                break;
+            }
+            case NodeKind::ARRAY_WRITE: {
+                auto aw = static_cast<const ArrayWriteNode*>(node);
                 std::string s_name;
-                if (ar->slice_expr->kind == NodeKind::VAR_REF) {
-                    s_name = static_cast<const VarRefNode*>(ar->slice_expr)->name;
+                if (aw->slice_expr && aw->slice_expr->kind == NodeKind::VAR_REF) {
+                    s_name = static_cast<const VarRefNode*>(aw->slice_expr)->name;
                 }
-                // Non-null assertion check
-                if (!s_name.empty()) {
-                    if (env.get_null_state(s_name) != NullState::DEFINITELY_NOT_NULL) {
-                        env.mark_violation("AbstractInterpretation: unguarded dereference of nullable pointer/slice: " + s_name);
-                        return;
-                    }
+                if (!s_name.empty() && env.get_null_state(s_name) != NullState::DEFINITELY_NOT_NULL) {
+                    env.mark_violation("AbstractInterpretation: unguarded write to nullable slice: " + s_name);
+                    return;
                 }
-                // Bounds check
-                Interval idx_int = eval_expr(ar->index_expr, env);
+                Interval idx_int = eval_expr(aw->index_expr, env);
                 if (idx_int.lo < 0) {
-                    env.mark_violation("AbstractInterpretation: array index can be negative (idx.lo < 0)");
+                    env.mark_violation("AbstractInterpretation: negative write index");
                     return;
                 }
                 if (!s_name.empty()) {
                     auto it_len = env.slice_lengths.find(s_name);
-                    if (it_len != env.slice_lengths.end()) {
-                        if (idx_int.hi >= it_len->second.lo && it_len->second.lo > 0) {
-                            // Possible out of bounds
-                        }
+                    if (it_len != env.slice_lengths.end() && it_len->second.hi > 0 &&
+                        idx_int.hi < Interval::kMaxBound && idx_int.hi >= it_len->second.hi) {
+                        env.mark_violation("AbstractInterpretation: write index exceeds slice upper bound (idx.hi >= slice.len)");
+                        return;
                     }
                 }
+                (void)eval_expr(aw->val_expr, env);
                 break;
             }
             case NodeKind::BOUNDED_LOOP: {
@@ -702,8 +768,15 @@ private:
                     env.mark_violation("AbstractInterpretation: loop step can be zero (infinite loop)");
                     return;
                 }
+                if (end_int.hi < Interval::kMaxBound && end_int.hi - start_int.lo > loop->max_iterations) {
+                    env.mark_violation("AbstractInterpretation: BoundedLoop range exceeds max_iterations cap");
+                    return;
+                }
 
-                Interval loop_var_range(start_int.lo, std::max(start_int.lo, end_int.hi));
+                // Loop variable i satisfies start <= i < end, so i in [start.lo, end.hi - 1]
+                int64_t loop_hi = (end_int.hi < Interval::kMaxBound && end_int.hi > start_int.lo)
+                                  ? (end_int.hi - 1) : end_int.hi;
+                Interval loop_var_range(start_int.lo, loop_hi);
                 env.set_interval(loop->counter_var, loop_var_range);
                 analyze_node(loop->body, env);
                 break;
@@ -711,13 +784,13 @@ private:
             case NodeKind::BRANCH: {
                 auto br = static_cast<const BranchNode*>(node);
                 // Check if branch condition is null guard: `data == nullptr || n == 0`
-                if (br->cond->kind == NodeKind::BINARY_OP) {
+                if (br->cond && br->cond->kind == NodeKind::BINARY_OP) {
                     auto b = static_cast<const BinaryOpNode*>(br->cond);
                     if (b->op == BinaryOpKind::LOGICAL_OR || b->op == BinaryOpKind::EQ) {
                         // In then-branch, pointer is null. In else-branch (or post-return), pointer is NOT NULL!
                         if (br->then_block && !br->then_block->statements.empty()) {
                             auto last = br->then_block->statements.back();
-                            if (last->kind == NodeKind::RETURN_STMT) {
+                            if (last && last->kind == NodeKind::RETURN_STMT) {
                                 // Fallthrough has non-null invariant!
                                 for (auto& p : env.null_states) {
                                     p.second = NullState::DEFINITELY_NOT_NULL;
@@ -1329,26 +1402,42 @@ public:
         int max_depth = 0;
         bool balanced = true;
         uint32_t node_count = 0;
+        std::vector<char> delim_stack;
 
         for (const auto& tok : tokens) {
             if (tok.type == CppToken::DELIMITER) {
                 if (tok.text == "{") {
                     ++brace;
+                    delim_stack.push_back('{');
                     if (brace > max_depth) max_depth = brace;
                     ++node_count;
                 } else if (tok.text == "}") {
                     --brace;
-                    if (brace < 0) balanced = false;
+                    if (brace < 0 || delim_stack.empty() || delim_stack.back() != '{') {
+                        balanced = false;
+                    } else {
+                        delim_stack.pop_back();
+                    }
                 } else if (tok.text == "(") {
                     ++paren;
+                    delim_stack.push_back('(');
                 } else if (tok.text == ")") {
                     --paren;
-                    if (paren < 0) balanced = false;
+                    if (paren < 0 || delim_stack.empty() || delim_stack.back() != '(') {
+                        balanced = false;
+                    } else {
+                        delim_stack.pop_back();
+                    }
                 } else if (tok.text == "[") {
                     ++bracket;
+                    delim_stack.push_back('[');
                 } else if (tok.text == "]") {
                     --bracket;
-                    if (bracket < 0) balanced = false;
+                    if (bracket < 0 || delim_stack.empty() || delim_stack.back() != '[') {
+                        balanced = false;
+                    } else {
+                        delim_stack.pop_back();
+                    }
                 } else if (tok.text == ";") {
                     ++node_count;
                 }
@@ -1363,7 +1452,7 @@ public:
             }
         }
 
-        if (brace != 0 || paren != 0 || bracket != 0) {
+        if (brace != 0 || paren != 0 || bracket != 0 || !delim_stack.empty()) {
             balanced = false;
         }
 

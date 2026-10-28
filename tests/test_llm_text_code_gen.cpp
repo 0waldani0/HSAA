@@ -1517,6 +1517,19 @@ int main() {
         check(neg_caught && env_neg.has_safety_violation,
               "T19.2c: Abstract Interpretation detects negative array index (idx < 0) before sandbox execution");
 
+        // Unsafe case 3: Upper-bound out-of-bounds array indexing (idx >= slice.len)
+        stir::BlockNode* oob_read_block = arena.create<stir::BlockNode>();
+        oob_read_block->add(arena.create<stir::ArrayReadNode>(
+            arena.create<stir::VarRefNode>("slice", stir::StirType::SLICE_INT32),
+            arena.create<stir::LiteralNode>(10LL),
+            stir::StirType::INT32_T));
+        stir::AbstractEnvironment env_oob;
+        env_oob.set_null_state("slice", stir::NullState::DEFINITELY_NOT_NULL);
+        env_oob.slice_lengths["slice"] = stir::Interval(10, 10);
+        bool oob_caught = !stir::AbstractInterpreter::verify_candidate_safety(oob_read_block, "slice", env_oob);
+        check(oob_caught && env_oob.has_safety_violation,
+              "T19.2d: Abstract Interpretation detects upper-bound out-of-bounds array index (idx >= slice.len)");
+
         // T19.3: Multi-Threaded CEGIS Execution Sandbox across 8 boundary test vectors
         // Candidate with 32-bit overflow bug fails vector 8 (VEC_OVERFLOW)
         auto buggy_overflow_fn = [](const int32_t* data, int n) -> int64_t {
@@ -1577,6 +1590,14 @@ int main() {
             nullptr, nullptr, &raw_aud_balanced);
         check(raw_aud_balanced,
               "T19.4c: Real C++ Lexer & AST Auditor ignores unbalanced delimiters inside raw strings R\"(...)\" and char literals '}'");
+
+        // T19.4d: Real C++ Lexer & AST Auditor LIFO stack rejects cross-nested delimiters [(])
+        bool cross_aud_balanced = true;
+        stir::RealCppAstAuditor::audit(
+            "int cross_test() { int a = (1 + [2); ] return a; }",
+            nullptr, nullptr, &cross_aud_balanced);
+        check(!cross_aud_balanced,
+              "T19.4d: Real C++ Lexer & AST Auditor LIFO delimiter stack rejects cross-nested delimiters [(])");
     }
 
     // =========================================================================
@@ -1663,6 +1684,32 @@ int main() {
         }
         check(novel_dag.all_propositions().size() >= 4 && found_lab,
               "T20.5: Dynamic narrative clause parser extracts typed propositions & Datalog Horn engine resolves 2-hop path on unseen story (Scroll -> Chest -> Lab)");
+
+        // T20.5b: Unseen OOV feminine + masculine narrative lemmatization & 2-hop Datalog resolution
+        drs::SemanticPlanningDag oov_dag;
+        std::string oov_narrative =
+            "Елена спрятала золотую монету внутри кожаной сумки. "
+            "Виктор перенес кожаную сумку в высокую башню.";
+        oov_dag.parse_narrative_text(oov_narrative);
+        drs::DatalogHornEngine oov_datalog;
+        oov_datalog.load_from_dag(oov_dag);
+        auto oov_res = oov_datalog.query("located_in", "золотая монета");
+        bool found_tower = false;
+        for (const auto& r : oov_res) {
+            if (r.find("высокая башня") != std::string::npos || r.find("башн") != std::string::npos) {
+                found_tower = true;
+                break;
+            }
+        }
+        std::string bag_gen = drs::DeterministicSurfaceRealizer::inflect_russian_phrase(
+            "кожаная сумка", drs::DeterministicSurfaceRealizer::Case::GENITIVE);
+        std::string oov_surface = drs::DeterministicSurfaceRealizer::realize_russian_answer(
+            "золотая монета", "кожаная сумка", "высокая башня");
+        check(found_tower &&
+              bag_gen == "кожаной сумки" &&
+              oov_surface.find("кожаную сумку") != std::string::npos &&
+              oov_surface.find("высокой башне") != std::string::npos,
+              "T20.5b: Unseen OOV feminine nouns ('золотую монету' -> 'золотая монета', 'кожаной сумки' -> 'кожаная сумка') lemmatize, resolve 2-hop Datalog, and inflect with 7-letter velar spelling rule");
     }
 
     std::printf("================================================================\n");

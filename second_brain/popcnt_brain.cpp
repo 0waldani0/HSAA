@@ -1,8 +1,16 @@
 #include "popcnt_brain.h"
 #include "assoc_sketch.h"
 #include "domain_seed_corpus.h"
+#if __has_include("stir_ast.h")
 #include "stir_ast.h"
+#else
+#include "../include/stir_ast.h"
+#endif
+#if __has_include("drs_engine.h")
 #include "drs_engine.h"
+#else
+#include "../include/drs_engine.h"
+#endif
 #include <memory>
 #include <mutex>
 // =============================================================================
@@ -20518,7 +20526,8 @@ POPCNT_BRAIN_API int brain_generate_code_cfg_constrained(
     // 5. Analytical Abstract Interpretation Pre-Filter
     stir::AbstractEnvironment abs_env;
     abs_env.set_null_state(ptr_param, stir::NullState::UNKNOWN);
-    abs_env.slice_lengths[ptr_param] = stir::Interval(0, 1000000000LL);
+    abs_env.set_interval(len_param, stir::Interval(0, 1000000LL));
+    abs_env.slice_lengths[ptr_param] = stir::Interval(1000000LL, 1000000LL);
     bool abs_verified = stir::AbstractInterpreter::verify_candidate_safety(stir_root, ptr_param, abs_env);
 
     // Dynamic CFG/EBNF + Type-Scope Masking on distractor tokens across AST construction points

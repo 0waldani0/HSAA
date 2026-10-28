@@ -27,10 +27,10 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [*] Compiling PopCount Second Brain Engine (AVX-512 VPOPCNTDQ / C++20)...
-cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /I"%SCRIPT_DIR%." "%SCRIPT_DIR%popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" /link /STACK:33554432
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /I"%SCRIPT_DIR%." /I"%SCRIPT_DIR%..\include" "%SCRIPT_DIR%popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" /link /STACK:33554432
 if %ERRORLEVEL% NEQ 0 (
     echo [!] AVX-512 compilation failed, falling back to AVX2...
-    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX2 /openmp /EHsc /utf-8 /wd4068 /I"%SCRIPT_DIR%." "%SCRIPT_DIR%popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" /link /STACK:33554432
+    cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX2 /openmp /EHsc /utf-8 /wd4068 /I"%SCRIPT_DIR%." /I"%SCRIPT_DIR%..\include" "%SCRIPT_DIR%popcnt_brain.cpp" /Fe:"%BUILD_DIR%\popcnt_brain.exe" /Fo:"%BUILD_DIR%\popcnt_brain.obj" /link /STACK:33554432
     if errorlevel 1 (
         echo [!] Compilation failed!
         exit /b 1
@@ -40,7 +40,7 @@ echo [+] Build succeeded: "%BUILD_DIR%\popcnt_brain.exe"
 
 REM Build Static Library & C-ABI Test
 echo [*] Building PopCount Brain C-ABI Library Object...
-cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /DBUILDING_POPCNT_BRAIN_LIB /c "%SCRIPT_DIR%popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 /DBUILDING_POPCNT_BRAIN_LIB /I"%SCRIPT_DIR%." /I"%SCRIPT_DIR%..\include" /c "%SCRIPT_DIR%popcnt_brain.cpp" /Fo:"%BUILD_DIR%\popcnt_brain_lib.obj"
 if errorlevel 1 exit /b 1
 lib.exe /nologo /OUT:"%BUILD_DIR%\popcnt_brain.lib" "%BUILD_DIR%\popcnt_brain_lib.obj"
 if errorlevel 1 exit /b 1
