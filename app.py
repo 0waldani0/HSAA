@@ -21,10 +21,24 @@ SUITES = [
 
 _cached_payload = None
 
+def resolve_bin(path):
+    if os.path.isfile(path) and os.access(path, os.X_OK):
+        return path
+    if os.name == "nt" and os.path.isfile(path + ".exe"):
+        return path + ".exe"
+    base = os.path.basename(path)
+    alt = os.path.join(ROOT_DIR, "second_brain", "build", base)
+    if os.path.isfile(alt):
+        return alt
+    if os.name == "nt" and os.path.isfile(alt + ".exe"):
+        return alt + ".exe"
+    return path
+
+
 
 def ensure_compiled():
     os.makedirs(BUILD_DIR, exist_ok=True)
-    if all(os.path.isfile(bp) and os.access(bp, os.X_OK) for _, bp, _ in SUITES):
+    if os.name == "nt" or all(os.path.isfile(resolve_bin(bp)) for _, bp, _ in SUITES):
         return
     cmd = r"""
     if ! command -v g++ >/dev/null 2>&1; then
@@ -59,7 +73,8 @@ def run_all_suites():
     ensure_compiled()
     results = []
     for name, bin_path, args in SUITES:
-        exists = os.path.isfile(bin_path) and os.access(bin_path, os.X_OK)
+        real_bin = resolve_bin(bin_path)
+        exists = os.path.isfile(real_bin)
         if not exists:
             results.append({
                 "binary": name,
@@ -72,7 +87,7 @@ def run_all_suites():
         t0 = time.perf_counter()
         try:
             proc = subprocess.run(
-                [bin_path] + args,
+                [real_bin] + args,
                 cwd=ROOT_DIR,
                 capture_output=True,
                 text=True,
@@ -102,7 +117,7 @@ def run_all_suites():
 
 def run_live_synthesis(mode="all", prompt=""):
     ensure_compiled()
-    bin_path = os.path.join(BUILD_DIR, "upgrade_lab")
+    bin_path = resolve_bin(os.path.join(BUILD_DIR, "upgrade_lab"))
     args = [bin_path, "unified", "--json", mode]
     if prompt:
         args.append(prompt)

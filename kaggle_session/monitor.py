@@ -31,6 +31,11 @@ for i in range(60): # 10 minutes max
             if line not in seen_messages:
                 seen_messages.add(line)
                 print(f"[KAGGLE UPDATE] {line}", flush=True)
+                if "OPENCODE_API_URL:" in line:
+                    api_url = line.split("OPENCODE_API_URL:")[1].strip()
+                    with open(r"c:\Users\Администратор\Documents\project upgrade\kaggle_endpoint.txt", "w", encoding="utf-8") as f:
+                        f.write(api_url)
+                    print(f"[BRIDGE NOTIFIED] Saved endpoint {api_url} to kaggle_endpoint.txt", flush=True)
                 if "GRADIO_URL:" in line:
                     print(f"SUCCESS! {line}", flush=True)
                     sys.exit(0)

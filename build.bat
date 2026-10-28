@@ -319,6 +319,7 @@ cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROO
     "%ROOT_DIR%src\model_mod.cpp" ^
     "%ROOT_DIR%src\hssa.cpp" ^
     "%ROOT_DIR%src\bench_runner.cpp" ^
+    "%ROOT_DIR%src\unified_engine.cpp" ^
     "%ROOT_DIR%src\main_lab.cpp" ^
     "%BUILD_DIR%\popcnt_brain.lib" ^
     "%BUILD_DIR%\ptq_cuda.lib" ^
@@ -346,6 +347,7 @@ cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROO
     "%ROOT_DIR%src\vsa_db.cpp" ^
     "%ROOT_DIR%src\model_mod.cpp" ^
     "%ROOT_DIR%src\bench_runner.cpp" ^
+    "%ROOT_DIR%src\unified_engine.cpp" ^
     "%ROOT_DIR%tests\test_bench_runner.cpp" ^
     "%BUILD_DIR%\popcnt_brain.lib" ^
     /Fe:"%BUILD_DIR%\test_bench_runner.exe" /Fo:"%BUILD_DIR%\obj_test_bench\\" %LINK_FLAGS% psapi.lib
