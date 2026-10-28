@@ -5,6 +5,9 @@
 #include <cstddef>
 #include <cmath>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 /*
  * =============================================================================
@@ -14,7 +17,7 @@
  */
 
 static inline uint32_t simd_hamming_512(const uint64_t* a, const uint64_t* b) noexcept {
-#if defined(__AVX512F__) && defined(__AVX512VPOPCNTDQ__)
+#if (defined(__AVX512F__) && defined(__AVX512VPOPCNTDQ__)) || (defined(_MSC_VER) && defined(__AVX512F__))
     __m512i va = _mm512_loadu_si512(reinterpret_cast<const void*>(a));
     __m512i vb = _mm512_loadu_si512(reinterpret_cast<const void*>(b));
     __m512i vx = _mm512_xor_si512(va, vb);
@@ -23,7 +26,11 @@ static inline uint32_t simd_hamming_512(const uint64_t* a, const uint64_t* b) no
 #else
     uint32_t d = 0;
     for (int i = 0; i < 8; ++i) {
+#if defined(_MSC_VER)
+        d += static_cast<uint32_t>(__popcnt64(a[i] ^ b[i]));
+#else
         d += static_cast<uint32_t>(__builtin_popcountll(a[i] ^ b[i]));
+#endif
     }
     return d;
 #endif
