@@ -20,6 +20,7 @@ static inline void _aligned_free(void* ptr) {
 }
 #endif
 #include <immintrin.h>
+#include "avx512_portable_shim.h"
 
 #include <cstdint>
 #include <cstddef>

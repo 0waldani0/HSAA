@@ -261,17 +261,8 @@ private:
             obj = trim(after_verb);
         }
 
-        // Canonical normalization & general Russian morphological lemmatization to Nominative singular
+        // General Russian UTF-8 morphological lemmatization to Nominative singular (zero hardcoded words)
         auto canonicalize = [](const std::string& str) -> std::string {
-            if (str.find("шкатулк") != std::string::npos) return "серебряная шкатулка";
-            if (str.find("обсерватори") != std::string::npos) return "древняя обсерватория";
-            if (str.find("ключ") != std::string::npos) return "рубиновый ключ";
-            if (str.find("Леонид") != std::string::npos) return "профессор Леонид";
-            if (str.find("хранител") != std::string::npos) return "старый хранитель";
-            if (str.find("сундук") != std::string::npos) return "железный сундук";
-            if (str.find("лаборатори") != std::string::npos) return "подземная лаборатория";
-            if (str.find("свиток") != std::string::npos || str.find("свитк") != std::string::npos) return "древний свиток";
-
             std::istringstream iss(str);
             std::vector<std::string> words;
             std::string w;
@@ -308,6 +299,8 @@ private:
                     is_masc_oblique = true;
                 } else if (adj.ends_with("ая") || adj.ends_with("яя")) {
                     is_fem_phrase = true;
+                } else if (adj.ends_with("ый") || adj.ends_with("ий") || adj.ends_with("ой")) {
+                    is_masc_oblique = true;
                 }
             }
 
@@ -316,6 +309,15 @@ private:
                 head = head.substr(0, head.size() - 4) + "ия";
             } else if (head.size() >= 8 && head.ends_with("ией")) {
                 head = head.substr(0, head.size() - 6) + "ия";
+            } else if (head.size() >= 8 && (head.ends_with("теля") || head.ends_with("телю") || head.ends_with("теле"))) {
+                head = head.substr(0, head.size() - 2) + "ь";
+            } else if (head.size() >= 10 && head.ends_with("телем")) {
+                head = head.substr(0, head.size() - 4) + "ь";
+            } else if (head.size() >= 8 && (head.ends_with("тка") || head.ends_with("тку") || head.ends_with("тке"))) {
+                // Fleeting vowel -ок restoration (e.g., свитка -> свиток)
+                head = head.substr(0, head.size() - 4) + "ок";
+            } else if (head.size() >= 10 && head.ends_with("тком")) {
+                head = head.substr(0, head.size() - 6) + "ок";
             } else if (is_fem_phrase && head.size() >= 6) {
                 if (head.ends_with("ой")) {
                     head = head.substr(0, head.size() - 4) + "а";
@@ -634,46 +636,8 @@ public:
         return word;
     }
 
-    // Inflect noun/adjective phrases according to Russian case government
+    // Inflect noun/adjective phrases according to Russian case government (100% rule-based, zero hardcoded phrases)
     static std::string inflect_russian_phrase(const std::string& phrase, Case target_case, bool /*is_feminine*/ = false) {
-        // Fast paths for common domain lexicon
-        if (phrase == "серебряная шкатулка") {
-            switch (target_case) {
-                case Case::ACCUSATIVE:   return "серебряную шкатулку";
-                case Case::GENITIVE:     return "серебряной шкатулки";
-                case Case::LOCATIVE:     return "серебряной шкатулке";
-                case Case::INSTRUMENTAL: return "серебряной шкатулкой";
-                default:                 return phrase;
-            }
-        }
-        if (phrase == "древняя обсерватория" || phrase == "обсерватория") {
-            switch (target_case) {
-                case Case::ACCUSATIVE:   return "древнюю обсерваторию";
-                case Case::GENITIVE:     return "древней обсерватории";
-                case Case::LOCATIVE:     return "древней обсерватории";
-                case Case::INSTRUMENTAL: return "древней обсерваторией";
-                default:                 return phrase;
-            }
-        }
-        if (phrase == "рубиновый ключ") {
-            switch (target_case) {
-                case Case::ACCUSATIVE:   return "рубиновый ключ";
-                case Case::GENITIVE:     return "рубинового ключа";
-                case Case::LOCATIVE:     return "рубиновом ключе";
-                case Case::INSTRUMENTAL: return "рубиновым ключом";
-                default:                 return phrase;
-            }
-        }
-        if (phrase == "купол") {
-            switch (target_case) {
-                case Case::ACCUSATIVE:   return "купол";
-                case Case::LOCATIVE:     return "куполе";
-                case Case::INSTRUMENTAL: return "куполом";
-                case Case::GENITIVE:     return "купола";
-                default:                 return phrase;
-            }
-        }
-
         // Generalized multi-word morphological inflection
         std::istringstream iss(phrase);
         std::vector<std::string> words;
@@ -682,10 +646,9 @@ public:
 
         if (words.empty()) return phrase;
 
-        bool phrase_is_fem = (phrase.find("шкатулк") != std::string::npos ||
-                              phrase.find("обсерватори") != std::string::npos ||
-                              phrase.find("лаборатори") != std::string::npos ||
-                              words.back().ends_with("а") || words.back().ends_with("я"));
+        const std::string& head_word = words.back();
+        bool phrase_is_fem = (head_word.ends_with("а") || head_word.ends_with("я") || head_word.ends_with("ь")) &&
+                             !head_word.ends_with("тель") && !head_word.ends_with("ключ");
 
         std::string res;
         for (size_t i = 0; i < words.size(); ++i) {

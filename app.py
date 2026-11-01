@@ -38,14 +38,28 @@ def resolve_bin(path):
 
 def ensure_compiled():
     os.makedirs(BUILD_DIR, exist_ok=True)
-    if os.name == "nt" or all(os.path.isfile(resolve_bin(bp)) for _, bp, _ in SUITES):
+    if os.name == "nt":
         return
+    req_bins = [resolve_bin(bp) for _, bp, _ in SUITES] + [os.path.join(BUILD_DIR, "upgrade_lab")]
+    if all(os.path.isfile(b) for b in req_bins):
+        oldest_bin = min(os.path.getmtime(b) for b in req_bins)
+        watched_dirs = ["include", "src", "second_brain", "tests", "legacy_ptq"]
+        newest_src = 0.0
+        for d in watched_dirs:
+            dp = os.path.join(ROOT_DIR, d)
+            if not os.path.isdir(dp):
+                continue
+            for fn in os.listdir(dp):
+                if fn.endswith((".h", ".hpp", ".c", ".cpp")):
+                    newest_src = max(newest_src, os.path.getmtime(os.path.join(dp, fn)))
+        if newest_src <= oldest_bin:
+            return
     cmd = r"""
     if ! command -v g++ >/dev/null 2>&1; then
         apt-get update && apt-get install -y --no-install-recommends g++ gcc libc6-dev make
     fi
-    CXXFLAGS="-std=c++20 -O2 -march=native -pthread -DBUILDING_POPCNT_BRAIN_LIB -Iinclude -Isecond_brain -Ilegacy_ptq"
-    gcc -O2 -march=native -Iinclude -Ilegacy_ptq -c legacy_ptq/ptq_cuda.c -o build/ptq_cuda.o &
+    CXXFLAGS="-std=c++20 -O3 -march=native -pthread -DBUILDING_POPCNT_BRAIN_LIB -Iinclude -Isecond_brain -Ilegacy_ptq"
+    gcc -O3 -march=native -Iinclude -Ilegacy_ptq -c legacy_ptq/ptq_cuda.c -o build/ptq_cuda.o &
     g++ $CXXFLAGS -c src/vsa_db.cpp -o build/vsa_db.o &
     g++ $CXXFLAGS -c src/hssa.cpp -o build/hssa.o &
     g++ $CXXFLAGS -c src/model_mod.cpp -o build/model_mod.o &

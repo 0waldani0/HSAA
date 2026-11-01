@@ -116,6 +116,21 @@ typedef struct UnifiedIdeaSynthTelemetry {
     double   total_idea_us;
 } UnifiedIdeaSynthTelemetry;
 
+/* Telemetry for Non-Brute-Force Reduced-Round 256-Bit ARX/Hash Preimage Solver */
+typedef struct UnifiedHashPreimageTelemetry {
+    uint32_t rounds_configured;
+    uint32_t target_bits_configured;
+    uint32_t solver_evaluations;
+    uint32_t brute_force_evaluations;
+    uint32_t simplex_pruned_branches;
+    uint32_t neutral_bit_jumps;
+    uint32_t best_hamming_distance_256;
+    uint32_t found_preimage_nonce;
+    bool     exact_target_matched;
+    double   speedup_vs_bruteforce;
+    double   solve_latency_us;
+} UnifiedHashPreimageTelemetry;
+
 /* 1. Lifecycle Management */
 void unified_engine_default_config(UnifiedEngineConfig* out_cfg);
 UnifiedEngine* unified_engine_create(const UnifiedEngineConfig* cfg);
@@ -186,11 +201,21 @@ int unified_engine_synthesize_ideas(
     UnifiedIdeaSynthTelemetry* out_telem
 );
 
-/* 8. Unified Persistence (Single Call Saves/Loads Entire Engine State) */
+/* 8. Non-Brute-Force 256-Bit ARX/Hash Preimage Solver (Backward Unrolling + Simplex Gate + Neutral Bits) */
+int unified_engine_solve_hash_preimage(
+    UnifiedEngine* eng,
+    uint32_t num_rounds,
+    uint32_t target_zero_bits,
+    char* out_report,
+    size_t max_len,
+    UnifiedHashPreimageTelemetry* out_telem
+);
+
+/* 9. Unified Persistence (Single Call Saves/Loads Entire Engine State) */
 int unified_engine_save(UnifiedEngine* eng, const char* path_prefix);
 int unified_engine_load(UnifiedEngine* eng, const char* path_prefix);
 
-/* 9. Direct Component Accessors for Interop with Existing Subsystems */
+/* 10. Direct Component Accessors for Interop with Existing Subsystems */
 VsaDbHandle*   unified_engine_get_vsa_db(UnifiedEngine* eng);
 PopCountBrain* unified_engine_get_brain(UnifiedEngine* eng);
 HssaContext*   unified_engine_get_hssa(UnifiedEngine* eng);

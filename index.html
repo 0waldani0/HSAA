@@ -176,36 +176,43 @@
         <div class="flex flex-wrap items-center gap-2">
           <label for="synthModeSelect" class="sr-only">Режим синтеза</label>
           <select id="synthModeSelect" aria-label="Режим синтеза" class="bg-slate-950 border border-slate-700 text-slate-200 text-xs font-mono rounded-lg px-3 py-2">
-            <option value="all">Все 3 конвейера (Текст + Код + Идеи)</option>
+            <option value="all">Все 4 конвейера (Текст + ST-IR Код + Идеи + 256-Bit Хэш)</option>
             <option value="text">1. Deep 28L Beam + RoPE Текст</option>
-            <option value="code">2. AST Код + Компилятор VSA f(x)</option>
+            <option value="code">2. ST-IR AST Код + Off-Grid Спектральный Солвер</option>
             <option value="idea">3. System-2 VSA Аналогии и Идеи</option>
+            <option value="hash">4. 256-Bit ARX/SHA-256 Прообраз без перебора (R:Bits)</option>
           </select>
           <label for="synthPromptInput" class="sr-only">Запрос или цель синтеза</label>
-          <input id="synthPromptInput" type="text" placeholder="Запрос (напр. Модуль_Вега или nonlinear_law)" class="bg-slate-950 border border-slate-700 text-slate-100 text-xs font-mono rounded-lg px-3 py-2 w-64" />
+          <input id="synthPromptInput" type="text" placeholder="Напр.: offgrid_osc, Модуль_Вега или 5:16" class="bg-slate-950 border border-slate-700 text-slate-100 text-xs font-mono rounded-lg px-3 py-2 w-64" />
           <button id="runSynthBtn" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-mono uppercase tracking-wider font-semibold rounded-lg transition cursor-pointer">
-            Синтезировать в C++20
+            Выполнить в C++20
           </button>
         </div>
       </div>
 
-      <div id="synthContainer" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div id="synthContainer" class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div class="bg-slate-950 border border-slate-800 rounded-lg p-4">
-          <div class="text-xs font-mono text-emerald-400 uppercase mb-1">1. Deep 28L Beam + Subword + RoPE Текст</div>
+          <div class="text-xs font-mono text-emerald-400 uppercase mb-1">1. Deep 28L Beam + Subword + RoPE Текст (Без словарей-заглушек)</div>
           <div id="synthTextMeta" class="text-[11px] font-mono text-slate-400 mb-2">Загрузка из C++ ядра...</div>
           <pre id="synthTextOut" class="text-xs font-mono text-slate-200 whitespace-pre-wrap bg-slate-900/90 border border-slate-800 rounded p-3">Выполняется...</pre>
         </div>
 
         <div class="bg-slate-950 border border-slate-800 rounded-lg p-4">
-          <div class="text-xs font-mono text-cyan-400 uppercase mb-1">2. AST Код + VSA f(x) → C++20 Песочница</div>
+          <div class="text-xs font-mono text-cyan-400 uppercase mb-1">2. ST-IR Arena AST + Непрерывный Спектральный Солвер f(x)</div>
           <div id="synthCodeMeta" class="text-[11px] font-mono text-slate-400 mb-2">Загрузка из C++ ядра...</div>
           <pre id="synthCodeOut" class="text-xs font-mono text-cyan-200 whitespace-pre-wrap bg-slate-900/90 border border-slate-800 rounded p-3 max-h-60 overflow-y-auto">Выполняется...</pre>
         </div>
 
         <div class="bg-slate-950 border border-slate-800 rounded-lg p-4">
-          <div class="text-xs font-mono text-violet-400 uppercase mb-1">3. System-2 VSA Аналогии &amp; Новые Идеи</div>
+          <div class="text-xs font-mono text-violet-400 uppercase mb-1">3. System-2 VSA Аналогии &amp; Декодирование Манифолда ℝ<sup>4096</sup></div>
           <div id="synthIdeaMeta" class="text-[11px] font-mono text-slate-400 mb-2">Загрузка из C++ ядра...</div>
           <pre id="synthIdeaOut" class="text-xs font-mono text-violet-200 whitespace-pre-wrap bg-slate-900/90 border border-slate-800 rounded p-3 max-h-60 overflow-y-auto">Выполняется...</pre>
+        </div>
+
+        <div class="bg-slate-950 border border-amber-500/40 rounded-lg p-4">
+          <div class="text-xs font-mono text-amber-400 uppercase mb-1">4. 256-Bit ARX/SHA-256 Инверсия прообраза без прямого перебора</div>
+          <div id="synthHashMeta" class="text-[11px] font-mono text-slate-400 mb-2">Загрузка из C++ ядра...</div>
+          <pre id="synthHashOut" class="text-xs font-mono text-amber-200 whitespace-pre-wrap bg-slate-900/90 border border-slate-800 rounded p-3 max-h-60 overflow-y-auto">Выполняется...</pre>
         </div>
       </div>
     </section>
@@ -228,9 +235,11 @@
       const tMeta = document.getElementById('synthTextMeta');
       const cMeta = document.getElementById('synthCodeMeta');
       const iMeta = document.getElementById('synthIdeaMeta');
+      const hMeta = document.getElementById('synthHashMeta');
       tMeta.textContent = 'Синтез в C++20...';
-      cMeta.textContent = 'Компиляция и проверка в песочнице...';
+      cMeta.textContent = 'Построение ST-IR AST и оптимизация спектра...';
       iMeta.textContent = 'Поиск VSA-аналогий и релаксация Хопфилда...';
+      hMeta.textContent = 'Обратное развёртывание ARX + отсечение Simplex Gate...';
       try {
         const qs = new URLSearchParams({ mode, prompt });
         const res = await fetch('/api/synthesize?' + qs.toString());
@@ -241,11 +250,15 @@
         }
         if (d.code_synth) {
           cMeta.textContent = `AST=${d.code_synth.ast_valid ? 'PASS' : 'FAIL'} (${d.code_synth.ast_nodes} узлов) • Sandbox=${d.code_synth.sandbox_verified ? 'VERIFIED' : 'FAIL'} • MSE=${Number(d.code_synth.sandbox_mse).toExponential(2)} • ${Number(d.code_synth.latency_us).toFixed(0)} мкс`;
-          document.getElementById('synthCodeOut').textContent = d.code_synth.vsa_func_code + '\n// --- Zero-Shot Algorithm ---\n' + d.code_synth.algo_code;
+          document.getElementById('synthCodeOut').textContent = d.code_synth.vsa_func_code + '\n// --- ST-IR Arena AST + AbstractInterpreter Proof ---\n' + d.code_synth.algo_code;
         }
         if (d.idea_synth) {
           iMeta.textContent = `аналогий=${d.idea_synth.analogies} • абдукций=${d.idea_synth.curiosity_gaps} • записано в VSA=${d.idea_synth.crystallized} • новизна=${Number(d.idea_synth.novelty_score).toFixed(2)} • dE=${Number(d.idea_synth.hopfield_dE).toFixed(1)}`;
           document.getElementById('synthIdeaOut').textContent = d.idea_synth.ideas + `\n\n[Проверка памяти VSA после кристаллизации]\nМодуль_Вега | использует_ядро ?  ==>  ${d.idea_synth.recalled_crystallized}`;
+        }
+        if (d.hash_solver) {
+          hMeta.textContent = `R=${d.hash_solver.rounds} раундов • 2^${d.hash_solver.target_bits} • HSAA=${d.hash_solver.solver_evals} vs Перебор=${d.hash_solver.bruteforce_evals} • Ускорение=${Number(d.hash_solver.speedup).toFixed(1)}x • ${Number(d.hash_solver.latency_us).toFixed(0)} мкс`;
+          document.getElementById('synthHashOut').textContent = d.hash_solver.report;
         }
       } catch (err) {
         tMeta.textContent = 'Ошибка вызова /api/synthesize';

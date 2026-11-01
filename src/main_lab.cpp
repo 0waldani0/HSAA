@@ -854,6 +854,10 @@ static int cmd_unified(int argc, char** argv) {
         char fbuf[128];
         std::snprintf(fbuf, sizeof(fbuf), "nonlinear_law(%.5f) = %.6f", static_cast<double>(x), static_cast<double>(y));
         unified_engine_observe(eng, fbuf, &obs_t);
+
+        float y_off = 1.2f + 0.5f * x + std::exp(-0.42f * x) * (1.8f * std::sin(1.73f * x) - 0.6f * std::cos(1.73f * x));
+        std::snprintf(fbuf, sizeof(fbuf), "offgrid_osc(%.5f) = %.6f", static_cast<double>(x), static_cast<double>(y_off));
+        unified_engine_observe(eng, fbuf, &obs_t);
     }
 
     if (json_mode) {
@@ -862,10 +866,20 @@ static int cmd_unified(int argc, char** argv) {
             : "Нейроморфные сопроцессоры вычисляют";
         std::string p_code = (!custom_prompt.empty() && req_mode == "code")
             ? custom_prompt
-            : "Synthesize C++20 analytical function for nonlinear_law(x)";
+            : "Synthesize C++20 analytical function for offgrid_osc(x)";
         std::string p_idea = (!custom_prompt.empty() && req_mode == "idea")
             ? custom_prompt
             : "Модуль_Вега";
+
+        uint32_t hash_rounds = 5U;
+        uint32_t hash_bits   = 16U;
+        if (!custom_prompt.empty() && req_mode == "hash") {
+            unsigned int r_in = 5U, b_in = 16U;
+            if (std::sscanf(custom_prompt.c_str(), "%u:%u", &r_in, &b_in) >= 1) {
+                hash_rounds = std::max(1U, std::min(16U, r_in));
+                hash_bits   = std::max(8U, std::min(20U, b_in));
+            }
+        }
 
         char text_out[2048] = {0};
         UnifiedTextGenTelemetry tg{};
@@ -877,7 +891,7 @@ static int cmd_unified(int argc, char** argv) {
 
         char algo_out[4096] = {0};
         UnifiedCodeSynthTelemetry cs_algo{};
-        unified_engine_synthesize_code(eng, "Dijkstra shortest path on Red-Black Tree", algo_out, sizeof(algo_out), &cs_algo);
+        unified_engine_synthesize_code(eng, "Synthesize cosine similarity kernel via ST-IR", algo_out, sizeof(algo_out), &cs_algo);
 
         char idea_out[4096] = {0};
         UnifiedIdeaSynthTelemetry id_t{};
@@ -886,6 +900,10 @@ static int cmd_unified(int argc, char** argv) {
         char recalled_idea[256] = {0};
         UnifiedForwardTelemetry fwd_rec{};
         unified_engine_forward(eng, "Модуль_Вега | использует_ядро ?", recalled_idea, sizeof(recalled_idea), nullptr, &fwd_rec);
+
+        char hash_rep[2048] = {0};
+        UnifiedHashPreimageTelemetry hs_t{};
+        unified_engine_solve_hash_preimage(eng, hash_rounds, hash_bits, hash_rep, sizeof(hash_rep), &hs_t);
 
         std::cout << "{\n"
                   << "  \"text_gen\": {\n"
@@ -921,6 +939,20 @@ static int cmd_unified(int argc, char** argv) {
                   << "    \"structural_cosine\": " << id_t.analogy_structural_cosine << ",\n"
                   << "    \"hopfield_dE\": " << id_t.hopfield_energy_delta << ",\n"
                   << "    \"latency_us\": " << id_t.total_idea_us << "\n"
+                  << "  },\n"
+                  << "  \"hash_solver\": {\n"
+                  << "    \"rounds\": " << hs_t.rounds_configured << ",\n"
+                  << "    \"target_bits\": " << hs_t.target_bits_configured << ",\n"
+                  << "    \"solver_evals\": " << hs_t.solver_evaluations << ",\n"
+                  << "    \"bruteforce_evals\": " << hs_t.brute_force_evaluations << ",\n"
+                  << "    \"simplex_pruned\": " << hs_t.simplex_pruned_branches << ",\n"
+                  << "    \"neutral_jumps\": " << hs_t.neutral_bit_jumps << ",\n"
+                  << "    \"best_hamming_256\": " << hs_t.best_hamming_distance_256 << ",\n"
+                  << "    \"found_nonce\": " << hs_t.found_preimage_nonce << ",\n"
+                  << "    \"exact_matched\": " << (hs_t.exact_target_matched ? "true" : "false") << ",\n"
+                  << "    \"speedup\": " << hs_t.speedup_vs_bruteforce << ",\n"
+                  << "    \"latency_us\": " << hs_t.solve_latency_us << ",\n"
+                  << "    \"report\": \"" << json_escape_str(hash_rep) << "\"\n"
                   << "  }\n"
                   << "}\n";
         unified_engine_destroy(eng);

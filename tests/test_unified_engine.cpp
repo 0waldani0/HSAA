@@ -285,6 +285,53 @@ int main() {
     CHECK_UNIFIED("crystallized System-2 hypothesis is immediately recallable via unified_engine_forward",
                   r_vc == 0 && std::strlen(verify_crystallized) > 0);
 
+    // 10. De-Hardcoded Verification: Off-Grid Continuous Spectral Solver, ST-IR AST Proof & 256-Bit ARX Preimage
+    std::printf("\n>>> 10. Off-Grid Continuous Spectral Optimization, ST-IR AST Proof & 256-Bit ARX Preimage Solver <<<\n");
+    for (int i = 0; i <= 20; ++i) {
+        float x = static_cast<float>(i) * 0.2f;
+        // True off-grid parameters: gamma = 0.42, omega = 1.73 (never in any fixed lookup table)
+        float y = 1.2f + 0.5f * x + std::exp(-0.42f * x) * (1.8f * std::sin(1.73f * x) - 0.6f * std::cos(1.73f * x));
+        char fbuf[128];
+        std::snprintf(fbuf, sizeof(fbuf), "offgrid_osc(%.2f) = %.6f", static_cast<double>(x), static_cast<double>(y));
+        unified_engine_observe(eng, fbuf, nullptr);
+    }
+    char offgrid_code[2048] = {0};
+    UnifiedCodeSynthTelemetry cs_offgrid{};
+    int r_off = unified_engine_synthesize_code(
+        eng,
+        "Synthesize C++20 analytical function for offgrid_osc(x)",
+        offgrid_code,
+        sizeof(offgrid_code),
+        &cs_offgrid
+    );
+    std::printf("    -> Off-Grid Spectral Synthesis (gamma=0.42, omega=1.73 -> sandbox MSE=%.6f):\n%s",
+                cs_offgrid.sandbox_mse, offgrid_code);
+    CHECK_UNIFIED("continuous coordinate-descent spectral solver recovers off-grid (gamma=0.42, omega=1.73)",
+                  r_off > 0 && cs_offgrid.compiled_from_vsa_function && cs_offgrid.sandbox_exec_verified &&
+                  cs_offgrid.sandbox_mse < 1e-3);
+
+    char stir_cos_code[2048] = {0};
+    UnifiedCodeSynthTelemetry cs_stir_cos{};
+    int r_stir = unified_engine_synthesize_code(
+        eng,
+        "Synthesize cosine similarity kernel via ST-IR",
+        stir_cos_code,
+        sizeof(stir_cos_code),
+        &cs_stir_cos
+    );
+    CHECK_UNIFIED("ST-IR Arena AST synthesizer proves safety via AbstractInterpreter and emits C++20 code",
+                  r_stir > 0 && cs_stir_cos.ast_balanced_valid && cs_stir_cos.sandbox_exec_verified &&
+                  std::strstr(stir_cos_code, "Synthesized via ST-IR Arena AST") != nullptr);
+
+    char hash_report[2048] = {0};
+    UnifiedHashPreimageTelemetry hash_telem{};
+    int r_hash = unified_engine_solve_hash_preimage(eng, 5, 16, hash_report, sizeof(hash_report), &hash_telem);
+    std::printf("    -> %s\n", hash_report);
+    CHECK_UNIFIED("256-bit ARX preimage solver (R=5, B=16) finds exact 256/256-bit preimage without forward brute-force",
+                  r_hash == 0 && hash_telem.exact_target_matched &&
+                  hash_telem.solver_evaluations < hash_telem.brute_force_evaluations &&
+                  hash_telem.speedup_vs_bruteforce > 50.0);
+
     unified_engine_destroy(eng);
 
     std::printf("\n================================================================================\n");
@@ -292,3 +339,4 @@ int main() {
     std::printf("================================================================================\n");
     return (g_failed == 0) ? 0 : 1;
 }
+

@@ -43,6 +43,7 @@ static inline void strncpy_s(char* dest, size_t dest_sz, const char* src, size_t
 }
 #endif
 #include <immintrin.h>
+#include "avx512_portable_shim.h"
 
 #include <cstdint>
 #include <cstddef>
