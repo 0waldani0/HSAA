@@ -18123,12 +18123,15 @@ POPCNT_BRAIN_API void brain_get_stats(PopCountBrain* brain, size_t* out_active_p
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    const size_t distinct_assoc = static_cast<size_t>(brain->assoc_fact_count);
+    const size_t assoc_4kb_pages = (distinct_assoc + ASSOC_SLOTS_PER_PAGE - 1) / ASSOC_SLOTS_PER_PAGE;
     if (out_active_pages) {
-        *out_active_pages = brain->engine
+        const size_t base_pages = brain->engine
             ? brain->engine->relay_chain.initialized_relay_pages.size()
             : 0;
+        *out_active_pages = base_pages + assoc_4kb_pages;
     }
-    if (out_active_rules) *out_active_rules = brain->active_rules;
+    if (out_active_rules) *out_active_rules = distinct_assoc > 0 ? distinct_assoc : brain->active_rules;
 }
 
 POPCNT_BRAIN_API int brain_save_state(PopCountBrain* brain, const char* filepath) {

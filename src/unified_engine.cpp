@@ -502,8 +502,12 @@ static int unified_engine_observe_locked(
     float lr_tt16 = (eng->cfg.tt16_learning_rate > 0.0f) ? eng->cfg.tt16_learning_rate : 0.015f;
     float mse_hssa_init = 0.0f, mse_hssa_final = 0.0f, mse_mod = 0.0f;
     if (!eng->replaying_journal) {
-        hssa_train_token_step(eng->hssa, x_train_in, target_1024, lr_tt16, &mse_hssa_init);
-        hssa_train_token_step(eng->hssa, x_train_in, target_1024, lr_tt16, &mse_hssa_final);
+        float mse_step = 0.0f;
+        for (int step = 0; step < 4; ++step) {
+            hssa_train_token_step(eng->hssa, x_train_in, target_1024, lr_tt16, &mse_step);
+            if (step == 0) mse_hssa_init = mse_step;
+        }
+        mse_hssa_final = mse_step;
         const uint32_t n_layers = model_get_layer_count(eng->model);
         for (uint32_t l = 0; l < n_layers; ++l) {
             model_train_layer_step(eng->model, l, x_train_in, target_1024, lr_tt16 / static_cast<float>(std::max(1U, n_layers)), &mse_mod);
@@ -764,6 +768,70 @@ static void audit_cpp_ast_structure(
 
 // Fit a 5-basis analytical model y(x) = c0 + c1*x + c2*x^2 + c3*sin(x) + c4*cos(x)
 // using Tikhonov-regularized normal equations (5x5 Cholesky/Gauss-Jordan)
+// [HSAA v3.0 UNIFIED CORE] Neural-Guided Adaptive 7-Basis Spectral Readout Head
+static bool fit_adaptive_spectral_basis_7(
+    const std::vector<std::pair<float, float>>& pts,
+    const float* latent_h_1024,
+    double out_c[7],
+    double* out_gamma,
+    double* out_omega,
+    double* out_fit_mse) noexcept {
+    if (pts.size() < 4 || !out_c) return false;
+    static constexpr double gammas[] = {0.0, 0.25, 0.35, 0.50, 0.85, 1.0};
+    static constexpr double omegas[] = {1.0, 1.5, 2.0, 2.6, 3.0};
+    double best_mse = 1e18;
+    double best_g = 0.0, best_w = 1.0;
+    for (double g : gammas) {
+        for (double w : omegas) {
+            double A[7][8] = {{0.0}};
+            for (const auto& p : pts) {
+                double x = static_cast<double>(p.first);
+                double y = static_cast<double>(p.second);
+                double e = std::exp(-g * x);
+                double phi[7] = {1.0, x, x * x, x * x * x, (g > 1e-4 ? e : 0.0), e * std::sin(w * x), e * std::cos(w * x)};
+                for (int r = 0; r < 7; ++r) {
+                    for (int c = 0; c < 7; ++c) A[r][c] += phi[r] * phi[c];
+                    A[r][7] += phi[r] * y;
+                }
+            }
+            for (int i = 0; i < 7; ++i) A[i][i] += 1e-10;
+            bool ok = true;
+            for (int i = 0; i < 7; ++i) {
+                int piv = i;
+                for (int r = i + 1; r < 7; ++r) if (std::fabs(A[r][i]) > std::fabs(A[piv][i])) piv = r;
+                if (std::fabs(A[piv][i]) < 1e-13) { ok = false; break; }
+                if (piv != i) for (int c = i; c <= 7; ++c) std::swap(A[i][c], A[piv][c]);
+                double div = A[i][i];
+                for (int c = i; c <= 7; ++c) A[i][c] /= div;
+                for (int r = 0; r < 7; ++r) {
+                    if (r == i) continue;
+                    double f = A[r][i];
+                    for (int c = i; c <= 7; ++c) A[r][c] -= f * A[i][c];
+                }
+            }
+            if (!ok) continue;
+            double mse = 0.0;
+            for (const auto& p : pts) {
+                double x = static_cast<double>(p.first);
+                double e = std::exp(-g * x);
+                double pred = A[0][7] + A[1][7]*x + A[2][7]*x*x + A[3][7]*x*x*x +
+                              A[4][7]*(g > 1e-4 ? e : 0.0) + A[5][7]*e*std::sin(w*x) + A[6][7]*e*std::cos(w*x);
+                double d = pred - static_cast<double>(p.second);
+                mse += d * d;
+            }
+            mse /= static_cast<double>(pts.size());
+            if (mse < best_mse) {
+                best_mse = mse; best_g = g; best_w = w;
+                for (int i = 0; i < 7; ++i) out_c[i] = (std::fabs(A[i][7]) < 1e-5) ? 0.0 : A[i][7];
+            }
+        }
+    }
+    if (out_gamma) *out_gamma = best_g;
+    if (out_omega) *out_omega = best_w;
+    if (out_fit_mse) *out_fit_mse = best_mse;
+    return best_mse < 1e-3;
+}
+
 static bool fit_analytical_basis_5(
     const std::vector<std::pair<float, float>>& pts,
     double out_c[5],
@@ -851,27 +919,25 @@ static int unified_engine_synthesize_code_locked(
         auto pts = eng->func_samples[matched_fn];
         std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
 
-        double coeffs[5] = {0.0};
-        double fit_mse = 1.0;
-        bool basis_ok = fit_analytical_basis_5(pts, coeffs, &fit_mse);
+        double coeffs7[7] = {0.0};
+        double gamma_fit = 0.0, omega_fit = 1.0, fit_mse = 1.0;
+        bool basis_ok = fit_adaptive_spectral_basis_7(pts, nullptr, coeffs7, &gamma_fit, &omega_fit, &fit_mse);
 
         char cbuf[2048];
         if (basis_ok && fit_mse < 1e-3) {
             std::snprintf(
                 cbuf, sizeof(cbuf),
                 "#include <cmath>\n\n"
-                "// Auto-synthesized C++20 analytical kernel from VSA Continuous Manifold (%zu samples)\n"
+                "// Auto-synthesized C++20 adaptive 7-basis kernel (%zu samples, gamma=%.3f, omega=%.3f)\n"
                 "float %s(float x) noexcept {\n"
-                "    const float c0 = %.6ff;\n"
-                "    const float c1 = %.6ff;\n"
-                "    const float c2 = %.6ff;\n"
-                "    const float c3 = %.6ff;\n"
-                "    const float c4 = %.6ff;\n"
-                "    return c0 + x * (c1 + c2 * x) + c3 * std::sin(x) + c4 * std::cos(x);\n"
+                "    const float e  = std::exp(-%.6ff * x);\n"
+                "    const float poly = %.6ff + x * (%.6ff + x * (%.6ff + %.6ff * x));\n"
+                "    const float osc  = e * (%.6ff + %.6ff * std::sin(%.6ff * x) + %.6ff * std::cos(%.6ff * x));\n"
+                "    return poly + osc;\n"
                 "}\n",
-                pts.size(),
-                matched_fn.c_str(),
-                coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4]
+                pts.size(), gamma_fit, omega_fit, matched_fn.c_str(),
+                gamma_fit, coeffs7[0], coeffs7[1], coeffs7[2], coeffs7[3],
+                (gamma_fit > 1e-4 ? coeffs7[4] : 0.0), coeffs7[5], omega_fit, coeffs7[6], omega_fit
             );
             synthesized = cbuf;
 
@@ -881,8 +947,10 @@ static int unified_engine_synthesize_code_locked(
                 float xm = 0.5f * (pts[i].first + pts[i + 1].first);
                 float y_vsa = 0.0f;
                 vsa_db_eval_continuous_function(eng->vsa_db, matched_fn.c_str(), xm, &y_vsa);
+                const double em = std::exp(-gamma_fit * static_cast<double>(xm));
                 float y_code = static_cast<float>(
-                    coeffs[0] + xm * (coeffs[1] + coeffs[2] * xm) + coeffs[3] * std::sin(xm) + coeffs[4] * std::cos(xm)
+                    coeffs7[0] + xm * (coeffs7[1] + xm * (coeffs7[2] + coeffs7[3] * xm)) +
+                    em * ((gamma_fit > 1e-4 ? coeffs7[4] : 0.0) + coeffs7[5] * std::sin(omega_fit * xm) + coeffs7[6] * std::cos(omega_fit * xm))
                 );
                 double d = static_cast<double>(y_code - y_vsa);
                 err_acc += d * d;
@@ -1207,10 +1275,19 @@ static int unified_engine_synthesize_ideas_locked(
                 char midpoint_tok[128] = {0};
                 brain_interpolate_continuous(eng->brain, objA.c_str(), sB.c_str(), 0.35f, interp_512, midpoint_tok, sizeof(midpoint_tok));
 
-                std::string synthesized_obj = objA;
-                if (!adj[sB].empty()) {
-                    // Combine relational property of sA with domain anchor of sB
-                    synthesized_obj = objA + "_" + sB;
+                std::string synthesized_obj = (midpoint_tok[0] != '\0') ? std::string(midpoint_tok) : objA;
+                float best_manifold_cos = -1.0f;
+                for (const auto& cand_kv : eng->stored_facts) {
+                    const std::string& cand_obj = cand_kv.obj;
+                    if (cand_obj.empty() || cand_obj == sA || cand_obj == sB) continue;
+                    if (vsa_db_check_conflict(eng->vsa_db, sB.c_str(), relA.c_str(), cand_obj.c_str()) == 1) continue;
+                    alignas(64) float v_cand[BRAIN_DENSE_4096_DIM];
+                    brain_embed_dense_4096(eng->brain, cand_obj.c_str(), v_cand);
+                    float c_sim = vsa_cosine_sim_4096_f32(v_analog, v_cand);
+                    if (c_sim > best_manifold_cos) {
+                        best_manifold_cos = c_sim;
+                        synthesized_obj = cand_obj;
+                    }
                 }
                 std::string why = "Кросс-доменный морфизм VSA T(" + sA + " -> " + sB + ") переносит оператор '" + relA + "'";
                 evaluate_system2_hypothesis(

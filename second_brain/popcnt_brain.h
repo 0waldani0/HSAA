@@ -132,18 +132,11 @@ POPCNT_BRAIN_API int brain_query_relation(PopCountBrain* brain, const char* subj
 // resolves to a stored fact with a different object counts as a conflict.
 POPCNT_BRAIN_API int brain_check_conflict(PopCountBrain* brain, const char* subject, const char* relation, const char* object);
 
-// Stats.
-//   out_active_pages: 4 KB expert pages that hold trained weights, as a count of
-//                     state rather than a budget. MEASURED LIMITATION: the engine
-//                     populates these in its CONSTRUCTOR from the built-in corpus,
-//                     and brain_store_fact does not re-run train_transitions_ste,
-//                     so this number does NOT change with the facts YOU store
-//                     (probed: 59 after create, still 59 after 250 stores). Read it
-//                     as the resident footprint of the engine's own training, never
-//                     as a per-call usage metric.
-//   out_active_rules: number of brain_store_fact calls, NOT the number of distinct
-//                     stored rules (probed: 250 after 200 distinct + 50 duplicate
-//                     stores).
+// Stats (Updated in HSAA v3.0 Unified Patch):
+//   out_active_pages: base relay 4 KB expert pages (59) + dynamically allocated
+//                     4 KB associative fact pages ((assoc_fact_count + ASSOC_SLOTS_PER_PAGE - 1) / ASSOC_SLOTS_PER_PAGE).
+//   out_active_rules: deduplicated count of distinct (Subject, Relation) rules stored in
+//                     the 4 KB VSA lexicon (brain->assoc_fact_count).
 POPCNT_BRAIN_API void brain_get_stats(PopCountBrain* brain, size_t* out_active_pages, size_t* out_active_rules);
 
 // State persistence

@@ -88,10 +88,12 @@ __pycache__/
 .aistudio/
 node_modules/
 .npm/
-package.json
-package-lock.json
-metadata.json
-server.js
+/package.json
+/package-lock.json
+/metadata.json
+/server.js
+!google_ai_studio/package.json
+!google_ai_studio/metadata.json
 .env
 .env.*
 npm-debug.log*

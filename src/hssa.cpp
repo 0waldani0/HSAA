@@ -149,17 +149,21 @@ static inline void hssa_quantize_base_ternary(HssaBaseLayerWeights* bw) noexcept
     quantize_ternary_channel_1024(bw->w_g_rot, bw->g_pos, bw->g_neg, &bw->scale_g_rot);
 }
 
-static inline void hssa_init_base_layer_weights(HssaBaseLayerWeights* bw) noexcept {
+static inline void hssa_init_base_layer_weights(HssaBaseLayerWeights* bw, uint32_t layer_idx = 0) noexcept {
     if (!bw) return;
+    const float depth_ratio = static_cast<float>(layer_idx) / 27.0f;
+    const float alpha_decay = 0.88f + 0.10f * depth_ratio;
+    const float freq_scale  = static_cast<float>(layer_idx + 1) * 0.37f;
     for (size_t i = 0; i < HSSA_HIDDEN_DIM; ++i) {
-        bw->w_k_diag[i] = 0.85f;
-        bw->w_k_rot[i]  = 0.15f;
-        bw->w_q_diag[i] = 0.85f;
-        bw->w_q_rot[i]  = -0.15f;
+        const float phase = freq_scale * static_cast<float>(i) * (6.2831853f / static_cast<float>(HSSA_HIDDEN_DIM));
+        bw->w_k_diag[i] = alpha_decay;
+        bw->w_k_rot[i]  = (1.0f - alpha_decay) * std::sin(phase);
+        bw->w_q_diag[i] = alpha_decay;
+        bw->w_q_rot[i]  = -(1.0f - alpha_decay) * std::sin(phase * 0.5f);
         bw->w_v_diag[i] = 0.90f;
         bw->w_v_rot[i]  = 0.10f;
-        bw->w_g_diag[i] = 0.80f;
-        bw->w_g_rot[i]  = 0.20f;
+        bw->w_g_diag[i] = 0.80f + 0.12f * depth_ratio;
+        bw->w_g_rot[i]  = 0.20f - 0.12f * depth_ratio;
     }
     hssa_quantize_base_ternary(bw);
 }
@@ -233,7 +237,7 @@ HssaContext* hssa_create(uint32_t num_layers) {
         std::memset(lyr->deltanet_state, 0, HSSA_DELTANET_STATE_SIZE * sizeof(float));
         std::memset(lyr->tt_u, 0, HSSA_TT16_CORE_SIZE * sizeof(float));
         std::memset(lyr->tt_v, 0, HSSA_TT16_CORE_SIZE * sizeof(float));
-        hssa_init_base_layer_weights(bw);
+        hssa_init_base_layer_weights(bw, l);
 
         lyr->vsa_handle = nullptr;
         lyr->reserved[0] = nullptr;
@@ -2174,7 +2178,7 @@ int hssa_load_weights(HssaContext* ctx, const char* filepath) {
                 csum = fnv1a64_update(csum, &tmp_bw[l], bw_bytes);
             }
         } else if (ok) {
-            hssa_init_base_layer_weights(&tmp_bw[l]);
+            hssa_init_base_layer_weights(&tmp_bw[l], l);
         }
     }
     if (ok && !tmp_att.empty()) {

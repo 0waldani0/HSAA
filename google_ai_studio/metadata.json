@@ -1,0 +1,6 @@
+{
+  "name": "HSAA Architecture & Generalization Lab",
+  "description": "Эмпирический стенд анализа архитектуры и обобщающей способности репозитория 0waldani0/HSAA: VSA-память, DeltaNet+TT16, прогноз траекторий, вывод формул, CEGIS-кодинг и аудит узких мест.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

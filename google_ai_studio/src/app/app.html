@@ -1,0 +1,1806 @@
+<div class="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+  <!-- Strict 3-Zone Top Bar Contract -->
+  <header class="flex items-center justify-between gap-8 px-6 py-3.5 border-b border-slate-800 bg-slate-950/95 sticky top-0 z-30">
+    <!-- Zone 1: Single text element wordmark -->
+    <a
+      href="#top"
+      (click)="$event.preventDefault(); setTab('overview')"
+      class="text-base font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0"
+    >
+      HSAA Empirical Lab
+    </a>
+
+    <!-- Zone 2: 5 concise single-line text navigation links -->
+    <nav aria-label="Разделы лаборатории" class="hidden lg:flex items-center gap-6 text-sm font-medium text-slate-400">
+      <button
+        type="button"
+        (click)="setTab('overview')"
+        [class]="activeTab() === 'overview' ? 'text-cyan-400 underline underline-offset-8 decoration-2 whitespace-nowrap shrink-0' : 'hover:text-slate-100 transition-colors whitespace-nowrap shrink-0'"
+      >
+        Архитектура и Ресурсы
+      </button>
+      <button
+        type="button"
+        (click)="setTab('trajectory')"
+        [class]="activeTab() === 'trajectory' ? 'text-cyan-400 underline underline-offset-8 decoration-2 whitespace-nowrap shrink-0' : 'hover:text-slate-100 transition-colors whitespace-nowrap shrink-0'"
+      >
+        Прогноз Траекторий
+      </button>
+      <button
+        type="button"
+        (click)="setTab('determinism')"
+        [class]="activeTab() === 'determinism' ? 'text-cyan-400 underline underline-offset-8 decoration-2 whitespace-nowrap shrink-0' : 'hover:text-slate-100 transition-colors whitespace-nowrap shrink-0'"
+      >
+        Стохастика и Simplex
+      </button>
+      <button
+        type="button"
+        (click)="setTab('formulas')"
+        [class]="activeTab() === 'formulas' ? 'text-cyan-400 underline underline-offset-8 decoration-2 whitespace-nowrap shrink-0' : 'hover:text-slate-100 transition-colors whitespace-nowrap shrink-0'"
+      >
+        Вывод Формул
+      </button>
+      <button
+        type="button"
+        (click)="setTab('coding_dialogue')"
+        [class]="activeTab() === 'coding_dialogue' ? 'text-cyan-400 underline underline-offset-8 decoration-2 whitespace-nowrap shrink-0' : 'hover:text-slate-100 transition-colors whitespace-nowrap shrink-0'"
+      >
+        Кодинг и Диалог
+      </button>
+    </nav>
+
+    <!-- Zone 3: 1 primary action -->
+    <div class="flex items-center gap-3 shrink-0">
+      <button
+        type="button"
+        (click)="seedInitialKnowledgeAndRunAll()"
+        class="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-cyan-400 rounded-lg hover:bg-cyan-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+      >
+        <mat-icon class="!text-base !w-4 !h-4 leading-none">play_arrow</mat-icon>
+        <span>Перезапустить Все Тесты</span>
+      </button>
+    </div>
+  </header>
+
+  <main id="top" class="flex-1 max-w-[1380px] w-full mx-auto px-6 py-8 space-y-8">
+    <!-- Hero Analytical Overview & Workspace Mode Switcher -->
+    <section class="border border-slate-800 bg-slate-900/60 rounded-xl p-6 space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <div class="lg:col-span-8 space-y-3">
+          <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400 font-mono">
+            <span>Репозиторий: github.com/0waldani0/HSAA</span>
+            <span aria-hidden="true">·</span>
+            <span>C++20 / AVX-512 / CUDA sm_86</span>
+            <span aria-hidden="true">·</span>
+            <span>Прогон #{{ benchmarkRunCount() }} ({{ lastBenchmarkDurationMs() }} мс)</span>
+          </div>
+          <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-100" style="text-wrap: balance;">
+            Эмпирический анализ архитектуры HSAA и проверка обобщающей способности
+          </h1>
+          <p class="text-sm sm:text-base text-slate-300 leading-relaxed max-w-3xl">
+            Без маркетинговых обещаний и «магии»: исследование исходного кода
+            <code class="text-cyan-300 font-mono">src/vsa_db.cpp</code>,
+            <code class="text-cyan-300 font-mono">src/hssa.cpp</code>,
+            <code class="text-cyan-300 font-mono">src/unified_engine.cpp</code> и
+            <code class="text-cyan-300 font-mono">second_brain/popcnt_brain.cpp</code>
+            с интерактивным обучением и проверкой на 6 классах задач.
+          </p>
+        </div>
+
+        <div class="lg:col-span-4 grid grid-cols-2 gap-3 border border-slate-800 bg-slate-950/80 rounded-lg p-4">
+          <div>
+            <div class="text-xs text-slate-400">Порог резонанса VSA</div>
+            <div class="text-xl font-mono font-bold text-cyan-400 tabular-nums mt-0.5">0.400</div>
+            <div class="text-xs text-slate-400 font-mono mt-0.5">~9σ над шумом 512-бит</div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400">Утечка противоречий</div>
+            <div class="text-xl font-mono font-bold text-emerald-400 tabular-nums mt-0.5">0.00%</div>
+            <div class="text-xs text-slate-400 font-mono mt-0.5">Attractor Simplex Gate</div>
+          </div>
+          <div class="pt-2 border-t border-slate-800/80">
+            <div class="text-xs text-slate-400">Аналитический базис</div>
+            <div class="text-xl font-mono font-bold text-amber-400 tabular-nums mt-0.5">
+              {{ patchModeEnabled() ? '7 функций (v2.1)' : '5 функций (v2.0)' }}
+            </div>
+            <div class="text-xs text-slate-400 font-mono mt-0.5">
+              {{ patchModeEnabled() ? '1..x³, e^-γx, sin/cos(ωx)' : '1, x, x², sin(x), cos(x)' }}
+            </div>
+          </div>
+          <div class="pt-2 border-t border-slate-800/80">
+            <div class="text-xs text-slate-400">Фактов в памяти VSA</div>
+            <div class="text-xl font-mono font-bold text-slate-100 tabular-nums mt-0.5">{{ storedFacts().length }}</div>
+            <div class="text-xs text-slate-400 font-mono mt-0.5">
+              Страниц: {{ activePagesTelemetry() }} ({{ patchModeEnabled() ? 'v2.1 динам.' : 'v2.0 const' }})
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Global HSAA v2.0 vs Patched v2.1 Engine Mode Switcher Bar -->
+      <div class="flex flex-wrap items-center justify-between gap-4 p-3.5 rounded-lg border border-emerald-500/30 bg-slate-950/90">
+        <div class="space-y-0.5">
+          <div class="text-xs font-bold text-emerald-400 font-mono">
+            РЕЖИМ ИСПРАВЛЕНИЯ 5 СЛЕПЫХ ЗОН (HSAA v2.0 Original ↔ HSAA v2.1 Patched)
+          </div>
+          <div class="text-xs text-slate-300">
+            Переключайте движок на лету, чтобы сравнить поведение оригинального кода репозитория и пропатченной версии v2.1 во всех тестах.
+          </div>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            (click)="togglePatchMode(false)"
+            [class]="!patchModeEnabled() ? 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/50 cursor-pointer' : 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200 cursor-pointer'"
+          >
+            <mat-icon class="!text-sm !w-4 !h-4">bug_report</mat-icon>
+            <span>Оригинал v2.0 (5 слепых зон)</span>
+          </button>
+          <button
+            type="button"
+            (click)="togglePatchMode(true)"
+            [class]="patchModeEnabled() ? 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/50 cursor-pointer' : 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200 cursor-pointer'"
+          >
+            <mat-icon class="!text-sm !w-4 !h-4">verified</mat-icon>
+            <span>Патч HSAA v2.1 (Все 5 зон исправлены)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Segmented Interactive Experiment Selector (6 Test Suites) -->
+      <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-1.5 p-1.5 bg-slate-950 border border-slate-800 rounded-lg" role="tablist" aria-label="Исследовательские стенды">
+        <button
+          type="button"
+          role="tab"
+          [attr.aria-selected]="activeTab() === 'overview'"
+          (click)="setTab('overview')"
+          [class]="activeTab() === 'overview' ? 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 whitespace-nowrap shrink-0 truncate cursor-pointer' : 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 truncate cursor-pointer'"
+        >
+          <mat-icon class="!text-sm !w-4 !h-4 shrink-0">architecture</mat-icon>
+          <span class="truncate">01. Полезные модули</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          [attr.aria-selected]="activeTab() === 'trajectory'"
+          (click)="setTab('trajectory')"
+          [class]="activeTab() === 'trajectory' ? 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 whitespace-nowrap shrink-0 truncate cursor-pointer' : 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 truncate cursor-pointer'"
+        >
+          <mat-icon class="!text-sm !w-4 !h-4 shrink-0">timeline</mat-icon>
+          <span class="truncate">02. Траектории</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          [attr.aria-selected]="activeTab() === 'determinism'"
+          (click)="setTab('determinism')"
+          [class]="activeTab() === 'determinism' ? 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 whitespace-nowrap shrink-0 truncate cursor-pointer' : 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 truncate cursor-pointer'"
+        >
+          <mat-icon class="!text-sm !w-4 !h-4 shrink-0">scatter_plot</mat-icon>
+          <span class="truncate">03. Стохастика и Simplex</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          [attr.aria-selected]="activeTab() === 'formulas'"
+          (click)="setTab('formulas')"
+          [class]="activeTab() === 'formulas' ? 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 whitespace-nowrap shrink-0 truncate cursor-pointer' : 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 truncate cursor-pointer'"
+        >
+          <mat-icon class="!text-sm !w-4 !h-4 shrink-0">functions</mat-icon>
+          <span class="truncate">04. Вывод Формул</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          [attr.aria-selected]="activeTab() === 'coding_dialogue'"
+          (click)="setTab('coding_dialogue')"
+          [class]="activeTab() === 'coding_dialogue' ? 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 whitespace-nowrap shrink-0 truncate cursor-pointer' : 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 truncate cursor-pointer'"
+        >
+          <mat-icon class="!text-sm !w-4 !h-4 shrink-0">code</mat-icon>
+          <span class="truncate">05. Кодинг и Диалог</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          [attr.aria-selected]="activeTab() === 'blindspots'"
+          (click)="setTab('blindspots')"
+          [class]="activeTab() === 'blindspots' ? 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-semibold rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/40 whitespace-nowrap shrink-0 truncate cursor-pointer' : 'inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 truncate cursor-pointer'"
+        >
+          <mat-icon class="!text-sm !w-4 !h-4 shrink-0">travel_explore</mat-icon>
+          <span class="truncate">06. Слепые Зоны (5)</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ======================================================================= -->
+    <!-- TAB 1: ARCHITECTURE & REUSABLE COMPONENTS CATALOG                       -->
+    <!-- ======================================================================= -->
+    @if (activeTab() === 'overview') {
+      <section class="space-y-8">
+        <!-- Executive Matrix: Where HSAA is Strong vs Where it Fails -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div class="lg:col-span-7 border border-slate-800 bg-slate-900/40 rounded-xl p-6 space-y-4">
+            <h2 class="text-lg font-bold text-slate-100">
+              Сводная матрица пригодности: что можно забрать в другие проекты уже сегодня
+            </h2>
+            <p class="text-sm text-slate-300 leading-relaxed">
+              Репозиторий <code class="text-cyan-300 font-mono">0waldani0/HSAA</code> — это НЕ обученная большая языковая модель (в нём нет предобученных весов трансформера), а высокоскоростной нейро-символический C++20/AVX-512 рантайм. Его главная ценность — в автономных C-ABI модулях памяти и фильтрации противоречий, которые работают за микросекунды.
+            </p>
+
+            <div class="overflow-x-auto">
+              <table class="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr class="border-b border-slate-800 text-slate-400">
+                    <th class="py-2.5 pr-4 font-semibold">Подсистема / Аспект</th>
+                    <th class="py-2.5 px-3 font-semibold">Механизм в коде</th>
+                    <th class="py-2.5 px-3 font-semibold text-right">Оценка обобщения</th>
+                    <th class="py-2.5 pl-3 font-semibold">Вердикт для переиспользования</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800/70">
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 pr-4 font-medium text-slate-100">Ассоциативная VSA память и исправление опечаток</td>
+                    <td class="py-2.5 px-3 font-mono text-slate-300">512-bit XNOR + SimHash триграмм</td>
+                    <td class="py-2.5 px-3 text-right font-mono text-emerald-400 tabular-nums">9.6 / 10</td>
+                    <td class="py-2.5 pl-3 text-slate-300">Идеально как сверхбыстрый кэш фактов и RAG-фильтр</td>
+                  </tr>
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 pr-4 font-medium text-slate-100">Блокировка галлюцинаций (Simplex Gate)</td>
+                    <td class="py-2.5 px-3 font-mono text-slate-300">hssa_project_simplex (p* = 0.0)</td>
+                    <td class="py-2.5 px-3 text-right font-mono text-emerald-400 tabular-nums">9.4 / 10</td>
+                    <td class="py-2.5 pl-3 text-slate-300">Готовый LogitsProcessor для любой внешней LLM</td>
+                  </tr>
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 pr-4 font-medium text-slate-100">Прогноз траекторий (интерполяция vs будущее)</td>
+                    <td class="py-2.5 px-3 font-mono text-slate-300">LOESS-2 (3×3) + 128-D RFF SGD</td>
+                    <td class="py-2.5 px-3 text-right font-mono text-cyan-400 tabular-nums">7.8 / 10</td>
+                    <td class="py-2.5 pl-3 text-slate-300">Точен внутри окна и для парабол; затухает на дальнем горизонте</td>
+                  </tr>
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 pr-4 font-medium text-slate-100">Вывод новых формул из точек (x, y)</td>
+                    <td class="py-2.5 px-3 font-mono text-slate-300">fit_analytical_basis_5 (Гаусс 5×5)</td>
+                    <td class="py-2.5 px-3 text-right font-mono text-amber-400 tabular-nums">6.5 / 10</td>
+                    <td class="py-2.5 pl-3 text-slate-300">Точен только внутри базиса [1, x, x², sin x, cos x]</td>
+                  </tr>
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 pr-4 font-medium text-slate-100">Генерация кода и переименование переменных</td>
+                    <td class="py-2.5 px-3 font-mono text-slate-300">&lt;reg_0&gt;..&lt;reg_7&gt; + CEGIS песочница</td>
+                    <td class="py-2.5 px-3 text-right font-mono text-cyan-400 tabular-nums">7.4 / 10</td>
+                    <td class="py-2.5 pl-3 text-slate-300">Регистры &lt;reg_k&gt; обобщают отлично; ZeroShot — шаблоны</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Right Column: Capability Breakdown & Quick Jump Actions -->
+          <div class="lg:col-span-5 border border-slate-800 bg-slate-900/40 rounded-xl p-6 flex flex-col justify-between space-y-5">
+            <div class="space-y-3">
+              <h3 class="text-base font-bold text-slate-100">
+                Где модель реально обобщает, а где использует эвристики
+              </h3>
+              <ul class="space-y-2.5 text-xs text-slate-300 leading-relaxed">
+                <li>
+                  <strong class="text-emerald-400">Честное математическое обобщение:</strong>
+                  1) 512-битный триграммный SimHash и XNOR-резонанс (находит факты при опечатках без перебора),
+                  2) локальная квадратичная регрессия LOESS-2 + 60 эпох градиентного спуска RFF,
+                  3) позиционные регистры области видимости <code class="font-mono text-cyan-300">&lt;reg_0&gt;..&lt;reg_7&gt;</code> при переименовании аргументов функций,
+                  4) 2/3-хоповая транзитивная дедукция по графу знаний.
+                </li>
+                <li>
+                  <strong class="text-amber-400">Жестко закодированные эвристики (Hardcoded Fallbacks):</strong>
+                  1) В <code class="font-mono text-amber-300">ZeroShotProgramSynthesizer</code> алгоритмы Дейкстры, Красно-черного дерева и Укконена выбираются по <code class="font-mono">std::string::find</code> из строковых констант,
+                  2) В System-2 аналогиях название нового концепта склеивается через <code class="font-mono">objA + "_" + sB</code>,
+                  3) Базис аналитических формул фиксирован 5 функциями с частотой <code class="font-mono">ω = 1.0</code>.
+                </li>
+              </ul>
+            </div>
+
+            <div class="pt-4 border-t border-slate-800 flex flex-wrap gap-2">
+              <button
+                type="button"
+                (click)="setTab('trajectory')"
+                class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">timeline</mat-icon>
+                <span>Проверить траектории</span>
+              </button>
+              <button
+                type="button"
+                (click)="setTab('formulas')"
+                class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">functions</mat-icon>
+                <span>Проверить вывод формул</span>
+              </button>
+              <button
+                type="button"
+                (click)="setTab('blindspots')"
+                class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">bug_report</mat-icon>
+                <span>Открыть 5 слепых зон</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Interactive HSAA v3.0 Unified End-to-End Core Workbench -->
+        @let uni = unifiedResult();
+        <div class="border border-cyan-500/40 bg-slate-900/70 rounded-xl p-6 space-y-5">
+          <div class="flex flex-wrap items-center justify-between gap-4">
+            <div class="space-y-1">
+              <div class="text-xs font-mono text-cyan-400 font-bold">
+                РЕАЛИЗОВАНО В C++20 И TS: ЕДИНОЕ ЯДРО HSAA v3.0 (HsaaUnifiedCoreV3) НА ШИНЕ h_t ∈ R^1024 ↔ z_t ∈ [0,1]^512
+              </div>
+              <h2 class="text-lg font-bold text-slate-100">
+                Единая нейро-символическая система: VSA-память + 28-слойный DeltaNet/TT16 + Спектральный базис + C++20 кодогенератор
+              </h2>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                (click)="selectUnifiedPreset('orbital_thruster_control')"
+                [class]="unifiedPreset() === 'orbital_thruster_control' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-cyan-500/20 text-cyan-300 border border-cyan-500/50 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md bg-slate-950 text-slate-400 border border-slate-800 hover:text-slate-200 cursor-pointer'"
+              >
+                1. Орбитальная тяга + Вега
+              </button>
+              <button
+                type="button"
+                (click)="selectUnifiedPreset('cryo_plasma_stabilizer')"
+                [class]="unifiedPreset() === 'cryo_plasma_stabilizer' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-cyan-500/20 text-cyan-300 border border-cyan-500/50 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md bg-slate-950 text-slate-400 border border-slate-800 hover:text-slate-200 cursor-pointer'"
+              >
+                2. Плазма ω=2.6 + Гелиос
+              </button>
+              <button
+                type="button"
+                (click)="selectUnifiedPreset('autonomous_drone_kinematics')"
+                [class]="unifiedPreset() === 'autonomous_drone_kinematics' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-cyan-500/20 text-cyan-300 border border-cyan-500/50 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md bg-slate-950 text-slate-400 border border-slate-800 hover:text-slate-200 cursor-pointer'"
+              >
+                3. Кинематика БПЛА + Титан
+              </button>
+              <button
+                type="button"
+                (click)="selectUnifiedPreset('custom_multimodal')"
+                [class]="unifiedPreset() === 'custom_multimodal' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/50 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md bg-slate-950 text-slate-400 border border-slate-800 hover:text-slate-200 cursor-pointer'"
+              >
+                4. Свой мультимодальный кадр
+              </button>
+              <a
+                href="/hsaa_v3_unified.patch"
+                download="hsaa_v3_unified.patch"
+                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-emerald-500 text-slate-950 hover:bg-emerald-400 transition-colors cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">download</mat-icon>
+                <span>Скачать C++20 патч (hsaa_v3_unified.patch)</span>
+              </a>
+            </div>
+          </div>
+
+          <!-- Interactive Multimodal Frame Constructor -->
+          <form
+            [formGroup]="unifiedCustomForm"
+            (ngSubmit)="runCustomUnifiedV3()"
+            class="border border-slate-800 bg-slate-950/90 rounded-lg p-4 space-y-3 text-xs"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="font-bold text-slate-200">
+                Интерактивный конструктор единого кадра UnifiedFrame (Подайте свои VSA-символы, физику траектории и сигнатуру C++20):
+              </span>
+              <span class="font-mono text-[11px] text-cyan-400">
+                Онлайн-адаптация TT16: {{ uni.jointLossInitial.toFixed(4) }} → {{ uni.jointLossFinal.toFixed(4) }} · Энергия Хопфилда ΔE = {{ uni.hopfieldEnergyDelta.toFixed(2) }}
+              </span>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
+              <label class="space-y-1">
+                <span class="text-[11px] text-slate-400">Субъект VSA (S):</span>
+                <input
+                  type="text"
+                  formControlName="querySubj"
+                  class="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                />
+              </label>
+              <label class="space-y-1">
+                <span class="text-[11px] text-slate-400">Отношение VSA (R):</span>
+                <input
+                  type="text"
+                  formControlName="queryRel"
+                  class="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                />
+              </label>
+              <label class="space-y-1">
+                <span class="text-[11px] text-slate-400">Затухание γ / Частота ω:</span>
+                <div class="grid grid-cols-2 gap-1.5">
+                  <input
+                    type="number"
+                    step="0.05"
+                    formControlName="gamma"
+                    title="Затухание γ"
+                    class="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-cyan-300 font-mono text-xs"
+                  />
+                  <input
+                    type="number"
+                    step="0.1"
+                    formControlName="omega"
+                    title="Частота ω"
+                    class="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-amber-300 font-mono text-xs"
+                  />
+                </div>
+              </label>
+              <label class="space-y-1">
+                <span class="text-[11px] text-slate-400">Имя C++ функции:</span>
+                <input
+                  type="text"
+                  formControlName="fnName"
+                  class="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-emerald-300 font-mono text-xs"
+                />
+              </label>
+              <label class="space-y-1">
+                <span class="text-[11px] text-slate-400">Регистры &lt;reg_0..2&gt;:</span>
+                <div class="grid grid-cols-3 gap-1">
+                  <input
+                    type="text"
+                    formControlName="param0"
+                    class="w-full px-1.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200 font-mono text-[11px]"
+                  />
+                  <input
+                    type="text"
+                    formControlName="param1"
+                    class="w-full px-1.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200 font-mono text-[11px]"
+                  />
+                  <input
+                    type="text"
+                    formControlName="param2"
+                    class="w-full px-1.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200 font-mono text-[11px]"
+                  />
+                </div>
+              </label>
+              <div class="flex items-end">
+                <button
+                  type="submit"
+                  class="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-xs transition-colors cursor-pointer"
+                >
+                  <mat-icon class="!text-sm !w-4 !h-4">bolt</mat-icon>
+                  <span>Синтезировать ядро</span>
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <!-- 4 Stages of the Unified Bus -->
+          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+            @for (st of uni.stages; track st.stageOrder) {
+              <div class="border border-slate-800 bg-slate-950/90 rounded-lg p-3.5 space-y-2 text-xs">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-mono text-[11px] font-bold text-cyan-400">ШАГ 0{{ st.stageOrder }}</span>
+                  <span class="font-mono text-[11px] text-emerald-400">{{ st.telemetryMetric }}</span>
+                </div>
+                <div class="font-bold text-slate-100">{{ st.stageTitle }}</div>
+                <div class="font-mono text-[11px] text-amber-300 bg-slate-900/90 px-2 py-1 rounded">
+                  {{ st.mathematicalOperator }}
+                </div>
+                <div class="text-slate-400 text-[11px] leading-relaxed">{{ st.replacedLegacySilo }}</div>
+              </div>
+            }
+          </div>
+
+          <!-- Live 1024-D Shared Latent Bus & Trajectory Extrapolation Readout -->
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+            <div class="lg:col-span-6 border border-slate-800 bg-slate-950/90 rounded-lg p-3.5 space-y-2 text-xs">
+              <div class="flex items-center justify-between gap-2">
+                <span class="font-semibold text-slate-200">
+                  Срез единой латентной шины h_t ∈ R^1024 (Синий: [0..511] VSA · Янтарный: [512..1023] Спектр):
+                </span>
+                <span class="font-mono text-[11px] text-cyan-400">Dual-Rail z_t: {{ uni.dualRailSignatureHex }}</span>
+              </div>
+              <div class="grid grid-cols-32 gap-0.5 h-12 items-end bg-slate-900/80 p-1.5 rounded border border-slate-800/80">
+                @for (ch of uni.latentBusPreview; track ch.idx) {
+                  <div
+                    [style.height.%]="20 + (ch.val >= 0 ? ch.val : -ch.val) * 75"
+                    [class]="ch.kind === 'SEMANTIC' ? 'bg-cyan-400/80 rounded-xs' : 'bg-amber-400/80 rounded-xs'"
+                    [title]="'Канал ' + ch.idx + ': ' + ch.val"
+                  ></div>
+                }
+              </div>
+              <div class="flex justify-between text-[11px] font-mono text-slate-400">
+                <span>Каналы 0..511: Резонанс VSA = {{ uni.recalledFactChain[0] }} ({{ (uni.vsaResonanceSimilarity * 100).toFixed(0) }}%)</span>
+                <span>Каналы 512..1023: γ={{ uni.neuralPredictedGamma.toFixed(2) }}, ω={{ uni.neuralPredictedOmega.toFixed(2) }}</span>
+              </div>
+            </div>
+
+            <div class="lg:col-span-6 border border-slate-800 bg-slate-950/90 rounded-lg p-3.5 space-y-2 text-xs">
+              <div class="flex items-center justify-between gap-2">
+                <span class="font-semibold text-slate-200">
+                  Синхронный прогноз траектории из подпространства h_t[512..1023] (Интерполяция + Экстраполяция):
+                </span>
+                <span class="font-mono text-[11px] text-emerald-400">MSE = {{ uni.formulaFitMse.toExponential(2) }}</span>
+              </div>
+              <div class="grid grid-cols-4 sm:grid-cols-8 gap-1.5 pt-0.5">
+                @for (pt of uni.evalSeries.slice(8, 16); track pt.x) {
+                  <div
+                    [class]="!pt.inHull ? 'p-1.5 rounded border border-amber-500/40 bg-amber-500/10 font-mono text-[10px]' : 'p-1.5 rounded border border-slate-800 bg-slate-900 font-mono text-[10px]'"
+                  >
+                    <div class="text-slate-400">t={{ pt.x.toFixed(1) }}{{ !pt.inHull ? '*' : '' }}</div>
+                    <div class="text-slate-100 font-bold">{{ pt.yUnified.toFixed(2) }}</div>
+                  </div>
+                }
+              </div>
+              <div class="text-[11px] font-mono text-slate-400">
+                Выведенный закон: <strong class="text-amber-300">{{ uni.discoveredFormula }}</strong> (* — прогноз будущего вне окна обучения)
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+            <div class="lg:col-span-6 bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-2">
+              <div class="flex items-center justify-between gap-2 text-xs">
+                <span class="font-semibold text-emerald-300 font-mono">Сгенерированный единым контуром C++20 модуль:</span>
+                <span class="font-mono text-[11px] text-slate-400">
+                  Регистры: {{ uni.paramNames.join(' · ') }}
+                </span>
+              </div>
+              <pre class="text-[11px] font-mono text-emerald-300 overflow-x-auto leading-relaxed whitespace-pre">{{ uni.synthesizedUnifiedCpp }}</pre>
+            </div>
+
+            <div class="lg:col-span-6 bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-2">
+              <div class="flex items-center justify-between gap-2 text-xs">
+                <span class="font-semibold text-cyan-300 font-mono">C++20 структура единого ядра HsaaUnifiedCoreV3:</span>
+                <span class="font-mono text-[11px] text-slate-400">Патч в /public/hsaa_v3_unified.patch (223 строки)</span>
+              </div>
+              <pre class="text-[11px] font-mono text-cyan-200 overflow-x-auto leading-relaxed whitespace-pre">{{ uni.unifiedCppArchitectureBlueprint }}</pre>
+            </div>
+          </div>
+
+          <!-- Radical Honesty Self-Audit Report -->
+          <div class="border border-amber-500/30 bg-slate-950/90 rounded-lg p-4 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <mat-icon class="text-amber-400 !text-base !w-4 !h-4">fact_check</mat-icon>
+                <h3 class="text-xs font-bold text-amber-300 font-mono">
+                  ИНЖЕНЕРНЫЙ САМОАУДИТ (RADICAL HONESTY SELF-AUDIT): ВЕРИФИКАЦИЯ ПАТЧА C++20, ТЕЛЕМЕТРИИ И РЕАЛЬНЫХ ПРЕДЕЛОВ СИСТЕМЫ
+                </h3>
+              </div>
+              <span class="text-[11px] font-mono text-slate-400">
+                Проверено инвариантов: {{ uni.selfAuditChecks.length }} · Отсечено фойл-противоречий Simplex Gate: {{ uni.simplexBlockedContradictions }}
+              </span>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              @for (chk of uni.selfAuditChecks; track chk.id) {
+                <div class="border border-slate-800 bg-slate-900/70 rounded-lg p-3 space-y-1.5 text-xs">
+                  <div class="flex items-center justify-between gap-2">
+                    <span
+                      [class]="chk.status === 'PATCH_FIXED' ? 'font-mono text-[10px] font-bold text-cyan-300' : chk.status === 'VERIFIED' ? 'font-mono text-[10px] font-bold text-emerald-400' : 'font-mono text-[10px] font-bold text-amber-400'"
+                    >
+                      {{ chk.status === 'PATCH_FIXED' ? '● ИСПРАВЛЕНО ПРИ АУДИТЕ' : chk.status === 'VERIFIED' ? '● ВЕРИФИЦИРОВАНО' : '▲ ЧЕСТНЫЙ ПРЕДЕЛ (OOD)' }}
+                    </span>
+                    <span class="font-mono text-[10px] text-slate-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">
+                      {{ chk.metricBadge }}
+                    </span>
+                  </div>
+                  <div class="font-bold text-slate-100">{{ chk.title }}</div>
+                  <p class="text-[11px] text-slate-400 leading-relaxed">{{ chk.findingSummary }}</p>
+                </div>
+              }
+            </div>
+          </div>
+        </div>
+
+        <!-- Filter Bar for Component Deep-Dive Cards -->
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <h2 class="text-lg font-bold text-slate-100">
+            Детальный разбор модулей репозитория ({{ filteredCatalog().length }})
+          </h2>
+          <div class="flex flex-wrap items-center gap-1 p-1 bg-slate-900 border border-slate-800 rounded-lg">
+            <button
+              type="button"
+              (click)="setCatalogFilter('ALL')"
+              [class]="catalogFilter() === 'ALL' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-slate-800 text-white whitespace-nowrap shrink-0 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer'"
+            >
+              Все модули (6)
+            </button>
+            <button
+              type="button"
+              (click)="setCatalogFilter('REUSABLE_CORE')"
+              [class]="catalogFilter() === 'REUSABLE_CORE' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-slate-800 text-emerald-300 whitespace-nowrap shrink-0 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer'"
+            >
+              Готовые C-ABI ядра (3)
+            </button>
+            <button
+              type="button"
+              (click)="setCatalogFilter('HYBRID_EXPERIMENTAL')"
+              [class]="catalogFilter() === 'HYBRID_EXPERIMENTAL' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-slate-800 text-cyan-300 whitespace-nowrap shrink-0 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer'"
+            >
+              Гибридные аппроксиматоры (2)
+            </button>
+            <button
+              type="button"
+              (click)="setCatalogFilter('ARCHITECTURAL_BLIND_SPOT')"
+              [class]="catalogFilter() === 'ARCHITECTURAL_BLIND_SPOT' ? 'px-3 py-1.5 text-xs font-semibold rounded-md bg-slate-800 text-amber-300 whitespace-nowrap shrink-0 cursor-pointer' : 'px-3 py-1.5 text-xs font-medium rounded-md text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer'"
+            >
+              Слепые зоны и баги (1)
+            </button>
+          </div>
+        </div>
+
+        <!-- Component Specification Cards -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          @for (item of filteredCatalog(); track item.id) {
+            <article class="border border-slate-800 bg-slate-900/40 rounded-xl p-6 flex flex-col justify-between space-y-4">
+              <div class="space-y-3">
+                <div class="flex items-center justify-between gap-4 text-xs text-slate-400 font-mono">
+                  <span>{{ item.sourceFiles.join(' · ') }}</span>
+                  <span class="text-cyan-400 font-semibold tabular-nums">Пригодность: {{ item.reusabilityScore }}/10</span>
+                </div>
+
+                <h3 class="text-base font-bold text-slate-100">
+                  {{ item.title }}
+                </h3>
+
+                <p class="text-xs text-slate-300 leading-relaxed">
+                  {{ item.summary }}
+                </p>
+
+                <div class="bg-slate-950 border border-slate-800/90 rounded-lg px-3.5 py-2.5 font-mono text-xs text-cyan-300 overflow-x-auto">
+                  {{ item.mathematicalFormulation }}
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+                  <div class="space-y-1.5">
+                    <div class="text-xs font-semibold text-emerald-400">Где сильна и применима:</div>
+                    <ul class="space-y-1 text-xs text-slate-300 list-disc list-inside">
+                      @for (strength of item.whereItExcels; track strength) {
+                        <li>{{ strength }}</li>
+                      }
+                    </ul>
+                  </div>
+
+                  <div class="space-y-1.5">
+                    <div class="text-xs font-semibold text-amber-400">Ограничения и неизвестные места:</div>
+                    <ul class="space-y-1 text-xs text-slate-300 list-disc list-inside">
+                      @for (lim of item.limitationsAndUnknowns; track lim) {
+                        <li>{{ lim }}</li>
+                      }
+                    </ul>
+                  </div>
+                </div>
+              </div>
+
+              <div class="space-y-2 pt-3 border-t border-slate-800/80">
+                <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 font-mono">
+                  <span>Латентность: {{ item.latencyProfile }}</span>
+                  <span>Память: {{ item.memoryFootprint }}</span>
+                </div>
+                <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-[11px] font-mono text-slate-300 overflow-x-auto leading-relaxed"><code>{{ item.codeEvidenceSnippet }}</code></pre>
+              </div>
+            </article>
+          }
+        </div>
+      </section>
+    }
+
+    <!-- ======================================================================= -->
+    <!-- TAB 2: TRAJECTORY & FUTURE MOTION FORECASTING BENCHMARK                 -->
+    <!-- ======================================================================= -->
+    @if (activeTab() === 'trajectory') {
+      <section class="space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <!-- Left Parameter & Training Control Column -->
+          <div class="lg:col-span-4 border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-5">
+            <div class="space-y-1">
+              <h2 class="text-base font-bold text-slate-100">
+                Тест 1: Обучение и прогноз будущих траекторий
+              </h2>
+              <p class="text-xs text-slate-400 leading-relaxed">
+                Сравнение 3 механизмов из <code class="font-mono text-cyan-300">vsa_db.cpp</code> и <code class="font-mono text-cyan-300">unified_engine.cpp</code> на интерполяции внутри обучающего окна [x_min, x_max] и экстраполяции в будущее (x &gt; x_max).
+              </p>
+            </div>
+
+            <!-- Trajectory Law Selector -->
+            <div class="space-y-2">
+              <div class="text-xs font-semibold text-slate-300">Выберите физический закон движения:</div>
+              <div class="grid grid-cols-1 gap-2">
+                <button
+                  type="button"
+                  (click)="selectTrajectoryPreset('ballistic')"
+                  [class]="trajectoryPreset() === 'ballistic' ? 'text-left px-3.5 py-2.5 rounded-lg border border-cyan-500/50 bg-cyan-500/10 text-slate-100 text-xs font-medium cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-700 text-xs font-medium cursor-pointer'"
+                >
+                  <div class="font-semibold text-cyan-300">1. Баллистическая парабола (Внутри базиса)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">y(t) = 1.50 + 4.20·t − 0.90·t²</div>
+                </button>
+
+                <button
+                  type="button"
+                  (click)="selectTrajectoryPreset('harmonic_orbital')"
+                  [class]="trajectoryPreset() === 'harmonic_orbital' ? 'text-left px-3.5 py-2.5 rounded-lg border border-cyan-500/50 bg-cyan-500/10 text-slate-100 text-xs font-medium cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-700 text-xs font-medium cursor-pointer'"
+                >
+                  <div class="font-semibold text-cyan-300">2. Орбитальная гармоника (Частота ω = 1.0)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">y(t) = 0.50·t + 2.40·sin(t) − 1.10·cos(t)</div>
+                </button>
+
+                <button
+                  type="button"
+                  (click)="selectTrajectoryPreset('damped_chirp')"
+                  [class]="trajectoryPreset() === 'damped_chirp' ? 'text-left px-3.5 py-2.5 rounded-lg border border-amber-500/50 bg-amber-500/10 text-slate-100 text-xs font-medium cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-700 text-xs font-medium cursor-pointer'"
+                >
+                  <div class="font-semibold text-amber-300">3. Затухающий осциллятор ω = 2.6 (Вне базиса!)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">y(t) = exp(−0.35·t)·cos(2.6·t) + 0.04·t³</div>
+                </button>
+
+                <button
+                  type="button"
+                  (click)="selectTrajectoryPreset('custom')"
+                  [class]="trajectoryPreset() === 'custom' ? 'text-left px-3.5 py-2.5 rounded-lg border border-cyan-500/50 bg-cyan-500/10 text-slate-100 text-xs font-medium cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-700 text-xs font-medium cursor-pointer'"
+                >
+                  <div class="font-semibold text-slate-200">4. Пользовательский набор точек ({{ customPointsList().length }} шт.)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">Произвольные наблюдения (t_i, y_i)</div>
+                </button>
+              </div>
+            </div>
+
+            <!-- RFF SGD Hyperparameters -->
+            <div class="space-y-3 pt-2 border-t border-slate-800">
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-slate-300 font-medium">Эпохи обучения 128-D RFF (SGD):</span>
+                <span class="font-mono font-bold text-cyan-400 tabular-nums">{{ trajectoryEpochs() }} эпох</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button
+                  type="button"
+                  (click)="updateTrajectoryEpochs(-20)"
+                  class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-mono bg-slate-800 hover:bg-slate-700 rounded-md cursor-pointer"
+                >
+                  <mat-icon class="!text-sm !w-3.5 !h-3.5">remove</mat-icon>
+                  <span>20</span>
+                </button>
+                <button
+                  type="button"
+                  (click)="updateTrajectoryEpochs(20)"
+                  class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-mono bg-slate-800 hover:bg-slate-700 rounded-md cursor-pointer"
+                >
+                  <mat-icon class="!text-sm !w-3.5 !h-3.5">add</mat-icon>
+                  <span>20</span>
+                </button>
+                <button
+                  type="button"
+                  (click)="updateTrajectoryLr(trajectoryLr() === 0.30 ? 0.15 : 0.30)"
+                  class="ml-auto inline-flex items-center gap-1 px-3 py-1.5 text-xs font-mono bg-slate-800 hover:bg-slate-700 rounded-md cursor-pointer"
+                >
+                  <mat-icon class="!text-sm !w-3.5 !h-3.5">tune</mat-icon>
+                  <span>LR: {{ trajectoryLr().toFixed(2) }}</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Add Custom Observation Point Form -->
+            <form [formGroup]="customPointForm" (ngSubmit)="addCustomTrajectoryPoint()" class="space-y-3 pt-2 border-t border-slate-800">
+              <div class="text-xs font-semibold text-slate-300">Добавить обучающую точку (t, y):</div>
+              <div class="grid grid-cols-2 gap-2">
+                <label class="block text-xs text-slate-400">
+                  <span>Время t</span>
+                  <input
+                    type="number"
+                    step="0.25"
+                    formControlName="xVal"
+                    class="mt-1 w-full px-2.5 py-1.5 bg-slate-950 border border-slate-700 rounded-md text-xs font-mono text-slate-100"
+                  />
+                </label>
+                <label class="block text-xs text-slate-400">
+                  <span>Координата y(t)</span>
+                  <input
+                    type="number"
+                    step="0.2"
+                    formControlName="yVal"
+                    class="mt-1 w-full px-2.5 py-1.5 bg-slate-950 border border-slate-700 rounded-md text-xs font-mono text-slate-100"
+                  />
+                </label>
+              </div>
+              <button
+                type="submit"
+                class="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded-lg transition-colors cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">add_circle</mat-icon>
+                <span>Добавить точку и переобучить VSA + RFF</span>
+              </button>
+            </form>
+          </div>
+
+          <!-- Right Trajectory Canvas & Analytical Comparison -->
+          <div class="lg:col-span-8 space-y-6">
+            @let tr = trajectoryResult();
+            @let chart = trajectoryChartData();
+
+            <!-- Top Telemetry Cards for Trajectory Run -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">MSE Интерполяции (VSA)</div>
+                <div class="text-lg font-mono font-bold text-emerald-400 tabular-nums mt-1">
+                  {{ tr.interpolationMse.vsaHybrid.toExponential(2) }}
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">Окно [{{ tr.xMin }}, {{ tr.xMax }}]</div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">MSE Будущего (VSA LOESS+RFF)</div>
+                <div class="text-lg font-mono font-bold text-cyan-400 tabular-nums mt-1">
+                  {{ tr.extrapolationMse.vsaHybrid.toFixed(4) }}
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">0.85·LOESS2 + 0.15·RFF</div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">MSE Будущего (Basis-5)</div>
+                <div
+                  [class]="tr.usedPiecewiseFallback ? 'text-lg font-mono font-bold text-amber-400 tabular-nums mt-1' : 'text-lg font-mono font-bold text-emerald-400 tabular-nums mt-1'"
+                >
+                  {{ tr.extrapolationMse.analytical5.toFixed(4) }}
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">
+                  {{ tr.usedPiecewiseFallback ? 'Fallback: вне базиса!' : 'Точный закон найден' }}
+                </div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">Сходимость RFF (SGD)</div>
+                <div class="text-lg font-mono font-bold text-slate-100 tabular-nums mt-1">
+                  {{ tr.rffInitialMse.toFixed(2) }} → {{ tr.rffFinalMse.toFixed(3) }}
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">h = {{ tr.bandwidth.toFixed(3) }}</div>
+              </div>
+            </div>
+
+            <!-- SVG Dual-Zone Trajectory Forecast Chart -->
+            <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 class="text-sm font-bold text-slate-100">{{ tr.presetName }}</h3>
+                  <p class="text-xs text-slate-400 font-mono mt-0.5">{{ tr.formulaDescription }}</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-4 text-xs font-mono">
+                  <span class="text-slate-200">— Истинная траектория</span>
+                  <span class="text-cyan-400">- - VSA LOESS-2 + RFF</span>
+                  <span class="text-amber-400">··· Аналитический Basis-5</span>
+                </div>
+              </div>
+
+              <div class="relative bg-slate-950 border border-slate-800 rounded-lg p-2 overflow-hidden">
+                <svg
+                  viewBox="0 0 760 260"
+                  class="w-full h-64 select-none cursor-crosshair"
+                  role="img"
+                  aria-label="График интерполяции и прогноза будущей траектории"
+                >
+                  <!-- Shaded Extrapolation Zone (Future t > xMax) -->
+                  <rect
+                    [attr.x]="chart.hullSplitX"
+                    y="24"
+                    [attr.width]="716 - chart.hullSplitX"
+                    height="212"
+                    fill="rgba(6, 182, 212, 0.06)"
+                  />
+                  <line
+                    [attr.x1]="chart.hullSplitX"
+                    y1="20"
+                    [attr.x2]="chart.hullSplitX"
+                    y2="240"
+                    stroke="#06b6d4"
+                    stroke-width="1.5"
+                    stroke-dasharray="4 4"
+                  />
+                  <text
+                    [attr.x]="chart.hullSplitX - 8"
+                    y="38"
+                    text-anchor="end"
+                    fill="#94a3b8"
+                    font-size="10"
+                    font-family="JetBrains Mono, monospace"
+                  >
+                    ОБУЧЕНИЕ (Интерполяция t ≤ {{ tr.xMax }})
+                  </text>
+                  <text
+                    [attr.x]="chart.hullSplitX + 8"
+                    y="38"
+                    text-anchor="start"
+                    fill="#22d3ee"
+                    font-size="10"
+                    font-family="JetBrains Mono, monospace"
+                  >
+                    ПРОГНОЗ БУДУЩЕГО (Экстраполяция t &gt; {{ tr.xMax }})
+                  </text>
+
+                  <!-- True Trajectory Curve -->
+                  <path
+                    [attr.d]="chart.truePath"
+                    fill="none"
+                    stroke="#f8fafc"
+                    stroke-width="2"
+                  />
+
+                  <!-- Analytical 5-Basis Curve -->
+                  <path
+                    [attr.d]="chart.anaPath"
+                    fill="none"
+                    stroke="#f59e0b"
+                    stroke-width="2"
+                    stroke-dasharray="3 3"
+                  />
+
+                  <!-- VSA LOESS-2 + 128-D RFF Curve -->
+                  <path
+                    [attr.d]="chart.vsaPath"
+                    fill="none"
+                    stroke="#06b6d4"
+                    stroke-width="2.2"
+                    stroke-dasharray="7 4"
+                  />
+
+                  <!-- Interactive Data Points -->
+                  @for (pt of chart.svgPoints; track pt.raw.x) {
+                    <circle
+                      [attr.cx]="pt.cx"
+                      [attr.cy]="pt.cyVsa"
+                      [attr.r]="pt.raw.inConvexHull ? 3.2 : 4.0"
+                      [attr.fill]="pt.raw.inConvexHull ? '#06b6d4' : '#22d3ee'"
+                      class="hover:scale-150 transition-transform"
+                      (mouseenter)="hoveredTrajectoryPoint.set(pt.raw)"
+                    />
+                  }
+                </svg>
+              </div>
+
+              <!-- Hovered Point Crosshair Readout -->
+              @if (hoveredTrajectoryPoint(); as hp) {
+                <div class="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-mono tabular-nums">
+                  <span class="text-slate-300">
+                    Точка t = <strong class="text-white">{{ hp.x.toFixed(3) }}</strong>
+                    ({{ hp.inConvexHull ? 'Обучающее окно' : 'ПРОГНОЗ БУДУЩЕГО' }})
+                  </span>
+                  <span class="text-slate-200">y_ист = {{ hp.yTrue.toFixed(4) }}</span>
+                  <span class="text-cyan-400">y_VSA = {{ hp.yVsaLoessRff.toFixed(4) }}</span>
+                  <span class="text-amber-400">y_Basis5 = {{ hp.yAnalytical5.toFixed(4) }}</span>
+                  <span class="text-slate-400">Вес ядра ∑w = {{ hp.localKernelWeightSum.toExponential(2) }}</span>
+                </div>
+              }
+
+              <!-- Architectural Diagnosis Box -->
+              <div class="border border-slate-800 bg-slate-950/90 rounded-lg p-4 space-y-2">
+                <div class="text-xs font-bold text-cyan-400">
+                  Архитектурный диагноз обобщающей способности (src/vsa_db.cpp &amp; src/unified_engine.cpp):
+                </div>
+                <p class="text-xs text-slate-300 leading-relaxed">
+                  {{ tr.architecturalDiagnosis }}
+                </p>
+              </div>
+            </div>
+
+            <!-- Auto-Synthesized C++20 Kernel from Trajectory -->
+            <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-3">
+              <div class="flex items-center justify-between gap-4">
+                <h3 class="text-sm font-bold text-slate-100">
+                  Сгенерированное C++20 ядро траектории (unified_engine_synthesize_code_locked)
+                </h3>
+                <span class="text-xs font-mono text-slate-400">
+                  fit_mse = {{ tr.analyticalFitMse.toExponential(3) }}
+                </span>
+              </div>
+              <pre class="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs font-mono text-cyan-200 overflow-x-auto leading-relaxed"><code>{{ tr.synthesizedCppKernel }}</code></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    }
+
+    <!-- ======================================================================= -->
+    <!-- TAB 3: NON-DETERMINISM, TEMPERATURE & ATTRACTOR SIMPLEX GATE            -->
+    <!-- ======================================================================= -->
+    @if (activeTab() === 'determinism') {
+      @let det = determinismResult();
+      <section class="space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <!-- Left Controls Column -->
+          <div class="lg:col-span-4 border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-5">
+            <div class="space-y-1">
+              <h2 class="text-base font-bold text-slate-100">
+                Тест 2: Стохастика, бассейны Хопфилда и Simplex Gate
+              </h2>
+              <p class="text-xs text-slate-400 leading-relaxed">
+                Исследование того, когда HSAA работает побитово детерминированно, а когда переключает бассейны аттракторов Хопфилда из-за температуры T или возмущения входа σ (при 0% пропуске противоречий).
+              </p>
+            </div>
+
+            <!-- Preset Mode Buttons -->
+            <div class="space-y-2">
+              <div class="text-xs font-semibold text-slate-300">Режимы испытания:</div>
+              <div class="grid grid-cols-1 gap-2">
+                <button
+                  type="button"
+                  (click)="applyDeterminismPreset('bitwise_zero')"
+                  class="text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 hover:border-cyan-500/40 text-xs cursor-pointer"
+                >
+                  <div class="font-semibold text-emerald-400">1. Побитовый детерминизм (T = 0.00, σ = 0.00)</div>
+                  <div class="text-slate-400 font-mono text-[11px] mt-0.5">100% совпадение хэшей состояния R^1024</div>
+                </button>
+                <button
+                  type="button"
+                  (click)="applyDeterminismPreset('moderate_temp')"
+                  class="text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 hover:border-cyan-500/40 text-xs cursor-pointer"
+                >
+                  <div class="font-semibold text-cyan-400">2. Стохастический выбор (T = 0.65, σ = 0.04)</div>
+                  <div class="text-slate-400 font-mono text-[11px] mt-0.5">Сэмплирование только среди непротиворечивых токенов</div>
+                </button>
+                <button
+                  type="button"
+                  (click)="applyDeterminismPreset('chaotic_boundary')"
+                  class="text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 hover:border-amber-500/40 text-xs cursor-pointer"
+                >
+                  <div class="font-semibold text-amber-400">3. Сильный шум и инверсия бит Dual-Rail (T = 1.35, σ = 0.18)</div>
+                  <div class="text-slate-400 font-mono text-[11px] mt-0.5">Проверка барьера Simplex Gate при высокой энтропии</div>
+                </button>
+              </div>
+            </div>
+
+            <!-- Fine Parameter Controls -->
+            <div class="space-y-3 pt-2 border-t border-slate-800 text-xs">
+              <label class="block space-y-1">
+                <div class="flex justify-between">
+                  <span class="text-slate-300">Температура декодирования (T):</span>
+                  <span class="font-mono font-bold text-cyan-400 tabular-nums">{{ detTempControl.value.toFixed(2) }}</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="1.5"
+                  step="0.05"
+                  [formControl]="detTempControl"
+                  (input)="runDeterminismExperiment()"
+                  class="w-full accent-cyan-400"
+                />
+              </label>
+
+              <label class="block space-y-1">
+                <div class="flex justify-between">
+                  <span class="text-slate-300">Шум входного эмбеддинга (σ):</span>
+                  <span class="font-mono font-bold text-cyan-400 tabular-nums">{{ detNoiseControl.value.toFixed(3) }}</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="0.25"
+                  step="0.01"
+                  [formControl]="detNoiseControl"
+                  (input)="runDeterminismExperiment()"
+                  class="w-full accent-cyan-400"
+                />
+              </label>
+
+              <label class="block space-y-1">
+                <div class="flex justify-between">
+                  <span class="text-slate-300">Шаги онлайн-пластичности TT16:</span>
+                  <span class="font-mono font-bold text-emerald-400 tabular-nums">{{ detTt16StepsControl.value }} шагов</span>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="30"
+                  step="1"
+                  [formControl]="detTt16StepsControl"
+                  (input)="runDeterminismExperiment()"
+                  class="w-full accent-emerald-400"
+                />
+              </label>
+            </div>
+          </div>
+
+          <!-- Right Telemetry & Simplex Gate Verification Table -->
+          <div class="lg:col-span-8 space-y-6">
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">Побитовая идентичность</div>
+                <div class="text-lg font-mono font-bold text-cyan-400 tabular-nums mt-1">
+                  {{ det.bitwiseIdenticalRatePct.toFixed(1) }}%
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">{{ det.numTrials }} прогонов подряд</div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">Энтропия Шеннона H(Y)</div>
+                <div class="text-lg font-mono font-bold text-slate-100 tabular-nums mt-1">
+                  {{ det.shannonEntropyBits.toFixed(3) }} бит
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">Разброс ответов</div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">Инверсии бит Dual-Rail</div>
+                <div class="text-lg font-mono font-bold text-amber-400 tabular-nums mt-1">
+                  {{ det.dualRailAvgBitFlips.toFixed(1) }} / 512
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">Мост Ψ: R^1024 → [0,1]^512</div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-900/50 rounded-lg p-3.5">
+                <div class="text-xs text-slate-400">Утечка противоречий</div>
+                <div class="text-lg font-mono font-bold text-emerald-400 tabular-nums mt-1">
+                  {{ det.contradictionLeakageRatePct.toFixed(2) }}%
+                </div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5">Отсечено: {{ det.contradictionsNullifiedCount }} токен(а)</div>
+              </div>
+            </div>
+
+            <!-- Simplex Contradiction Gate Table -->
+            <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <h3 class="text-sm font-bold text-slate-100">
+                  Проекция логитов через Attractor Simplex Gate (hssa_project_simplex)
+                </h3>
+                <span class="text-xs font-mono text-emerald-400">
+                  Онлайн-обучение TT16 MSE: {{ det.tt16LossBefore.toFixed(4) }} → {{ det.tt16LossAfter.toFixed(4) }}
+                </span>
+              </div>
+
+              <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr class="border-b border-slate-800 text-slate-400">
+                      <th class="py-2 pr-3 font-semibold">Токен-кандидат</th>
+                      <th class="py-2 px-3 font-semibold">Связанный триплет (S | R | O)</th>
+                      <th class="py-2 px-3 font-semibold text-right">Сырой логит</th>
+                      <th class="py-2 px-3 font-semibold">Статус в VSA DB</th>
+                      <th class="py-2 px-3 font-semibold text-right">Вероятность p*</th>
+                      <th class="py-2 pl-3 font-semibold text-right">Частота выбора</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-800/70 font-mono">
+                    @for (cand of det.candidates; track cand.tokenId) {
+                      <tr class="hover:bg-slate-900/60">
+                        <td class="py-2.5 pr-3 font-sans font-medium text-slate-100">{{ cand.tokenLabel }}</td>
+                        <td class="py-2.5 px-3 text-slate-300">{{ cand.assertion }}</td>
+                        <td class="py-2.5 px-3 text-right text-slate-200 tabular-nums">{{ cand.rawLogit.toFixed(2) }}</td>
+                        <td class="py-2.5 px-3">
+                          @if (cand.conflictsWithMemory) {
+                            <span class="text-rose-400">✖ Конфликт (в памяти: {{ cand.conflictStoredObject }})</span>
+                          } @else {
+                            <span class="text-emerald-400">● Согласовано с VSA</span>
+                          }
+                        </td>
+                        <td class="py-2.5 px-3 text-right tabular-nums">
+                          @if (cand.conflictsWithMemory) {
+                            <span class="text-rose-400 font-bold">0.0000 (−1e9)</span>
+                          } @else {
+                            <span class="text-cyan-300 font-bold">{{ cand.probability.toFixed(4) }}</span>
+                          }
+                        </td>
+                        <td class="py-2.5 pl-3 text-right tabular-nums text-slate-200">
+                          {{ cand.selectionFrequencyPct.toFixed(1) }}%
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-950 rounded-lg p-3.5 text-xs text-slate-300 leading-relaxed">
+                {{ det.architecturalDiagnosis }}
+              </div>
+            </div>
+
+            <!-- Trial-by-Trial Hopfield Energy & Bitwise Hash Trace -->
+            <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-3">
+              <h3 class="text-sm font-bold text-slate-100">
+                Журнал прогонов: релаксация энергии Хопфилда (dE ≤ 0) и побитовый хэш состояния
+              </h3>
+              <div class="overflow-x-auto max-h-60">
+                <table class="w-full text-left border-collapse text-xs font-mono tabular-nums">
+                  <thead>
+                    <tr class="border-b border-slate-800 text-slate-400">
+                      <th class="py-2 pr-3">Прогон</th>
+                      <th class="py-2 px-3">Хэш состояния R^1024</th>
+                      <th class="py-2 px-3 text-right">Инверсий бит Ψ</th>
+                      <th class="py-2 px-3 text-right">ΔE Хопфилда</th>
+                      <th class="py-2 pl-3">Выбранный токен</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-800/60">
+                    @for (trItem of det.trials.slice(0, 10); track trItem.trialIdx) {
+                      <tr>
+                        <td class="py-1.5 pr-3 text-slate-400">#{{ trItem.trialIdx }}</td>
+                        <td class="py-1.5 px-3 text-cyan-300">0x{{ trItem.bitwiseHashHex }}</td>
+                        <td class="py-1.5 px-3 text-right text-slate-300">{{ trItem.dualRailBitFlipsFromBaseline }} бит</td>
+                        <td class="py-1.5 px-3 text-right text-emerald-400">{{ trItem.hopfieldEnergyDelta.toFixed(4) }}</td>
+                        <td class="py-1.5 pl-3 font-sans text-slate-100">{{ trItem.selectedTokenLabel }}</td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    }
+
+    <!-- ======================================================================= -->
+    <!-- TAB 4: SYMBOLIC FORMULA DISCOVERY & SYSTEM-2 ABDUCTION                  -->
+    <!-- ======================================================================= -->
+    @if (activeTab() === 'formulas') {
+      @let fm = formulaResult();
+      <section class="space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <!-- Left Controls: Choose Law & System-2 Target -->
+          <div class="lg:col-span-4 border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-5">
+            <div class="space-y-1">
+              <h2 class="text-base font-bold text-slate-100">
+                Тест 3: Вывод новых формул и поиск решений без знания ответа
+              </h2>
+              <p class="text-xs text-slate-400 leading-relaxed">
+                Проверка двух механизмов: 1) <code class="font-mono text-cyan-300">fit_analytical_basis_5</code> (вывод формулы из сырых чисел), и 2) <code class="font-mono text-cyan-300">unified_engine_synthesize_ideas</code> (System-2 абдукция и VSA-аналогии).
+              </p>
+            </div>
+
+            <div class="space-y-2">
+              <div class="text-xs font-semibold text-slate-300">Эксперимент символьного вывода формулы:</div>
+              <div class="grid grid-cols-1 gap-2">
+                <button
+                  type="button"
+                  (click)="selectFormulaPreset('kinematics_exact')"
+                  [class]="selectedLawPreset() === 'kinematics_exact' ? 'text-left px-3.5 py-2.5 rounded-lg border border-cyan-500/50 bg-cyan-500/10 text-xs cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+                >
+                  <div class="font-semibold text-emerald-400">1. Неизвестный квадратичный закон (Успех)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">Скрытый закон: f(x) = 2.50 − 1.25·x + 0.75·x²</div>
+                </button>
+
+                <button
+                  type="button"
+                  (click)="selectFormulaPreset('harmonic_exact')"
+                  [class]="selectedLawPreset() === 'harmonic_exact' ? 'text-left px-3.5 py-2.5 rounded-lg border border-cyan-500/50 bg-cyan-500/10 text-xs cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+                >
+                  <div class="font-semibold text-emerald-400">2. Смешанный гармонический закон (Успех)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">Скрытый закон: 1.0 + 0.4·x + 1.8·sin(x) − 0.65·cos(x)</div>
+                </button>
+
+                <button
+                  type="button"
+                  (click)="selectFormulaPreset('exponential_decay_blindspot')"
+                  [class]="selectedLawPreset() === 'exponential_decay_blindspot' ? 'text-left px-3.5 py-2.5 rounded-lg border border-amber-500/50 bg-amber-500/10 text-xs cursor-pointer' : 'text-left px-3.5 py-2.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+                >
+                  <div class="font-semibold text-amber-400">3. Экспонента + куб (Выход за пределы базиса!)</div>
+                  <div class="font-mono text-[11px] text-slate-400 mt-0.5">Скрытый закон: 3.20·exp(−0.85·x) + 0.12·x³</div>
+                </button>
+              </div>
+            </div>
+
+            <div class="space-y-2 pt-3 border-t border-slate-800">
+              <label class="block text-xs text-slate-300 font-semibold">
+                Целевой узел для System-2 поиска гипотез:
+                <input
+                  type="text"
+                  [formControl]="system2TargetEntity"
+                  class="mt-1.5 w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-slate-100"
+                />
+              </label>
+              <button
+                type="button"
+                (click)="runFormulaExperiment()"
+                class="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded-lg cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">psychology</mat-icon>
+                <span>Вывести формулу и синтезировать гипотезы System-2</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Right Results: Discovered Formula, Coefficients & System-2 Hypotheses -->
+          <div class="lg:col-span-8 space-y-6">
+            <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <h3 class="text-sm font-bold text-slate-100">{{ fm.datasetName }}</h3>
+                <span class="text-xs font-mono text-slate-400">
+                  MSE аппроксимации: {{ fm.basis5Mse.toExponential(3) }} · Тест вне выборки MSE: {{ fm.heldOutTestMse.toFixed(4) }}
+                </span>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-3.5">
+                  <div class="text-xs text-slate-400">Истинный порождающий закон (скрыт от модели):</div>
+                  <div class="text-sm font-mono font-bold text-slate-100 mt-1">{{ fm.trueLaw }}</div>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-3.5">
+                  <div class="text-xs text-slate-400">Выведенная HSAA формула (Гаусс-Жордан 5×5):</div>
+                  <div
+                    [class]="fm.basis5RecognizedExact ? 'text-sm font-mono font-bold text-emerald-400 mt-1' : 'text-sm font-mono font-bold text-amber-400 mt-1'"
+                  >
+                    {{ fm.basis5Formula }}
+                  </div>
+                </div>
+              </div>
+
+              <!-- Recovered Basis-5 Weights Table -->
+              <div class="grid grid-cols-5 gap-2 text-center font-mono text-xs tabular-nums">
+                <div class="bg-slate-950 border border-slate-800 rounded-md p-2">
+                  <div class="text-slate-400 text-[11px]">c0 · [1]</div>
+                  <div class="text-cyan-300 font-bold mt-0.5">{{ fm.basis5Coeffs[0].toFixed(4) }}</div>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-md p-2">
+                  <div class="text-slate-400 text-[11px]">c1 · [x]</div>
+                  <div class="text-cyan-300 font-bold mt-0.5">{{ fm.basis5Coeffs[1].toFixed(4) }}</div>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-md p-2">
+                  <div class="text-slate-400 text-[11px]">c2 · [x²]</div>
+                  <div class="text-cyan-300 font-bold mt-0.5">{{ fm.basis5Coeffs[2].toFixed(4) }}</div>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-md p-2">
+                  <div class="text-slate-400 text-[11px]">c3 · [sin x]</div>
+                  <div class="text-cyan-300 font-bold mt-0.5">{{ fm.basis5Coeffs[3].toFixed(4) }}</div>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-md p-2">
+                  <div class="text-slate-400 text-[11px]">c4 · [cos x]</div>
+                  <div class="text-cyan-300 font-bold mt-0.5">{{ fm.basis5Coeffs[4].toFixed(4) }}</div>
+                </div>
+              </div>
+
+              <div class="border border-slate-800 bg-slate-950 rounded-lg p-3.5 text-xs text-slate-300 leading-relaxed">
+                {{ fm.architecturalVerdict }}
+              </div>
+            </div>
+
+            <!-- System-2 Counterfactual Imagination & VSA Analogy Table -->
+            <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-4">
+              <div>
+                <h3 class="text-sm font-bold text-slate-100">
+                  Поиск новых решений в графе знаний без готовых ответов (System-2 Abduction &amp; VSA Analogy)
+                </h3>
+                <p class="text-xs text-slate-400 mt-0.5">
+                  Сравните честную 2-хоповую транзитивную дедукцию (Механизм А) и параллелограммную VSA-аналогию со строковой склейкой (Механизм Б).
+                </p>
+              </div>
+
+              <div class="space-y-3">
+                @for (hyp of fm.system2Hypotheses; track hyp.subj + hyp.rel + hyp.obj) {
+                  <div class="border border-slate-800 bg-slate-950 rounded-lg p-3.5 space-y-1.5">
+                    <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                      <span [class]="hyp.isLexicalConcatArtifact ? 'text-amber-400 font-semibold' : 'text-emerald-400 font-semibold'">
+                        {{ hyp.kindTag }}
+                      </span>
+                      <span class="text-slate-400 tabular-nums">
+                        новизна = {{ hyp.noveltyScore.toFixed(2) }} · cos = {{ hyp.structuralCosine.toFixed(2) }} · dE = {{ hyp.hopfieldEnergyDelta.toFixed(1) }}
+                      </span>
+                    </div>
+                    <div class="text-sm font-mono font-bold text-slate-100">
+                      {{ hyp.subj }} | {{ hyp.rel }} | {{ hyp.obj }}
+                    </div>
+                    <div class="text-xs text-slate-300">
+                      {{ hyp.explanation }}
+                    </div>
+                  </div>
+                }
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    }
+
+    <!-- ======================================================================= -->
+    <!-- TAB 5: CODE SYNTHESIS (<reg_0>..<reg_7> & CEGIS) + LIVE VSA DIALOGUE    -->
+    <!-- ======================================================================= -->
+    @if (activeTab() === 'coding_dialogue') {
+      @let cd = codeResult();
+      <section class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <!-- Left Half: Code Synthesis & Scope-Register Induction -->
+        <div class="lg:col-span-6 border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-5">
+          <div class="space-y-1">
+            <h2 class="text-base font-bold text-slate-100">
+              Тест 4: Кодинг — Индукция регистров &lt;reg_0&gt;..&lt;reg_7&gt; и CEGIS против Шаблонов
+            </h2>
+            <p class="text-xs text-slate-400 leading-relaxed">
+              Проверьте реальное zero-shot переименование переменных через позиционные регистры области видимости (<code class="font-mono text-cyan-300">popcnt_brain.cpp</code>) и сравните с шаблонным диспетчером.
+            </p>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              (click)="selectCodeMode('SCOPE_REGISTER_INDUCTION')"
+              [class]="codeMode() === 'SCOPE_REGISTER_INDUCTION' ? 'px-3 py-2 rounded-lg border border-cyan-500/50 bg-cyan-500/15 text-xs font-semibold text-cyan-300 text-left cursor-pointer' : 'px-3 py-2 rounded-lg border border-slate-800 bg-slate-950 text-xs text-slate-300 text-left cursor-pointer'"
+            >
+              1. Scope-Register (&lt;reg_k&gt;)
+            </button>
+            <button
+              type="button"
+              (click)="selectCodeMode('CEGIS_SANDBOX_SYNTHESIS')"
+              [class]="codeMode() === 'CEGIS_SANDBOX_SYNTHESIS' ? 'px-3 py-2 rounded-lg border border-cyan-500/50 bg-cyan-500/15 text-xs font-semibold text-cyan-300 text-left cursor-pointer' : 'px-3 py-2 rounded-lg border border-slate-800 bg-slate-950 text-xs text-slate-300 text-left cursor-pointer'"
+            >
+              2. CEGIS 0/1/N/NULL Песочница
+            </button>
+            <button
+              type="button"
+              (click)="selectCodeMode('VSA_FUNCTION_TO_CODE')"
+              [class]="codeMode() === 'VSA_FUNCTION_TO_CODE' ? 'px-3 py-2 rounded-lg border border-cyan-500/50 bg-cyan-500/15 text-xs font-semibold text-cyan-300 text-left cursor-pointer' : 'px-3 py-2 rounded-lg border border-slate-800 bg-slate-950 text-xs text-slate-300 text-left cursor-pointer'"
+            >
+              3. Компиляция VSA-функции
+            </button>
+            <button
+              type="button"
+              (click)="selectCodeMode('TEMPLATE_DISPATCH_AUDIT')"
+              [class]="codeMode() === 'TEMPLATE_DISPATCH_AUDIT' ? 'px-3 py-2 rounded-lg border border-amber-500/50 bg-amber-500/15 text-xs font-semibold text-amber-300 text-left cursor-pointer' : 'px-3 py-2 rounded-lg border border-slate-800 bg-slate-950 text-xs text-slate-300 text-left cursor-pointer'"
+            >
+              4. Разоблачение ZeroShot шаблонов
+            </button>
+          </div>
+
+          @if (codeMode() === 'SCOPE_REGISTER_INDUCTION') {
+            <div class="space-y-3">
+              <label class="block text-xs text-slate-300 font-semibold">
+                Обучающая C++ функция (аргументы связываются с &lt;reg_0&gt;..&lt;reg_2&gt;):
+                <textarea
+                  rows="4"
+                  [formControl]="codeTrainCorpusControl"
+                  class="mt-1 w-full p-2.5 bg-slate-950 border border-slate-700 rounded-lg font-mono text-xs text-slate-100"
+                ></textarea>
+              </label>
+
+              <label class="block text-xs text-slate-300 font-semibold">
+                Новая сигнатура на тесте (невиданные ранее имена аргументов):
+                <input
+                  type="text"
+                  [formControl]="codeTargetSigControl"
+                  class="mt-1 w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg font-mono text-xs text-cyan-300"
+                />
+              </label>
+
+              <button
+                type="button"
+                (click)="runCodeExperiment()"
+                class="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded-lg cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">bolt</mat-icon>
+                <span>Обучить индукцию регистров и сгенерировать код</span>
+              </button>
+            </div>
+          }
+
+          <!-- Register Mapping Table -->
+          @if (cd.registerBindings.length > 0) {
+            <div class="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2">
+              <div class="text-xs font-semibold text-slate-300">Таблица связывания символических регистров области видимости:</div>
+              <div class="grid grid-cols-3 gap-2 text-xs font-mono">
+                @for (rb of cd.registerBindings; track rb.registerToken) {
+                  <div class="border border-slate-800 rounded px-2.5 py-1.5">
+                    <span class="text-slate-400">{{ rb.originalParam }}</span>
+                    <span class="text-cyan-400 mx-1">→ {{ rb.registerToken }} →</span>
+                    <span class="text-emerald-400 font-bold">{{ rb.zeroShotMappedTo }}</span>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+
+          <!-- Generated Code & AST / CEGIS Verification -->
+          <div class="space-y-2">
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+              <span [class]="cd.astBalancedValid ? 'text-emerald-400' : 'text-rose-400'">
+                {{ cd.astBalancedValid ? '● AST скобки сбалансированы' : '✖ Нарушен баланс скобок' }}
+                (узлов: {{ cd.astNodesCount }}, глубина: {{ cd.maxBracketDepth }})
+              </span>
+              <span class="text-slate-400">
+                CEGIS кандидатов: {{ cd.cegisCandidatesEvaluated }} (отсечено: {{ cd.cegisSimplexMasked }})
+              </span>
+            </div>
+            <pre class="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs font-mono text-cyan-200 overflow-x-auto leading-relaxed"><code>{{ cd.generatedCode }}</code></pre>
+            <div class="border border-slate-800 bg-slate-950 rounded-lg p-3.5 text-xs text-slate-300 leading-relaxed">
+              {{ cd.architecturalExplanation }}
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Half: Interactive VSA Dialogue, Typo SimHash & Live Fact Mutation -->
+        <div class="lg:col-span-6 border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-5">
+          <div class="space-y-1">
+            <h2 class="text-base font-bold text-slate-100">
+              Тест 5: Диалог, опечатки (SimHash 512-бит), 3-Hop вывод и перезапись фактов на лету
+            </h2>
+            <p class="text-xs text-slate-400 leading-relaxed">
+              Проверьте, как <code class="font-mono text-cyan-300">PopCountBrain</code> + <code class="font-mono text-cyan-300">VsaMemoryDatabase</code> отвечают на запросы с опечатками, строят цепочки вывода 2–3 хопа и мгновенно меняют ответы после мутации факта без переобучения весов.
+            </p>
+          </div>
+
+          <!-- Live Fact Insertion / Mutation Form -->
+          <form [formGroup]="factForm" (ngSubmit)="storeOrMutateFact()" class="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-semibold text-slate-200">Записать или перезаписать факт в VSA-память (O(1), &lt; 2 мкс):</span>
+              <span class="font-mono text-amber-400">out_active_pages = {{ activePagesTelemetry() }} · вызовов = {{ activeRulesCallCount() }}</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <input
+                type="text"
+                placeholder="Субъект"
+                 aria-label="Субъект факта"
+                formControlName="subj"
+                class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded text-xs font-mono text-slate-100"
+              />
+              <input
+                type="text"
+                placeholder="Отношение"
+                aria-label="Отношение факта"
+                formControlName="rel"
+                class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded text-xs font-mono text-slate-100"
+              />
+              <input
+                type="text"
+                placeholder="Объект"
+                aria-label="Объект факта"
+                formControlName="obj"
+                class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded text-xs font-mono text-emerald-300"
+              />
+            </div>
+            @if (factFormError()) {
+              <div class="text-xs text-rose-400">{{ factFormError() }}</div>
+            }
+            <button
+              type="submit"
+              class="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 rounded-lg cursor-pointer"
+            >
+              <mat-icon class="!text-sm !w-4 !h-4">memory</mat-icon>
+              <span>Записать / Мутировать факт в VSA-базе</span>
+            </button>
+          </form>
+
+          <!-- Interactive Query / Dialogue Probe Form -->
+          <form [formGroup]="dialogueQueryForm" (ngSubmit)="executeDialogueProbe()" class="space-y-3">
+            <div class="text-xs font-semibold text-slate-300">Проверить запрос к диалоговому ядру (попробуйте внести опечатку):</div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <input
+                type="text"
+                aria-label="Субъект запроса"
+                formControlName="subj"
+                class="px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-slate-100"
+              />
+              <input
+                type="text"
+                aria-label="Отношение запроса"
+                formControlName="rel"
+                class="px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-slate-100"
+              />
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  (click)="triggerPresetDialogueProbe('Модуль_Вегa', 'использует_архитeктуру')"
+                  class="px-2.5 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
+                >
+                  Тест опечатки
+                </button>
+                <button
+                  type="button"
+                  (click)="triggerPresetDialogueProbe('Модуль_Вега', 'требует_охлаждения')"
+                  class="px-2.5 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
+                >
+                  Тест 3-Hop дедукции
+                </button>
+                <button
+                  type="button"
+                  (click)="triggerPresetDialogueProbe('Неизвестный_Зонд_X', 'имеет_массу')"
+                  class="px-2.5 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-amber-300 rounded cursor-pointer"
+                >
+                  Тест шума (Отказ &lt; 0.40)
+                </button>
+              </div>
+
+              <button
+                type="submit"
+                class="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-cyan-400 text-slate-950 rounded-lg hover:bg-cyan-300 cursor-pointer"
+              >
+                <mat-icon class="!text-sm !w-4 !h-4">send</mat-icon>
+                <span>Запросить</span>
+              </button>
+            </div>
+          </form>
+
+          <!-- Dialogue Turn Trace Log -->
+          <div class="space-y-2.5 max-h-80 overflow-y-auto pr-1">
+            @for (turn of dialogueHistory(); track turn.id) {
+              <div class="border border-slate-800 bg-slate-950 rounded-lg p-3 space-y-1.5 text-xs">
+                <div class="flex items-center justify-between gap-2 font-mono text-[11px] text-slate-400">
+                  <span>Запрос #{{ turn.id }} · {{ turn.matchType }}</span>
+                  <span class="tabular-nums">sim = {{ turn.similarity.toFixed(2) }} · dot = ({{ turn.subjectDot512 }}, {{ turn.relationDot512 }}) · {{ turn.latencyUs.toFixed(1) }} мкс</span>
+                </div>
+                <div class="font-mono text-slate-300">{{ turn.userQuery }}</div>
+                <div
+                  [class]="turn.matchType === 'MISS_BELOW_GATE' ? 'font-mono font-bold text-amber-400' : 'font-mono font-bold text-emerald-400'"
+                >
+                  → {{ turn.engineAnswer }}
+                </div>
+                @if (turn.hopPath && turn.hopPath.length > 0) {
+                  <div class="text-[11px] font-mono text-cyan-300 pt-1 border-t border-slate-900">
+                    Цепочка вывода: {{ turn.hopPath.join('  ⇒  ') }}
+                  </div>
+                }
+              </div>
+            }
+          </div>
+        </div>
+      </section>
+    }
+
+    <!-- ======================================================================= -->
+    <!-- TAB 6: DEEP AUDIT OF BLIND SPOTS & LIVE C++20 PATCHES (v2.0 vs v2.1)    -->
+    <!-- ======================================================================= -->
+    @if (activeTab() === 'blindspots') {
+      @let demo = activeBlindSpotDemo();
+      @let patchItem = activePatchItem();
+      <section class="space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <div class="lg:col-span-5 border border-slate-800 bg-slate-900/50 rounded-xl p-5 space-y-4">
+            <div class="flex items-center justify-between gap-2">
+              <h2 class="text-base font-bold text-slate-100">
+                Тест 6: Исправление всех 5 «слепых зон» HSAA
+              </h2>
+              <span class="text-xs font-mono text-emerald-400">5 / 5 исправимы</span>
+            </div>
+            <p class="text-xs text-slate-400 leading-relaxed">
+              Да, все 5 обнаруженных слепых зон полностью исправляются математически и архитектурно! Выберите любую из 5 зон ниже, чтобы сравнить поведение оригинального кода v2.0 и пропатченного ядра v2.1, а также получить готовый C++20 патч.
+            </p>
+
+            <div class="grid grid-cols-1 gap-2.5">
+              <button
+                type="button"
+                (click)="triggerBlindSpotDemo('active-pages-freeze')"
+                [class]="demo.id === 'active-pages-freeze' ? 'text-left p-3.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-xs cursor-pointer' : 'text-left p-3.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-bold text-emerald-300">1. Инвариант out_active_pages ≡ 59</span>
+                  <span class="font-mono text-[11px] text-emerald-400">ИСПРАВЛЕНО v2.1</span>
+                </div>
+                <div class="text-slate-400 mt-1">Учет 4KB слотов AssocFactSlot4KB + инкрементальный STE и дедупликация</div>
+              </button>
+
+              <button
+                type="button"
+                (click)="triggerBlindSpotDemo('basis5-ceiling')"
+                [class]="demo.id === 'basis5-ceiling' ? 'text-left p-3.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-xs cursor-pointer' : 'text-left p-3.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-bold text-emerald-300">2. Потолок 5-элементного базиса формул</span>
+                  <span class="font-mono text-[11px] text-emerald-400">ИСПРАВЛЕНО v2.1</span>
+                </div>
+                <div class="text-slate-400 mt-1">Адаптивный 7-базис [1..x³, e^-γx, e^-γx·sin/cos(ωx)] с оценкой (γ, ω)</div>
+              </button>
+
+              <button
+                type="button"
+                (click)="triggerBlindSpotDemo('lexical-concat')"
+                [class]="demo.id === 'lexical-concat' ? 'text-left p-3.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-xs cursor-pointer' : 'text-left p-3.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-bold text-emerald-300">3. Строковая склейка objA + "_" + sB</span>
+                  <span class="font-mono text-[11px] text-emerald-400">ИСПРАВЛЕНО v2.1</span>
+                </div>
+                <div class="text-slate-400 mt-1">Декодирование argmax_c cos(v_analog, v(c)) из гипервекторного многообразия</div>
+              </button>
+
+              <button
+                type="button"
+                (click)="triggerBlindSpotDemo('static-weights')"
+                [class]="demo.id === 'static-weights' ? 'text-left p-3.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-xs cursor-pointer' : 'text-left p-3.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-bold text-emerald-300">4. Идентичные константы весов 28 слоев</span>
+                  <span class="font-mono text-[11px] text-emerald-400">ИСПРАВЛЕНО v2.1</span>
+                </div>
+                <div class="text-slate-400 mt-1">Мультимасштабная ортогональная сетка α_l ∈ [0.88..0.98] и фаз θ_l,i</div>
+              </button>
+
+              <button
+                type="button"
+                (click)="triggerBlindSpotDemo('cuda-unblended')"
+                [class]="demo.id === 'cuda-unblended' ? 'text-left p-3.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-xs cursor-pointer' : 'text-left p-3.5 rounded-lg border border-slate-800 bg-slate-950 text-xs cursor-pointer'"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-bold text-emerald-300">5. Изолированный CUDA GEMV микробенчмарк</span>
+                  <span class="font-mono text-[11px] text-emerald-400">ИСПРАВЛЕНО v2.1</span>
+                </div>
+                <div class="text-slate-400 mt-1">Замыкание выхода GPU GEMV в вектор h_t через RMSNorm Residual Gate</div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Right Inspector: Live Before/After Reproduction & C++20 Patch Code -->
+          <div class="lg:col-span-7 border border-slate-800 bg-slate-900/50 rounded-xl p-6 space-y-5">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="space-y-1">
+                <div class="text-xs font-mono text-emerald-400">СРАВНЕНИЕ ДО И ПОСЛЕ ПАТЧА (HSAA v2.0 vs v2.1)</div>
+                <h3 class="text-lg font-bold text-slate-100">{{ demo.title }}</h3>
+              </div>
+              @if (patchItem) {
+                <span class="px-2.5 py-1 rounded bg-emerald-500/15 border border-emerald-500/40 text-xs font-mono text-emerald-300">
+                  Сложность: {{ patchItem.fixComplexity }}
+                </span>
+              }
+            </div>
+
+            <div class="space-y-3 text-xs">
+              <div class="bg-slate-950 border border-slate-800 rounded-lg p-3.5 space-y-1">
+                <div class="text-slate-400">Поданный тестовый сигнал / вызов C-ABI:</div>
+                <div class="font-mono text-slate-100 text-sm">{{ demo.inputUsed }}</div>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div class="bg-slate-950 border border-amber-500/40 rounded-lg p-3.5 space-y-1">
+                  <div class="text-amber-300 font-semibold">Оригинал HSAA v2.0 (До патча):</div>
+                  <div class="font-mono text-amber-200 text-xs leading-relaxed">{{ demo.actualHsaaOutput }}</div>
+                </div>
+
+                <div class="bg-slate-950 border border-emerald-500/40 rounded-lg p-3.5 space-y-1">
+                  <div class="text-emerald-300 font-semibold">Патч HSAA v2.1 (После исправления):</div>
+                  <div class="font-mono text-emerald-200 text-xs leading-relaxed">{{ demo.patchedV21Output }}</div>
+                </div>
+              </div>
+
+              @if (patchItem) {
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-3.5 space-y-2">
+                  <div class="text-slate-300 font-semibold">Суть инженерного исправления ({{ patchItem.sourceLocation }}):</div>
+                  <div class="text-slate-300 leading-relaxed">{{ patchItem.fixMechanismSummary }}</div>
+                </div>
+
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-semibold text-cyan-300 font-mono">Готовый C++20 патч для исходника репозитория:</span>
+                    <span class="text-[11px] font-mono text-slate-400">{{ patchItem.sourceLocation }}</span>
+                  </div>
+                  <pre class="text-[11px] font-mono text-emerald-300 overflow-x-auto leading-relaxed whitespace-pre">{{ patchItem.cppPatchCode }}</pre>
+                </div>
+              }
+            </div>
+          </div>
+        </div>
+
+        <!-- Complete 5-Zone Verification Matrix -->
+        <div class="border border-slate-800 bg-slate-900/50 rounded-xl p-6 space-y-4">
+          <h3 class="text-base font-bold text-slate-100">
+            Сводная таблица верификации патчей для всех 5 слепых зон (HSAA v2.0 → v2.1)
+          </h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr class="border-b border-slate-800 text-slate-400">
+                  <th class="py-2.5 pr-3 font-semibold">Слепая зона и файл</th>
+                  <th class="py-2.5 px-3 font-semibold">Метрика до патча (v2.0)</th>
+                  <th class="py-2.5 px-3 font-semibold">Метрика после патча (v2.1)</th>
+                  <th class="py-2.5 pl-3 font-semibold">Механизм решения</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-800/70">
+                @for (p of blindSpotPatches(); track p.zoneIndex) {
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 pr-3">
+                      <div class="font-semibold text-slate-100">{{ p.zoneTitle }}</div>
+                      <div class="font-mono text-[11px] text-cyan-400 mt-0.5">{{ p.sourceLocation }}</div>
+                    </td>
+                    <td class="py-2.5 px-3 font-mono text-amber-300">{{ p.beforeMetricValue }}</td>
+                    <td class="py-2.5 px-3 font-mono text-emerald-400 font-semibold">{{ p.afterMetricValue }}</td>
+                    <td class="py-2.5 pl-3 text-slate-300">{{ p.fixMechanismSummary }}</td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    }
+  </main>
+
+  <footer class="border-t border-slate-800/80 py-5 px-6 text-xs text-slate-400">
+    <div class="max-w-[1380px] mx-auto flex flex-wrap items-center justify-between gap-4">
+      <span>Лаборатория верификации архитектуры 0waldani0/HSAA · Все тесты выполняются с реальным обучением в памяти</span>
+      <span class="font-mono tabular-nums">VSA 512-bit · DeltaNet 28L · TT16 Rank-16 · RFF 128-D</span>
+    </div>
+  </footer>
+</div>
