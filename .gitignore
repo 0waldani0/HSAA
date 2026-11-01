@@ -84,7 +84,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
-.agents/
 .aistudio/
 node_modules/
 .npm/
@@ -92,13 +91,18 @@ node_modules/
 /package-lock.json
 /metadata.json
 /server.js
-!google_ai_studio/package.json
-!google_ai_studio/metadata.json
 .env
 .env.*
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 *.pem
-kaggle_session/output/
 kaggle_endpoint.txt
+
+# ==============================================================================
+# Permanently Removed Labs / Sandboxes (Never Track, Never Push)
+# ==============================================================================
+.agents/
+colab_bridge/
+google_ai_studio/
+kaggle_session/
