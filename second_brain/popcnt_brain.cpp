@@ -11,6 +11,7 @@
 #else
 #include "../include/drs_engine.h"
 #endif
+#include <limits>
 #include <memory>
 #include <mutex>
 // =============================================================================
@@ -8823,6 +8824,7 @@ struct CodeProseTokenizer {
     static constexpr int TOK_EOS   = 2;
     static constexpr int TOK_NL    = 3;
     static constexpr int TOK_IND_1 = 4;  // <ind_1> .. <ind_8> are 4..11
+    static constexpr int OOV_BREAK = -1;   // frozen-vocabulary miss; splits the sequence
     static constexpr int TOK_REG_0 = 12; // <reg_0> .. <reg_7> are 12..19
     static constexpr int NUM_REGS  = 8;
 
@@ -8988,7 +8990,7 @@ struct CodeProseTokenizer {
                 if (i < n && line[i] == quote) ++i;
                 std::string lit = line.substr(start, i - start);
                 int id = add_missing ? add_word(lit) : get_word_id(lit);
-                if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
+                if (id >= 0) out_ids.push_back(id); else { out_ids.push_back(OOV_BREAK); ++tokenize_oov_count_; }
                 continue;
             }
             if (i + 1 < n) {
@@ -9009,7 +9011,7 @@ struct CodeProseTokenizer {
                 if (is_op2) {
                     std::string op2 = line.substr(i, 2);
                     int id = add_missing ? add_word(op2) : get_word_id(op2);
-                    if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
+                    if (id >= 0) out_ids.push_back(id); else { out_ids.push_back(OOV_BREAK); ++tokenize_oov_count_; }
                     i += 2;
                     continue;
                 }
@@ -9030,7 +9032,7 @@ struct CodeProseTokenizer {
                 }
                 std::string num = line.substr(start, i - start);
                 int id = add_missing ? add_word(num) : get_word_id(num);
-                if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
+                if (id >= 0) out_ids.push_back(id); else { out_ids.push_back(OOV_BREAK); ++tokenize_oov_count_; }
                 continue;
             }
             if (is_word_byte(c)) {
@@ -9047,12 +9049,12 @@ struct CodeProseTokenizer {
                 }
                 std::string word = line.substr(start, i - start);
                 int id = add_missing ? add_word(word) : get_word_id(word);
-                if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
+                if (id >= 0) out_ids.push_back(id); else { out_ids.push_back(OOV_BREAK); ++tokenize_oov_count_; }
                 continue;
             }
             std::string sym(1, line[i]);
             int id = add_missing ? add_word(sym) : get_word_id(sym);
-            if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
+            if (id >= 0) out_ids.push_back(id); else { out_ids.push_back(OOV_BREAK); ++tokenize_oov_count_; }
             ++i;
         }
     }
@@ -9363,9 +9365,9 @@ struct CodeProseTokenizer {
         return encoded;
     }
 
-    // Held-out encoding: never grows the trained vocabulary. Unknown words are
-    // dropped and counted, so an evaluation corpus cannot silently extend the
-    // model it is supposed to test.
+    // Held-out encoding: never grows the trained vocabulary. An unknown word
+    // emits OOV_BREAK, and the frozen encoder splits the sequence there, so no
+    // transition is ever scored across a token the model has not seen.
     std::vector<std::vector<int>> encode_corpus_segments_frozen(
         const std::string& raw_corpus,
         int64_t* out_oov_tokens
@@ -9375,9 +9377,17 @@ struct CodeProseTokenizer {
         tokenize_oov_count_ = 0;
         for (const std::string& seg : raw_segments) {
             auto seq = tokenize_segment(seg, false, true);
-            if (seq.size() > 2) {
-                encoded.push_back(std::move(seq));
+            std::vector<int> run;
+            run.reserve(seq.size());
+            for (int tok : seq) {
+                if (tok == OOV_BREAK) {
+                    if (run.size() > 2) encoded.push_back(run);
+                    run.clear();
+                } else {
+                    run.push_back(tok);
+                }
             }
+            if (run.size() > 2) encoded.push_back(std::move(run));
         }
         if (out_oov_tokens) *out_oov_tokens = tokenize_oov_count_;
         return encoded;
@@ -9871,14 +9881,17 @@ struct PopCountGenerativeLLM {
         std::memset(out, 0, sizeof(*out));
         const int64_t vocab = static_cast<int64_t>(sublinear_net->vocab_size);
         if (vocab <= 0) return false;
-        const double T = std::clamp(temperature > 0.0 ? temperature : 1.0, 0.05, 100.0);
+        const double T = std::clamp(temperature > 0.0 ? temperature : 1.0, 0.05, 1.0e6);
         out->temperature = T;
         out->uniform_ppl = static_cast<double>(vocab);
 
         int64_t oov = 0;
         auto seqs = tokenizer.encode_corpus_segments_frozen(text, &oov);
         out->oov_tokens = oov;
-        if (seqs.empty()) return false;
+        if (seqs.empty()) {
+            std::memset(out, 0, sizeof(*out));
+            return false;
+        }
 
         std::vector<int32_t> scores;
         double nll = 0.0;
@@ -9890,33 +9903,21 @@ struct PopCountGenerativeLLM {
                 const int target = seq[t + 1];
                 if (target < 0 || target >= vocab) continue;
                 sublinear_net->step_full_vocab_scores(seq[t], scores);
-                // Per-context z-standardisation: the ternary logits carry a
-                // context-dependent offset and scale, so an unnormalised softmax
-                // is dominated by whichever context has the widest score range.
-                // The transform is monotone, so the argmax (and top-1) is
-                // unchanged; it only makes densities comparable across contexts.
-                double mu = 0.0;
-                for (int32_t s : scores) mu += static_cast<double>(s);
-                mu /= static_cast<double>(scores.size());
-                double var = 0.0;
-                for (int32_t s : scores) {
-                    const double d = static_cast<double>(s) - mu;
-                    var += d * d;
-                }
-                const double sigma = std::sqrt(var / static_cast<double>(scores.size()));
-                const double inv_sigma = (sigma > 1.0e-12) ? (1.0 / sigma) : 1.0;
-
+                // Plain softmax over the raw ternary logits at one scalar
+                // temperature. No per-context centring or scaling: those make
+                // each context use a different effective temperature, so the
+                // fitted T would not transfer to another corpus.
                 double mx = -1.0e300;
                 for (int32_t s : scores) {
-                    const double v = (static_cast<double>(s) - mu) * inv_sigma / T;
+                    const double v = static_cast<double>(s) / T;
                     if (v > mx) mx = v;
                 }
                 double sum = 0.0;
                 for (int32_t s : scores) {
-                    sum += std::exp((static_cast<double>(s) - mu) * inv_sigma / T - mx);
+                    sum += std::exp(static_cast<double>(s) / T - mx);
                 }
                 nll += (mx + std::log(sum))
-                     - ((static_cast<double>(scores[static_cast<size_t>(target)]) - mu) * inv_sigma / T);
+                     - (static_cast<double>(scores[static_cast<size_t>(target)]) / T);
                 const auto best_it = std::max_element(scores.begin(), scores.end());
                 if (best_it != scores.end() &&
                     static_cast<size_t>(best_it - scores.begin()) == static_cast<size_t>(target)) {
@@ -9926,10 +9927,16 @@ struct PopCountGenerativeLLM {
             }
         }
         sublinear_net->reset_state();
-        if (scored == 0) return false;
+        if (scored == 0) {
+            std::memset(out, 0, sizeof(*out));
+            return false;
+        }
         out->tokens_scored = scored;
         out->mean_nll = nll / static_cast<double>(scored);
-        out->perplexity = std::exp(out->mean_nll);
+        // exp() overflows double above 709: report INF rather than a bogus
+        // finite number, and keep mean_nll as the usable quantity.
+        out->perplexity = (out->mean_nll < 700.0) ? std::exp(out->mean_nll)
+                                                  : std::numeric_limits<double>::infinity();
         out->top1_accuracy = 100.0 * static_cast<double>(hits) / static_cast<double>(scored);
         return true;
     }
@@ -12916,6 +12923,7 @@ struct PopCountGenerativeLLM {
         }
         MappedWeightBank* lbank = llm_bank_guard->get();
         int32_t init_err = 0, final_err = 0, unreachable = 0;
+        int eff_epochs = epochs;
         double ste_coverage = 0.0;
 
         if (lbank) {
@@ -12942,7 +12950,7 @@ struct PopCountGenerativeLLM {
                     }
                 }
             }
-            int eff_epochs = (total_tokens <= 25000)
+            eff_epochs = (total_tokens <= 25000)
                 ? epochs
                 : std::max(1, std::min(epochs, static_cast<int>(75000 / std::max<size_t>(1, total_tokens))));
             if (total_tokens > 25000) {
@@ -13078,14 +13086,14 @@ struct PopCountGenerativeLLM {
         ).count();
 
         last_trained_corpus = corpus_text;
-        last_trained_epochs = epochs;
+        last_trained_epochs = eff_epochs;
         is_trained = true;
 
         last_stats.vocab_size = tokenizer.id_to_word.size();
         last_stats.num_sequences = raw_num_sequences;
         last_stats.total_tokens = total_tokens;
         last_stats.total_transitions = (total_tokens > 50000) ? total_transitions : eval_positions;
-        last_stats.epochs = epochs;
+        last_stats.epochs = eff_epochs;
         last_stats.initial_errors = static_cast<int>(init_err);
         last_stats.final_errors = static_cast<int>(eval_positions - eval_correct);
         last_stats.replay_accuracy_percent = (eval_positions > 0)
@@ -18407,6 +18415,7 @@ POPCNT_BRAIN_API int brain_eval_heldout_perplexity(
     BrainHeldoutEval* out_eval
 ) {
     if (!brain || !text || text[0] == '\0' || !out_eval) return 0;
+    std::memset(out_eval, 0, sizeof(*out_eval));
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     if (!brain->llm_engine) return 0;
     return brain->llm_engine->eval_heldout_perplexity(text, temperature, out_eval) ? 1 : 0;
@@ -18465,7 +18474,11 @@ bool PopCountGenerativeLLM::embed_continuous_text(
         }
     }
 
-    const float inv_n_toks = 1.0f / static_cast<float>(std::max<size_t>(1, toks.size()));
+    size_t in_vocab_toks = 0;
+    for (int tok_id : toks) {
+        if (tok_id >= 0) ++in_vocab_toks;
+    }
+    const float inv_n_toks = 1.0f / static_cast<float>(std::max<size_t>(1, in_vocab_toks));
     bool all_in_vocab = !toks.empty();
     for (size_t i = 0; i < toks.size(); ++i) {
         int tid = toks[i];
@@ -18925,7 +18938,11 @@ bool PopCountGenerativeLLM::embed_dense_4096_text(
 
     // 1. Accumulate trained 4096-D token embeddings (which incorporate backprop-trained
     //    FoundationContinuousManifold weights + distributional SVD + morphological n-grams)
-    const float inv_n_toks = 1.0f / static_cast<float>(std::max<size_t>(1, toks.size()));
+    size_t in_vocab_toks = 0;
+    for (int tok_id : toks) {
+        if (tok_id >= 0) ++in_vocab_toks;
+    }
+    const float inv_n_toks = 1.0f / static_cast<float>(std::max<size_t>(1, in_vocab_toks));
     int in_vocab_count = 0;
     for (size_t i = 0; i < toks.size(); ++i) {
         int tid = toks[i];

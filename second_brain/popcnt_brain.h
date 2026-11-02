@@ -198,12 +198,15 @@ POPCNT_BRAIN_API int brain_train_file(
 );
 
 // Held-out next-token evaluation of the trained generative head.
-// Perplexity is computed as exp(mean NLL) over the in-vocabulary tokens of the
-// supplied text, where the predictive distribution is softmax over the exact
-// full-vocabulary ternary POPCNT logits divided by temperature (no shortlist,
-// no backoff prior). Out-of-vocabulary tokens are dropped by the tokenizer and
-// counted in out_oov_tokens, so a high OOV rate makes the number meaningless
-// and is reported explicitly.
+// Perplexity is exp(mean NLL) over the exact full-vocabulary ternary POPCNT
+// logits divided by temperature: softmax(s / T), no shortlist, no backoff
+// prior, no per-context rescaling. Temperature is a scalar calibration fitted
+// by the caller on training data; it cannot adapt per context, so the number is
+// directly comparable across corpora. An out-of-vocabulary token terminates the
+// sequence instead of being spliced out, so no transition is scored across a
+// token the model never saw; the count is reported in oov_tokens.
+// If mean_nll exceeds 709, exp() overflows double and perplexity is INF while
+// mean_nll stays finite - that is a calibration failure, not a number to hide.
 typedef struct {
     int64_t tokens_scored;    // transitions with a known target
     int64_t oov_tokens;       // tokens the trained vocabulary could not encode
@@ -215,6 +218,9 @@ typedef struct {
 } BrainHeldoutEval;
 
 // Returns 1 on success (brain trained and text non-empty), 0 on failure.
+// Evaluation resets the generative head's recurrent state (it must start each
+// held-out sequence from a clean state), so it must not be interleaved with a
+// live brain_generate call. The C API serialises both under brain_mutex.
 POPCNT_BRAIN_API int brain_eval_heldout_perplexity(
     PopCountBrain* brain,
     const char* text,
