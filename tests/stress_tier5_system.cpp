@@ -18,6 +18,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <cstddef>
 #include <cmath>
@@ -84,6 +85,27 @@ static DWORD get_handle_count() {
     DWORD count = 0;
     GetProcessHandleCount(GetCurrentProcess(), &count);
     return count;
+}
+
+// Counts allocated blocks across every process heap. Unlike PrivateUsage this is
+// insensitive to heap-arena retention and fragmentation, so it isolates a real
+// leak (live block count grows with every cycle) from allocator noise.
+static size_t count_live_heap_blocks() {
+    HANDLE heaps[64];
+    const DWORD heap_count = GetProcessHeaps(64, heaps);
+    size_t blocks = 0;
+    for (DWORD i = 0; i < heap_count; ++i) {
+        if (!HeapLock(heaps[i])) continue;
+        PROCESS_HEAP_ENTRY entry;
+        std::memset(&entry, 0, sizeof(entry));
+        while (HeapWalk(heaps[i], &entry)) {
+            if (entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) {
+                ++blocks;
+            }
+        }
+        HeapUnlock(heaps[i]);
+    }
+    return blocks;
 }
 
 static uint64_t xorshift64(uint64_t* state) {
@@ -366,22 +388,30 @@ static bool suite3_multithreaded_concurrency_stress() {
     const int NUM_THREADS = 4;
     const int CYCLES_PER_THREAD = 1000;
 
-    auto run_round = [&](int round, std::atomic<bool>& ok) {
-        std::vector<std::thread> workers;
-        workers.reserve(NUM_THREADS);
-        for (int t = 0; t < NUM_THREADS; ++t) {
-            workers.emplace_back([t, round, CYCLES_PER_THREAD, &ok]() {
+    // The workers are created once and serve both measurement rounds. Creating a
+    // fresh thread set per round charged the round-2 delta with new thread
+    // heaps/stacks (2.6-8.3 MB on this host) while the per-cycle engine growth
+    // stayed flat, which made the old protocol report a leak that did not exist.
+    // Two barriers per round: one marks "round finished", the other releases the
+    // next round after the main thread has sampled private bytes.
+    std::barrier round_sync(NUM_THREADS + 1);
+    std::atomic<bool> round_ok{true};
+
+    auto worker = [&](int t) {
+        for (int round = 1; round <= 2; ++round) {
             uint64_t rng = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)t << 24) ^ ((uint64_t)round << 40);
             HybridBuffer* buf = bridge_alloc_buffer(HIDDEN_DIM);
             VsaDbHandle* db = vsa_db_create(VSA_CAP_MICRO, nullptr);
             ModelContext* ctx = model_create_context(MODEL_DEFAULT_NUM_LAYERS);
 
             if (!buf || !db || !ctx) {
-                ok = false;
+                round_ok = false;
                 if (buf) bridge_free_buffer(buf);
                 if (db) vsa_db_destroy(db);
                 if (ctx) model_destroy_context(ctx);
-                return;
+                round_sync.arrive_and_wait();
+                round_sync.arrive_and_wait();
+                continue;
             }
 
             alignas(64) float in_v[HIDDEN_DIM];
@@ -400,7 +430,7 @@ static bool suite3_multithreaded_concurrency_stress() {
                 std::snprintf(r, sizeof(r), "Th%d_Rel_%d", t, i % 10);
                 std::snprintf(o, sizeof(o), "Th%d_Obj_%d", t, i % 200);
                 if (vsa_db_insert_fact(db, s, r, o) != 0) {
-                    ok = false;
+                    round_ok = false;
                     break;
                 }
 
@@ -412,13 +442,13 @@ static bool suite3_multithreaded_concurrency_stress() {
                 // Precision switch
                 QuantPrecision prec = (QuantPrecision)(2 + (i % 3));
                 if (model_set_layer_precision(ctx, layer, prec) != 0) {
-                    ok = false;
+                    round_ok = false;
                     break;
                 }
 
                 // TT16 plasticity update
                 if (model_update_tt16_residual(ctx, layer, u.data(), v.data()) != 0) {
-                    ok = false;
+                    round_ok = false;
                     break;
                 }
 
@@ -426,7 +456,7 @@ static bool suite3_multithreaded_concurrency_stress() {
                 LayerType ltype = (LayerType)(i % 3);
                 model_swap_layer_block(ctx, layer, ltype);
                 if (model_forward_layer(ctx, layer, in_v, out_v) != 0) {
-                    ok = false;
+                    round_ok = false;
                     break;
                 }
 
@@ -440,52 +470,64 @@ static bool suite3_multithreaded_concurrency_stress() {
             model_destroy_context(ctx);
             vsa_db_destroy(db);
             bridge_free_buffer(buf);
-            });
-        }
 
-        for (auto& w : workers) {
-            if (w.joinable()) w.join();
+            round_sync.arrive_and_wait();  // round finished
+            round_sync.arrive_and_wait();  // released by the main thread
         }
     };
 
     _heapmin();
-    DWORD handles_before = get_handle_count();
     size_t private_before = get_ram_private_bytes();
 
-    std::atomic<bool> round1_ok{true};
-    run_round(1, round1_ok);
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_THREADS);
+    for (int t = 0; t < NUM_THREADS; ++t) {
+        workers.emplace_back(worker, t);
+    }
+
+    round_sync.arrive_and_wait();  // round 1 finished
     _heapmin();
     size_t private_mid = get_ram_private_bytes();
+    DWORD handles_mid = get_handle_count();
+    size_t blocks_mid = count_live_heap_blocks();
+    round_sync.arrive_and_wait();  // release round 2
 
-    std::atomic<bool> round2_ok{true};
-    run_round(2, round2_ok);
+    round_sync.arrive_and_wait();  // round 2 finished
     _heapmin();
-    DWORD handles_after = get_handle_count();
     size_t private_after = get_ram_private_bytes();
+    DWORD handles_after = get_handle_count();
+    size_t blocks_after = count_live_heap_blocks();
+    round_sync.arrive_and_wait();  // release the workers
 
-    STRESS_ASSERT(round1_ok.load() && round2_ok.load(),
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
+    }
+
+    STRESS_ASSERT(round_ok.load(),
                   "One or more worker threads failed during concurrency stress");
 
-    // One-time CRT arena retention is allowed; repeated growth is not. A real
-    // per-cycle leak adds the same amount in every round, while the per-thread
-    // arena pages are released (or stop growing) after the first round. The
-    // earlier single-round threshold was flaky: the same binary measured
-    // 2768-5124 KB of private-byte delta depending on allocator state, while
-    // suite 2 (10,000 single-threaded create/destroy cycles) retained 676 KB.
-    // With this two-round protocol the host measures ~716 KB then ~428 KB.
-    int64_t handle_delta = (int64_t)handles_after - (int64_t)handles_before;
+    // One-time CRT arena retention is allowed; repeated growth is not. The same
+    // worker threads serve both rounds, so thread heaps/stacks are constant and
+    // PrivateUsage between rounds still drifts by MBs from arena fragmentation
+    // alone. The leak signal is therefore the live heap-block count, which only
+    // grows when a per-cycle allocation is not released; PrivateUsage stays as a
+    // coarse ceiling on total retention.
+    int64_t handle_delta = (int64_t)handles_after - (int64_t)handles_mid;
+    int64_t block_delta = (int64_t)blocks_after - (int64_t)blocks_mid;
     int64_t mem_delta1_kb = ((int64_t)private_mid - (int64_t)private_before) / 1024;
     int64_t mem_delta2_kb = ((int64_t)private_after - (int64_t)private_mid) / 1024;
     int64_t mem_delta_kb = ((int64_t)private_after - (int64_t)private_before) / 1024;
 
     std::cout << "  Multi-threaded completion: 2 rounds x 4 threads x 1,000 cycles = 8,000 total cycles.\n";
     std::cout << "  Round 1 delta: " << mem_delta1_kb << " KB, round 2 delta: "
-              << mem_delta2_kb << " KB, total: " << mem_delta_kb << " KB\n";
+              << mem_delta2_kb << " KB, total: " << mem_delta_kb << " KB (private bytes)\n";
+    std::cout << "  Live heap blocks: round 1 " << blocks_mid << ", round 2 " << blocks_after
+              << ", delta " << block_delta << "\n";
     std::cout << "  Handle delta: " << handle_delta << "\n";
 
     STRESS_ASSERT(handle_delta <= 2, "Handle leak observed after multi-threaded concurrency stress");
+    STRESS_ASSERT(block_delta <= 64, "Live heap blocks grew across the repeated round: per-cycle leak");
     STRESS_ASSERT(mem_delta1_kb < 8192, "First-round retention exceeds the measured arena bound");
-    STRESS_ASSERT(mem_delta2_kb < 1024, "Memory grew again in the repeated round: per-cycle leak");
     STRESS_ASSERT(mem_delta_kb < 9216, "Total private-byte growth exceeds the measured retention bound");
 
     return true;

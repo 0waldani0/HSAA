@@ -483,30 +483,51 @@ static bool bench_tt16_dyadic_residual_fidelity() {
 // =============================================================================
 
 // Reference GQA Implementation (Double-Precision)
+// Mirrors forward_gqa_block including the procedural base-layer projections
+// that mmod_init_base_layer_weights installs (0.88/0.12 for Q, 0.88/-0.12 for K,
+// 0.90/0.10 for V) and the deterministic per-head rotation offsets derived from
+// the layer index. Without them the reference would model a plain attention
+// block that the engine has not shipped since the online-training feature.
 static void reference_gqa_forward(const float* in_vec, float* out_vec) {
     const size_t H_Q = 8;
     const size_t H_KV = 2;
     const size_t G = 4;
     const size_t D_H = 128;
+    const size_t layer_idx = 0;
     const double scale = 0.08838834764831844; // 1.0 / sqrt(128.0)
 
     for (size_t h = 0; h < H_Q; ++h) {
         size_t kv_head = h / G;
+        const size_t rot_q = (layer_idx * 5 + h * 3 + 1) & (D_H - 1);
+        const size_t rot_k = (layer_idx * 7 + kv_head * 5 + 3) & (D_H - 1);
+        const size_t rot_v = (layer_idx * 11 + kv_head * 7 + 5) & (D_H - 1);
         const float* q_ptr = &in_vec[h * D_H];
         const float* k_ptr = &in_vec[kv_head * D_H];
         const float* v_ptr = &in_vec[512 + kv_head * D_H];
         float* out_ptr = &out_vec[h * D_H];
 
+        double q_proj[D_H];
+        double k_proj[D_H];
+        double v_proj[D_H];
+        for (size_t j = 0; j < D_H; ++j) {
+            q_proj[j] = 0.88 * static_cast<double>(q_ptr[j])
+                      + 0.12 * static_cast<double>(q_ptr[(j + rot_q) & (D_H - 1)]);
+            k_proj[j] = 0.88 * static_cast<double>(k_ptr[j])
+                      - 0.12 * static_cast<double>(k_ptr[(j + rot_k) & (D_H - 1)]);
+            v_proj[j] = 0.90 * static_cast<double>(v_ptr[j])
+                      + 0.10 * static_cast<double>(v_ptr[(j + rot_v) & (D_H - 1)]);
+        }
+
         double score = 0.0;
         for (size_t j = 0; j < D_H; ++j) {
-            score += static_cast<double>(q_ptr[j]) * static_cast<double>(k_ptr[j]);
+            score += q_proj[j] * k_proj[j];
         }
         score *= scale;
 
         double attn_weight = 1.0 / (1.0 + std::exp(-score));
 
         for (size_t j = 0; j < D_H; ++j) {
-            out_ptr[j] = static_cast<float>(static_cast<double>(q_ptr[j]) + attn_weight * static_cast<double>(v_ptr[j]));
+            out_ptr[j] = static_cast<float>(static_cast<double>(q_ptr[j]) + attn_weight * v_proj[j]);
         }
     }
 }

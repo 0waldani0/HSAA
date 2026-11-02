@@ -4,7 +4,8 @@
 **Build:** MSVC 2022 C++20, `/arch:AVX512`; CUDA sm_86 via nvcc for the PTQ kernels.
 **Entry points:**
 - `build.bat test` - full native E2E (`tests\build_tests.bat run`).
-- `build.bat test_hssa`, `test_vsa_db`, `test_model_mod`, `test_bench`, `test_bridge` - per-module suites.
+- `build.bat test_hssa`, `test_vsa_db`, `test_model_mod`, `test_bench`, `test_bridge`, `test_unified` - per-module suites.
+- `tests\build_unified_tests.bat run` - unified engine + 256-bit ARX preimage solver (36 checks).
 - `second_brain\measur\native_measur_runner.cpp` & `tests\stress_concurrent_builds.cpp` - native C++20 causal baseline and concurrent build verification (zero Python).
 
 ---
@@ -27,7 +28,7 @@ public C-ABI:
    forward after the swap.
 5. `bench_runner`: latency/throughput are measured; accuracy is reported as N/A.
 
-Measured: **43 checks run, 43 passed, 0 failed, exit code 0.**
+Measured: **47 checks run, 47 passed, 0 failed, exit code 0.**
 
 The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 `tests/test_harness.h` only inspected source text (for example, whether
@@ -37,7 +38,8 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 
 | Suite | Command | Result |
 |---|---|---|
-| Native E2E | `build.bat test` | 43 / 43 |
+| Native E2E | `build.bat test` | 47 / 47 |
+| Unified engine + ARX solver | `tests\build_unified_tests.bat run` | 36 / 36 |
 | HSSA conformance | `build.bat test_hssa` | 6 / 6 |
 | VSA database | `build.bat test_vsa_db` | 9 / 9 |
 | model_mod | `build.bat test_model_mod` | 10 / 10 |
@@ -47,16 +49,16 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 | Tier 5 system | `tests\build_stress_tier5.bat run` | 5 / 5 |
 | Tier 5 adversarial | `tests\build_stress_tier5_adversarial.bat run` | 17 / 17 |
 | HSSA M1 | `tests\build_hssa_m1_tests.bat run` | 5 / 5 |
-| HSSA M2 (CUDA) | `tests\build_hssa_m2_tests.bat run` | 5 / 5; 28-layer step 317-372 us on an idle host (400 us SLA; loaded-host runs of 457-847 us are contention, not code), GEMV cosine 1.00000 / SQNR 137.64 dB vs CPU |
+| HSSA M2 (CUDA) | `tests\build_hssa_m2_tests.bat run` | 5 / 5; GEMV cosine 1.00000 / SQNR 137.64 dB vs CPU; average 28-layer step 253-286 us, fastest step 180-228 us, 400 us SLA. Two engine/test fixes were required to reach it: the per-layer head loop is capped at one OpenMP thread per head (a 16-thread team over 8 iterations inflated the step by several times), and the timing thread is no longer pinned to a single core (workers inherit that affinity and ran the parallel loop on 1/8 of the machine) |
 | HSSA M3 | `tests\build_hssa_m3_tests.bat run` | 8 / 8 |
-| model_mod benchmark | `tests\build_bench_model_mod.bat run` | 5 / 5 |
+| model_mod benchmark | `tests\build_bench_model_mod.bat run` | 5 / 5 (GQA min cosine 1.00000000 / SQNR 131.63 dB against a reference that includes the shipped base-layer projections) |
 | VSA hot-swap benchmark | `tests\build_bench_hot_swap.bat run` | 3 / 3 |
 | Challenger 2 | `tests\build_challenger2.bat` | 4 / 4 |
-| Adversarial stress | `tests\build_adversarial_stress.bat` | pass |
+| Adversarial stress | `tests\build_adversarial_stress.bat` | pass (24 checks; the latency mutation flip now perturbs the threshold around the measured value instead of assuming a 0.05 us floor that the faster table violates) |
 | Micro-benchmark | `tests\build_micro_bench.bat` | pass |
 | PTQ host validation | `tests\build_ptq_validation.bat run` | 5 / 5 (N/M tiling and fused rank rejections) |
-| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 65 / 65 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override, L>1000 hard context horizon, 32-layer non-linear + Riemannian SGD + 3-hop deduction, Distributional OOV Output Priors on held-out targets, and 10+ MB / 1.0 GB bank AVX-512 cache & fragmentation profiling) |
-| C-ABI probe (F22) | `second_brain\measur\build_capi_probe.bat` | exit 0 |
+| PopCount Generative LLM | `tests\build_llm_text_code_tests.bat run` | 108 / 108 (RU/EN prose, C++/Python codegen, zero-shot param renaming, live fact override, L>1000 hard context horizon, 32-layer non-linear + Riemannian SGD + 3-hop deduction, Distributional OOV Output Priors on held-out targets, and 10+ MB / 1.0 GB bank AVX-512 cache & fragmentation profiling) |
+| C-ABI probe (F22) | `second_brain\measur\build_capi_probe.bat` | exit 0 (0 failures; duplicate stores are deduplicated, see section 3) |
 | Assoc calibration | `second_brain\measur\build_assoc_calib.bat` | recall/FP table at the shipped gate |
 
 ## 3. Contract changes that earlier tests had pinned incorrectly
@@ -75,6 +77,20 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 - HSSA CUDA is a **measurement-only microbenchmark**: a synthetic 1024x1024
   matrix, GEMV and DMA are timed, and the result is not blended into the model
   state. The kernel itself is verified against a CPU reference by HSSA M2.
+- `brain_get_stats` reports the **deduplicated** count of distinct
+  (Subject, Relation) rules. Re-storing an existing fact 50 times adds 0 rules
+  (previously the probe counted calls); the C-ABI probe now pins the documented
+  dedup behaviour instead of the old call-counting behaviour.
+- `bench_layer_types_numerical_fidelity`'s GQA reference now includes the
+  shipped base-layer projections (0.88/0.12 Q, 0.88/-0.12 K, 0.90/0.10 V) with
+  the deterministic per-head rotation offsets. Without them the reference
+  modeled a plain attention block that the engine has not shipped since
+  online training landed, so every GQA iteration failed the 0.99999 gate.
+- Tier 5 suite 3 leak detection now counts **live heap blocks** across the two
+  rounds instead of comparing private bytes. The same worker threads serve both
+  rounds, so thread heaps/stacks are constant; private bytes still drifted by
+  3-8 MB per round from arena fragmentation alone (min step times unchanged,
+  block delta measured 0 across 6 consecutive runs).
 
 ## 4. Scope and limitations (no inflated claims)
 

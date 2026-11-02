@@ -44,6 +44,23 @@ static inline void strncpy_s(char* dest, size_t dest_sz, const char* src, size_t
 #endif
 #include <immintrin.h>
 #include "avx512_portable_shim.h"
+#include <algorithm>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
+/* OpenMP thread count for the per-layer head loop. Builds without /openmp
+ * (per-module test scripts) still compile: the pragma degrades to a no-op and
+ * the helper returns 1. With OpenMP the count is capped at the head count so
+ * the runtime never splits a larger team over H iterations. */
+static inline int hssa_head_omp_threads(size_t heads) noexcept {
+#if defined(_OPENMP)
+    return (int)std::min<size_t>(heads, (size_t)omp_get_max_threads());
+#else
+    (void)heads;
+    return 1;
+#endif
+}
 
 #include <cstdint>
 #include <cstddef>
@@ -493,7 +510,14 @@ static void forward_deltanet_layer(HssaLayer* layer, const float* in_vec, float*
 
     __m512 v_alpha = _mm512_set1_ps(alpha);
 
-    #pragma omp parallel for schedule(static)
+    // The head loop has exactly H iterations, so one OpenMP thread per head is
+    // the full parallel width. Without the cap the runtime split a 16-thread
+    // team over 8 iterations: half the team idled and spun at the end of every
+    // region, which inflated the average step by several times and made the
+    // per-step latency jitter widely.
+    const int omp_head_threads = hssa_head_omp_threads(H);
+
+    #pragma omp parallel for schedule(static) num_threads(omp_head_threads)
     for (int h = 0; h < (int)H; ++h) {
         const float* x_h = &in_vec[h * D_H];
         float* S_h = &layer->deltanet_state[h * D_H * D_H];

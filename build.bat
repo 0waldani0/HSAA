@@ -340,16 +340,23 @@ if not exist "%BUILD_DIR%\popcnt_brain.lib" (
     call :build_second_brain
     if errorlevel 1 exit /b 1
 )
+if not exist "%BUILD_DIR%\ptq_cuda.lib" (
+    echo [*] ptq_cuda.lib missing, building ptq first...
+    call :build_ptq
+    if errorlevel 1 exit /b 1
+)
 echo [*] Compiling Benchmark Runner Test Harness (test_bench_runner.exe)...
 if not exist "%BUILD_DIR%\obj_test_bench" mkdir "%BUILD_DIR%\obj_test_bench"
 cl.exe %MSVC_CXX_FLAGS% /I"%ROOT_DIR%include" /I"%ROOT_DIR%second_brain" /I"%ROOT_DIR%legacy_ptq" ^
     "%ROOT_DIR%src\bridge.cpp" ^
     "%ROOT_DIR%src\vsa_db.cpp" ^
     "%ROOT_DIR%src\model_mod.cpp" ^
+    "%ROOT_DIR%src\hssa.cpp" ^
     "%ROOT_DIR%src\bench_runner.cpp" ^
     "%ROOT_DIR%src\unified_engine.cpp" ^
     "%ROOT_DIR%tests\test_bench_runner.cpp" ^
     "%BUILD_DIR%\popcnt_brain.lib" ^
+    "%BUILD_DIR%\ptq_cuda.lib" ^
     /Fe:"%BUILD_DIR%\test_bench_runner.exe" /Fo:"%BUILD_DIR%\obj_test_bench\\" %LINK_FLAGS% psapi.lib
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] test_bench_runner compilation failed.

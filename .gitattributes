@@ -1,0 +1,4 @@
+# Windows batch/script entry points must be CRLF: cmd.exe fails to resolve
+# `goto :label` targets in LF-only batch files ("cannot find the batch label").
+*.bat text eol=crlf
+*.cmd text eol=crlf

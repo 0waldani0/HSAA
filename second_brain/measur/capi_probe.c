@@ -108,8 +108,11 @@ int main(void) {
     }
     size_t pages2 = 0, rules2 = 0;
     brain_get_stats(b, &pages2, &rules2);
-    printf("after 50 dup stores : active_pages=%zu active_rules=%zu (calls, not distinct)\n", pages2, rules2);
-    if (rules2 != (size_t)N_FACTS + 50) { printf("FAIL: duplicate accounting changed\n"); return 3; }
+    printf("after 50 dup stores : active_pages=%zu active_rules=%zu (deduplicated)\n", pages2, rules2);
+    // Contract (popcnt_brain.h): out_active_rules is the deduplicated count of
+    // distinct (Subject, Relation) rules, so re-storing an existing fact must
+    // not add a rule. A regression that counts calls instead is still caught.
+    if (rules2 != (size_t)N_FACTS) { printf("FAIL: duplicate stores created distinct rules (%zu vs %d)\n", rules2, N_FACTS); return 3; }
 
     int failures = 0;
     char ans[256];

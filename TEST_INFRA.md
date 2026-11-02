@@ -7,6 +7,7 @@ and the current readiness statement are in `TEST_READY.md`.
 
 - **Per-module suites** (built and run by `build.bat`):
   `test_bridge`, `test_vsa_db`, `test_model_mod`, `test_hssa`, `test_bench`,
+  `test_unified` (unified engine + ARX preimage solver),
   plus the second-brain gates (`tests\build_popcnt_backoff_tests.bat`,
   `tests\build_popcnt_selector_tests.bat`) and the C-ABI probe
   (`second_brain\measur\build_capi_probe.bat`).

@@ -2034,6 +2034,14 @@ static inline uint32_t arx_rotr32(uint32_t x, uint32_t n) noexcept {
     return (x >> n) | (x << (32U - n));
 }
 
+static inline uint32_t arx_popcount32(uint32_t x) noexcept {
+#if defined(_MSC_VER)
+    return static_cast<uint32_t>(__popcnt(x));
+#else
+    return static_cast<uint32_t>(__builtin_popcount(x));
+#endif
+}
+
 static inline uint32_t sha256_sigma0(uint32_t x) noexcept {
     return arx_rotr32(x, 2U) ^ arx_rotr32(x, 13U) ^ arx_rotr32(x, 22U);
 }
@@ -2117,7 +2125,7 @@ static void eval_arx256_rounds(
 static inline uint32_t hamming_distance_256(const uint32_t s1[8], const uint32_t s2[8]) noexcept {
     uint32_t dist = 0;
     for (int i = 0; i < 8; ++i) {
-        dist += static_cast<uint32_t>(__builtin_popcount(s1[i] ^ s2[i]));
+        dist += arx_popcount32(s1[i] ^ s2[i]);
     }
     return dist;
 }
