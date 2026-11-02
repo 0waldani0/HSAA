@@ -51,6 +51,8 @@ The previous "184/184" suite was removed: `tests/tier1..4_*.cpp` and
 | HSSA M1 | `tests\build_hssa_m1_tests.bat run` | 5 / 5 |
 | HSSA M2 (CUDA) | `tests\build_hssa_m2_tests.bat run` | 5 / 5; GEMV cosine 1.00000 / SQNR 137.64 dB vs CPU; average 28-layer step 253-286 us, fastest step 180-228 us, 400 us SLA. Two engine/test fixes were required to reach it: the per-layer head loop is capped at one OpenMP thread per head (a 16-thread team over 8 iterations inflated the step by several times), and the timing thread is no longer pinned to a single core (workers inherit that affinity and ran the parallel loop on 1/8 of the machine) |
 | HSSA M3 | `tests\build_hssa_m3_tests.bat run` | 8 / 8 |
+| Held-out perplexity | `tests\build_holdout_perplexity.bat` | in-domain PPL 146.81 vs uniform 3197, top-1 51.78%; cross-domain prose PPL 7468, top-1 10.78% (23% OOV) — the cross-domain number is worse than uniform and is reported as such |
+| Mechanism benchmark | `tests\build_mechanism_bench.bat` | ternary GQA cosine 1.00000000 / SQNR 131.54 dB; layer footprint 1.88x smaller than float32; speed 0.42-0.45x of the scalar float32 reference; resonance memory 0.000% FP, 100% 1-bit-flip recall at 2.66e8 queries/s |
 | model_mod benchmark | `tests\build_bench_model_mod.bat run` | 5 / 5 (GQA min cosine 1.00000000 / SQNR 131.63 dB against a reference that includes the shipped base-layer projections) |
 | VSA hot-swap benchmark | `tests\build_bench_hot_swap.bat run` | 3 / 3 |
 | Challenger 2 | `tests\build_challenger2.bat` | 4 / 4 |

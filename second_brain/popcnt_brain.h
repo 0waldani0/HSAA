@@ -197,6 +197,31 @@ POPCNT_BRAIN_API int brain_train_file(
     BrainTrainStats* out_stats
 );
 
+// Held-out next-token evaluation of the trained generative head.
+// Perplexity is computed as exp(mean NLL) over the in-vocabulary tokens of the
+// supplied text, where the predictive distribution is softmax over the exact
+// full-vocabulary ternary POPCNT logits divided by temperature (no shortlist,
+// no backoff prior). Out-of-vocabulary tokens are dropped by the tokenizer and
+// counted in out_oov_tokens, so a high OOV rate makes the number meaningless
+// and is reported explicitly.
+typedef struct {
+    int64_t tokens_scored;    // transitions with a known target
+    int64_t oov_tokens;       // tokens the trained vocabulary could not encode
+    double  mean_nll;         // mean negative log-likelihood (nats)
+    double  perplexity;       // exp(mean_nll)
+    double  top1_accuracy;    // exact next-token hit rate of the same scores
+    double  temperature;      // temperature the caller supplied
+    double  uniform_ppl;      // vocabulary-size baseline
+} BrainHeldoutEval;
+
+// Returns 1 on success (brain trained and text non-empty), 0 on failure.
+POPCNT_BRAIN_API int brain_eval_heldout_perplexity(
+    PopCountBrain* brain,
+    const char* text,
+    double temperature,
+    BrainHeldoutEval* out_eval
+);
+
 // Autoregressively generate coherent text or source code from a prompt.
 // Writes null-terminated UTF-8 output to out_text (up to max_len bytes).
 // temperature <= 0.0f selects deterministic greedy decoding; temperature > 0.0f

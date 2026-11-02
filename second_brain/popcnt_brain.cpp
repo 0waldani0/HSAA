@@ -3761,6 +3761,37 @@ NativeSublinearLLM(MappedWeightBank* b, int v_size, int k, bool swa, uint64_t se
         return compute_vocab_argmax_popcnt(ffn_out, vocab_pos.data(), vocab_neg.data(), vocab_size);
     }
 
+    // Exact full-vocabulary logits for the context after consuming token_id.
+    // No shortlist and no backoff prior: every vocabulary entry is scored with
+    // the same ternary POPCNT dot product, so a softmax over these values is
+    // well defined and reproducible.
+    int step_full_vocab_scores(int token_id, std::vector<int32_t>& out_scores) {
+        uint32_t eids[16];
+        int32_t escores[16];
+        step_mlgru_and_route(token_id, false, eids, escores);
+        execute_sparse_micro_experts(bank->base_ptr, mlgru_out, eids, top_k, ffn_out);
+
+        uint64_t sign_bits[WORDS_PER_VEC];
+        uint64_t mag_planes[NUM_BIT_PLANES][WORDS_PER_VEC];
+        pack_activation_bitplanes(ffn_out, sign_bits, mag_planes);
+
+        out_scores.assign(static_cast<size_t>(vocab_size), 0);
+        int best_v = 0;
+        int32_t best_score = -1000000;
+        for (int v = 0; v < vocab_size; ++v) {
+            const uint64_t* vp = vocab_pos.data() + static_cast<size_t>(v) * WORDS_PER_VEC;
+            const uint64_t* vn = vocab_neg.data() + static_cast<size_t>(v) * WORDS_PER_VEC;
+            const int32_t s = ternary_popcnt_dot_512(vp, vn, sign_bits, mag_planes);
+            out_scores[static_cast<size_t>(v)] = s;
+            if (s > best_score) {
+                best_score = s;
+                best_v = v;
+            }
+        }
+        return best_v;
+    }
+
+
     int decide_token(const int8_t* __restrict__ ffn_out) {
         return decide_token(ffn_out, prev_prev_token_id, last_token_id);
     }
@@ -8797,6 +8828,9 @@ struct CodeProseTokenizer {
 
     std::unordered_map<std::string, int> word_to_id;
     std::vector<std::string> id_to_word;
+    // Tokens dropped because the frozen vocabulary had no id for them. Reset by
+    // encode_corpus_segments_frozen so held-out OOV pressure is reported.
+    int64_t tokenize_oov_count_ = 0;
 
     CodeProseTokenizer() {
         reset();
@@ -8954,7 +8988,7 @@ struct CodeProseTokenizer {
                 if (i < n && line[i] == quote) ++i;
                 std::string lit = line.substr(start, i - start);
                 int id = add_missing ? add_word(lit) : get_word_id(lit);
-                if (id >= 0) out_ids.push_back(id);
+                if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
                 continue;
             }
             if (i + 1 < n) {
@@ -8975,7 +9009,7 @@ struct CodeProseTokenizer {
                 if (is_op2) {
                     std::string op2 = line.substr(i, 2);
                     int id = add_missing ? add_word(op2) : get_word_id(op2);
-                    if (id >= 0) out_ids.push_back(id);
+                    if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
                     i += 2;
                     continue;
                 }
@@ -8996,7 +9030,7 @@ struct CodeProseTokenizer {
                 }
                 std::string num = line.substr(start, i - start);
                 int id = add_missing ? add_word(num) : get_word_id(num);
-                if (id >= 0) out_ids.push_back(id);
+                if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
                 continue;
             }
             if (is_word_byte(c)) {
@@ -9013,12 +9047,12 @@ struct CodeProseTokenizer {
                 }
                 std::string word = line.substr(start, i - start);
                 int id = add_missing ? add_word(word) : get_word_id(word);
-                if (id >= 0) out_ids.push_back(id);
+                if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
                 continue;
             }
             std::string sym(1, line[i]);
             int id = add_missing ? add_word(sym) : get_word_id(sym);
-            if (id >= 0) out_ids.push_back(id);
+            if (id >= 0) out_ids.push_back(id); else ++tokenize_oov_count_;
             ++i;
         }
     }
@@ -9326,6 +9360,26 @@ struct CodeProseTokenizer {
                 encoded.push_back(std::move(seq));
             }
         }
+        return encoded;
+    }
+
+    // Held-out encoding: never grows the trained vocabulary. Unknown words are
+    // dropped and counted, so an evaluation corpus cannot silently extend the
+    // model it is supposed to test.
+    std::vector<std::vector<int>> encode_corpus_segments_frozen(
+        const std::string& raw_corpus,
+        int64_t* out_oov_tokens
+    ) {
+        std::vector<std::string> raw_segments = split_training_segments(raw_corpus);
+        std::vector<std::vector<int>> encoded;
+        tokenize_oov_count_ = 0;
+        for (const std::string& seg : raw_segments) {
+            auto seq = tokenize_segment(seg, false, true);
+            if (seq.size() > 2) {
+                encoded.push_back(std::move(seq));
+            }
+        }
+        if (out_oov_tokens) *out_oov_tokens = tokenize_oov_count_;
         return encoded;
     }
 
@@ -9808,6 +9862,77 @@ struct PopCountGenerativeLLM {
     CodeProseTokenizer tokenizer;
     std::unique_ptr<AutoMappedWeightBank> llm_bank_guard;
     std::unique_ptr<NativeSublinearLLM> sublinear_net;
+
+    // Held-out perplexity over the exact full-vocabulary score distribution of
+    // the trained sublinear net. OOV tokens are dropped by the frozen tokenizer
+    // and reported separately so an evaluation corpus cannot extend the model.
+    bool eval_heldout_perplexity(const char* text, double temperature, BrainHeldoutEval* out) {
+        if (!text || !out || !sublinear_net) return false;
+        std::memset(out, 0, sizeof(*out));
+        const int64_t vocab = static_cast<int64_t>(sublinear_net->vocab_size);
+        if (vocab <= 0) return false;
+        const double T = std::clamp(temperature > 0.0 ? temperature : 1.0, 0.05, 100.0);
+        out->temperature = T;
+        out->uniform_ppl = static_cast<double>(vocab);
+
+        int64_t oov = 0;
+        auto seqs = tokenizer.encode_corpus_segments_frozen(text, &oov);
+        out->oov_tokens = oov;
+        if (seqs.empty()) return false;
+
+        std::vector<int32_t> scores;
+        double nll = 0.0;
+        int64_t scored = 0;
+        int64_t hits = 0;
+        for (const auto& seq : seqs) {
+            sublinear_net->reset_state();
+            for (size_t t = 0; t + 1 < seq.size(); ++t) {
+                const int target = seq[t + 1];
+                if (target < 0 || target >= vocab) continue;
+                sublinear_net->step_full_vocab_scores(seq[t], scores);
+                // Per-context z-standardisation: the ternary logits carry a
+                // context-dependent offset and scale, so an unnormalised softmax
+                // is dominated by whichever context has the widest score range.
+                // The transform is monotone, so the argmax (and top-1) is
+                // unchanged; it only makes densities comparable across contexts.
+                double mu = 0.0;
+                for (int32_t s : scores) mu += static_cast<double>(s);
+                mu /= static_cast<double>(scores.size());
+                double var = 0.0;
+                for (int32_t s : scores) {
+                    const double d = static_cast<double>(s) - mu;
+                    var += d * d;
+                }
+                const double sigma = std::sqrt(var / static_cast<double>(scores.size()));
+                const double inv_sigma = (sigma > 1.0e-12) ? (1.0 / sigma) : 1.0;
+
+                double mx = -1.0e300;
+                for (int32_t s : scores) {
+                    const double v = (static_cast<double>(s) - mu) * inv_sigma / T;
+                    if (v > mx) mx = v;
+                }
+                double sum = 0.0;
+                for (int32_t s : scores) {
+                    sum += std::exp((static_cast<double>(s) - mu) * inv_sigma / T - mx);
+                }
+                nll += (mx + std::log(sum))
+                     - ((static_cast<double>(scores[static_cast<size_t>(target)]) - mu) * inv_sigma / T);
+                const auto best_it = std::max_element(scores.begin(), scores.end());
+                if (best_it != scores.end() &&
+                    static_cast<size_t>(best_it - scores.begin()) == static_cast<size_t>(target)) {
+                    ++hits;
+                }
+                ++scored;
+            }
+        }
+        sublinear_net->reset_state();
+        if (scored == 0) return false;
+        out->tokens_scored = scored;
+        out->mean_nll = nll / static_cast<double>(scored);
+        out->perplexity = std::exp(out->mean_nll);
+        out->top1_accuracy = 100.0 * static_cast<double>(hits) / static_cast<double>(scored);
+        return true;
+    }
 
     std::unordered_map<uint64_t, std::vector<NextTokenEntry>> horizon_tables[MAX_HORIZON + 1];
     std::unordered_map<uint64_t, std::vector<NextTokenEntry>> reg_horizon_tables[MAX_HORIZON + 1];
@@ -18273,6 +18398,18 @@ POPCNT_BRAIN_API int brain_train_file(
     std::string text((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
     if (text.empty()) return 0;
     return brain_train_corpus(brain, text.c_str(), epochs, out_stats);
+}
+
+POPCNT_BRAIN_API int brain_eval_heldout_perplexity(
+    PopCountBrain* brain,
+    const char* text,
+    double temperature,
+    BrainHeldoutEval* out_eval
+) {
+    if (!brain || !text || text[0] == '\0' || !out_eval) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine) return 0;
+    return brain->llm_engine->eval_heldout_perplexity(text, temperature, out_eval) ? 1 : 0;
 }
 
 POPCNT_BRAIN_API int brain_generate(

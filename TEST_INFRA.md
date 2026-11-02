@@ -59,6 +59,8 @@ tests/
   stress_tier5_adversarial.cpp boundary/leak adversarial stress
   stress_model_mod.cpp         model_mod stress
   bench_model_mod.cpp          model_mod numerical fidelity benchmark
+  bench_holdout_perplexity.cpp held-out PPL on disjoint repo files (frozen tokenizer)
+  bench_mechanism_ternary_vsa.cpp ternary projection accuracy/memory/speed + resonance gate
   bench_vsa_hot_swap.cpp       vector scan / hot-swap benchmark
   test_ptq_validation.cpp      PTQ host tiling/rank rejection guards
   test_hssa_m1.cpp             HSSA M1 adversarial
