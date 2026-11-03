@@ -65,6 +65,7 @@ tests/
   bench_zeroshot_falsify.cpp   proves synthesis is corpus-independent (untrained brain test)
   bench_rule_generalization.cpp periodic sequences vs abstract rules (successor/addition)
   bench_claim_falsify.cpp     probes shipped claims on untrained / differing-corpus brains
+  bench_induction.cpp         finite DSL induction (addition, mod successor, mul, negative controls)
   note: second_brain/measur/README.md cites Python scripts (regress_par.py, sweep_slots.py,
         corpus_regression.py) that are NOT in this tree; only __pycache__ remains. The
         native acceptance_harness reproduces the 175876-transition split/seed but not

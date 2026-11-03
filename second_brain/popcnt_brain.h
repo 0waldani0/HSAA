@@ -366,6 +366,39 @@ POPCNT_BRAIN_API int brain_eval_continuous_function(
     size_t y_dim
 );
 
+// Induce a finite source-compositional scalar relation from a set of
+// demonstrations (x_samples, y_samples). Enumerates programs over variables,
+// the integer constants 0..10 and the operators +, -, *, /, mod,
+// de-duplicates them by behaviour on the examples, and keeps the smallest
+// program that fits every example within 1e-6. Writes the formula (e.g.
+// "mod((x0 + 1), 10)") to out_formula. This is induction over a finite
+// DSL, not general reasoning: sin(x)+x^2 and anything outside the DSL
+// correctly reports failure. Returns 1 on exact fit, 0 otherwise.
+// max_nodes limits program size (3..9; <=0 selects the default).
+POPCNT_BRAIN_API int brain_induce_relation(
+    PopCountBrain* brain,
+    const char* relation_name,
+    const float* x_samples,
+    const float* y_samples,
+    size_t num_examples,
+    size_t x_dim,
+    int max_nodes,
+    char* out_formula,
+    size_t max_formula_len
+);
+
+// Evaluate a relation previously installed by brain_induce_relation.
+// Returns 1 on success and writes one float to out_y, 0 on failure
+// (unknown relation, invalid argument or a postfix op that is undefined
+// at the query, e.g. division by zero).
+POPCNT_BRAIN_API int brain_eval_induced_relation(
+    PopCountBrain* brain,
+    const char* relation_name,
+    const float* x_query,
+    size_t x_dim,
+    float* out_y
+);
+
 // Infer the target entity for query_subject from an unstructured text corpus
 // that contains implicit relational co-occurrences without any fixed syntactic
 // template, using 4096-D continuous relational displacement vectors and VSA

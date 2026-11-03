@@ -14244,6 +14244,183 @@ struct ContinuousVsaFunctionApproximator {
     }
 };
 
+// ============================================================================
+// Finite inductive relation learner
+// ============================================================================
+// Enumerates compositional programs over a small scalar DSL (index variables,
+// integer constants, +, -, *, /, mod) bottom-up and de-duplicates candidates by
+// their BEHAVIOUR on the training examples (quantized output vector hash). The
+// smallest program that fits every example within 1e-6 is returned.
+//
+// Scope and honesty: this is induction over a finite set of demonstrations of
+// a source-compositional scalar law. It is NOT general reasoning: it cannot
+// learn sin(x)+x^2, mixed boolean logic, or any relation outside the DSL, and
+// it does not verify anything beyond exact fit on the given examples. It
+// exists to close the exact gap this project demonstrated: "withheld pair with
+// all constituents demonstrated" (successor / addition / modular rules).
+// ============================================================================
+
+struct InducedProgramNode {
+    uint8_t op;   // 0=VAR (arg), 1=CONST (cst), 2=ADD, 3=SUB, 4=MUL, 5=DIV, 6=MOD
+    uint8_t arg;  // variable index for op == 0
+    float cst;    // constant value for op == 1
+};
+
+struct InducedProgram {
+    std::vector<InducedProgramNode> postfix;
+    std::string formula;
+    int nodes = 0;
+};
+
+namespace induced_impl {
+
+constexpr double kExactTol = 1e-6;
+
+bool eval_postfix(const std::vector<InducedProgramNode>& post,
+                  const float* x, size_t x_dim, double& out) {
+    double st[64];
+    size_t sp = 0;
+    for (const InducedProgramNode& n : post) {
+        if (n.op == 0) {
+            if (n.arg >= x_dim || sp >= 64) return false;
+            st[sp++] = static_cast<double>(x[n.arg]);
+            continue;
+        }
+        if (n.op == 1) {
+            if (sp >= 64) return false;
+            st[sp++] = static_cast<double>(n.cst);
+            continue;
+        }
+        if (sp < 2) return false;
+        const double b = st[--sp];
+        const double a = st[--sp];
+        if (n.op == 2) st[sp++] = a + b;
+        else if (n.op == 3) st[sp++] = a - b;
+        else if (n.op == 4) st[sp++] = a * b;
+        else if (n.op == 5) { if (b == 0.0) return false; st[sp++] = a / b; }
+        else if (n.op == 6) { if (b == 0.0) return false; st[sp++] = std::fmod(a, b); }
+        else return false;
+    }
+    if (sp != 1) return false;
+    out = st[0];
+    return true;
+}
+
+std::string pop_str(std::vector<std::string>& st) {
+    std::string s = std::move(st.back());
+    st.pop_back();
+    return s;
+}
+
+std::string print_postfix(const std::vector<InducedProgramNode>& post) {
+    std::vector<std::string> st;
+    for (const InducedProgramNode& n : post) {
+        if (n.op == 0) {
+            st.push_back(std::string("x") + std::to_string(n.arg));
+        } else if (n.op == 1) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%g", n.cst);
+            st.push_back(buf);
+        } else if (n.op == 5) {
+            std::string b = pop_str(st), a = pop_str(st);
+            st.push_back("(" + a + " / " + b + ")");
+        } else if (n.op == 6) {
+            std::string b = pop_str(st), a = pop_str(st);
+            st.push_back("mod(" + a + ", " + b + ")");
+        } else {
+            std::string b = pop_str(st), a = pop_str(st);
+            const char* sym = (n.op == 2) ? " + " : (n.op == 3) ? " - " : " * ";
+            st.push_back("(" + a + sym + b + ")");
+        }
+    }
+    return st.empty() ? std::string() : st.back();
+}
+
+uint64_t hash_vec(const std::vector<double>& v) {
+    uint64_t h = 1469598103934665603ull;
+    for (double d : v) {
+        int64_t q = std::llround(d * 1e6);
+        for (int b = 0; b < 8; ++b) {
+            h ^= static_cast<uint64_t>(static_cast<uint8_t>((q >> (b * 8)) & 0xff));
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+struct Entry {
+    std::vector<InducedProgramNode> prog;
+    std::vector<double> outs;
+    double mse;
+    bool exact;
+};
+
+bool induce(const float* xs, const float* ys, size_t n, size_t x_dim,
+            int max_nodes, InducedProgram* out_prog) {
+    if (!xs || !ys || n == 0 || x_dim == 0 || !out_prog) return false;
+    max_nodes = std::max(3, std::min(max_nodes, 9));
+
+    std::unordered_map<uint64_t, size_t> seen;
+    std::vector<Entry> catalog;
+
+    auto try_add = [&](std::vector<InducedProgramNode> prog) -> bool {
+        std::vector<double> outs(n, 0.0);
+        double mse = 0.0;
+        bool exact = true;
+        for (size_t i = 0; i < n; ++i) {
+            double o = 0.0;
+            if (!eval_postfix(prog, xs + i * x_dim, x_dim, o)) return false;
+            outs[i] = o;
+            const double d = o - static_cast<double>(ys[i]);
+            mse += d * d;
+            if (std::fabs(d) > kExactTol) exact = false;
+        }
+        mse /= static_cast<double>(n);
+        const uint64_t h = hash_vec(outs);
+        if (seen.find(h) != seen.end()) return false;  // behaviour already represented
+        seen.emplace(h, catalog.size());
+        Entry e;
+        e.prog = std::move(prog);
+        e.outs = std::move(outs);
+        e.mse = mse;
+        e.exact = exact;
+        catalog.push_back(std::move(e));
+        return true;
+    };
+
+    for (size_t v = 0; v < x_dim; ++v) try_add({{0, static_cast<uint8_t>(v), 0.0f}});
+    for (int c = 0; c <= 10; ++c) try_add({{1, 0, static_cast<float>(c)}});
+
+    for (int size = 2; size <= max_nodes; ++size) {
+        const size_t before = catalog.size();
+        for (size_t ia = 0; ia < before; ++ia) {
+            if (catalog.size() >= 40000) break;
+            for (size_t ib = 0; ib < before; ++ib) {
+                if (catalog[ia].prog.size() + catalog[ib].prog.size() != static_cast<size_t>(size - 1)) continue;
+                for (uint8_t op = 2; op <= 6; ++op) {
+                    if (catalog.size() >= 40000) break;
+                    std::vector<InducedProgramNode> prog = catalog[ia].prog;
+                    prog.insert(prog.end(), catalog[ib].prog.begin(), catalog[ib].prog.end());
+                    prog.push_back({op, 0, 0.0f});
+                    try_add(std::move(prog));
+                }
+            }
+        }
+    }
+
+    const Entry* best = nullptr;
+    for (const Entry& e : catalog) {
+        if (e.exact && (best == nullptr || e.prog.size() < best->prog.size())) best = &e;
+    }
+    if (!best) return false;
+    out_prog->postfix = best->prog;
+    out_prog->nodes = static_cast<int>(best->prog.size());
+    out_prog->formula = print_postfix(best->prog);
+    return true;
+}
+
+}  // namespace induced_impl
+
 struct PopCountBrain {
     std::string bank_path;
     std::unique_ptr<AutoMappedWeightBank> bank_guard;
@@ -14254,6 +14431,7 @@ struct PopCountBrain {
     uint32_t assoc_fact_count = 0;
     HolographicSuperpositionBank holo_bank;
     ContinuousVsaFunctionApproximator cont_vsa_func;
+    std::map<std::string, InducedProgram> induced_relations;
     mutable AssocFact resolved_fact_cache;
     mutable AssocFact synthesized_multihop_fact;
     mutable std::recursive_mutex brain_mutex;
@@ -19387,6 +19565,50 @@ POPCNT_BRAIN_API int brain_eval_continuous_function(
     if (!brain || !func_name || !x_query || !out_y || x_dim == 0 || y_dim == 0) return 0;
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     return brain->cont_vsa_func.eval_function(func_name, x_query, x_dim, out_y, y_dim) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API int brain_induce_relation(
+    PopCountBrain* brain,
+    const char* relation_name,
+    const float* x_samples,
+    const float* y_samples,
+    size_t num_examples,
+    size_t x_dim,
+    int max_nodes,
+    char* out_formula,
+    size_t max_formula_len
+) {
+    if (out_formula && max_formula_len > 0) out_formula[0] = '\0';
+    if (!brain || !relation_name || !x_samples || !y_samples || num_examples == 0 || x_dim == 0) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    InducedProgram prog;
+    if (!induced_impl::induce(x_samples, y_samples, num_examples, x_dim, max_nodes, &prog)) return 0;
+    if (out_formula && max_formula_len > 0) {
+        std::snprintf(out_formula, max_formula_len, "%s", prog.formula.c_str());
+    }
+    std::string key = hsaa_assoc::normalize(relation_name);
+    if (key.empty()) key = relation_name;
+    brain->induced_relations[key] = std::move(prog);
+    return 1;
+}
+
+POPCNT_BRAIN_API int brain_eval_induced_relation(
+    PopCountBrain* brain,
+    const char* relation_name,
+    const float* x_query,
+    size_t x_dim,
+    float* out_y
+) {
+    if (!brain || !relation_name || !x_query || !out_y || x_dim == 0) return 0;
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    std::string key = hsaa_assoc::normalize(relation_name);
+    if (key.empty()) key = relation_name;
+    auto it = brain->induced_relations.find(key);
+    if (it == brain->induced_relations.end()) return 0;
+    double v = 0.0;
+    if (!induced_impl::eval_postfix(it->second.postfix, x_query, x_dim, v)) return 0;
+    *out_y = static_cast<float>(v);
+    return 1;
 }
 
 POPCNT_BRAIN_API int brain_infer_template_free_relation(

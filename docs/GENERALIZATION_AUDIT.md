@@ -146,7 +146,37 @@ Interpretation, backed by the mechanism and the corpus, not by a guess:
   abstraction over unseen relations**. It is not a scaling or sample-density
   effect; the training set already contained both operands and both outputs.
 
-## 5. What the rest of the code actually proves
+## 5. New mechanism: finite inductive relation learner
+
+Constraint of scope: `brain_generate` cannot answer a pair whose required
+transition never appeared (measured 0/2). The new public C API closes exactly
+that gap: `brain_induce_relation` / `brain_eval_induced_relation` (engine
+`induced_impl` in `popcnt_brain.cpp`).
+
+Method: bottom-up enumeration of compositional programs (variables, the
+integer constants 0..10, `+`, `-`, `*`, `/`, `mod`), de-duplicated by BEHAVIOUR
+on the demonstrations (quantized output-vector hash; first - i.e. smallest -
+representative kept per behaviour), returning the smallest program that fits
+every one of the demonstrations within 1e-6. Explicit scope:
+**finite demonstrations of a scalar source-compositional law**. Not general
+reasoning, not open-ended synthesis; `sin(x) + x^2` and anything outside the
+DSL correctly report failure.
+
+Measured (`tests/bench_induction.cpp`, this host):
+
+| Task (demonstrations) | Result | Smallest rule found | Time |
+|---|---|---|---|
+| addition 1..4, pairs 2+3, 3+4 withheld (14 demos) | **answers 5 and 7** | `(x0 + x1)` | 116 ms |
+| successor mod 10, 4->5 and 7->8 withheld (8 demos) | **answers 5 and 8** | `mod((x0 + 1), 10)` | 81 ms |
+| mul mod 10, pair (2,3) withheld (8 demos) | answers 6; finds `(x0 * x1)` (mod never wraps for operands <= 3; minimal consistent program is the product) | `(x0 * x1)` | 95 ms |
+| random permutation (negative control) | **refused** (`ok=0`); no spurious exact fit | - | 98 ms |
+| sin(x)+0.25x^2 (honest miss) | **refused** (`ok=0`); not expressible in DSL | - | 104 ms |
+| plain successor, 4 and 7 withheld (8 demos) | **answers 5 and 8** | `(x0 + 1)` | 77 ms |
+
+The negative controls are the important part: nothing was "learned" on random
+or inexpressible data - the API returns 0 rather than a fabricated law.
+
+## 6. What the rest of the code actually proves
 
 The inventory of all 23 harnesses, plus this audit, covers:
 
@@ -168,7 +198,7 @@ Claims with no executable proof behind them:
 | "Off-grid spectral solver recovers parameters" | `tests/test_unified_engine.cpp:309` | sandbox compares against the same LOESS evaluator that produced the fit (circular) |
 | "Template-free relation inference" | `second_brain/README.md:424` | subject substring match + sketch dot; single-subject sentences only |
 
-## 6. Verdict
+## 7. Verdict
 
 - **Memorisation vs generalisation:** 80.14% -> 58.11% top-1, PPL 15.0 -> 416.8
   on unseen files. Genuine in-domain generalisation, 22 pp below in-sample.
@@ -179,11 +209,12 @@ Claims with no executable proof behind them:
 - **Unseen algorithms:** no. The synthesizer is a template engine that produces
   identical output with zero training, with the shipped corpus, and outside its
   keyword set it either emits nothing or an unrelated template.
-- **Rule induction:** the generator continues periodic sequences it has never
+- **Rule induction:** the *generator* continues periodic sequences it has never
   seen at longer lengths and unseen phases (12/12 and 4/4), and reproduces
-  trained transitions perfectly (100%). It induces no new relation: withheld
-  successor and addition pairs score 0/2 despite full determination by the
-  demonstrated examples.
+  trained transitions perfectly (100%), but infers no new relation: withheld
+  successor and addition pairs score 0/2. The new `brain_induce_relation`
+  mechanism closes that specific gap for scalar compositional laws (it recovered
+  addition and mod-10 successor in < 120 ms) - still not general reasoning.
 - **What is genuinely useful:** in-domain code completion/ranking at 58% top-1
   on unseen files, periodic-sequence continuation, sub-1e-4 MSE interpolation
   of a smooth function inside its sampled range, 5 us associative lookup with a

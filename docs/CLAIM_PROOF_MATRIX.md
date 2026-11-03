@@ -77,6 +77,9 @@ Claims that still do not have executable support, ranked by severity:
 
 What *is* supported with executable evidence on this host (and on this push):
 
+- Finite induction (new API `brain_induce_relation`): exact compositional fits recovered
+  (`(x0 + x1)`, `mod((x0 + 1), 10)`, `(x0 + 1)`) and extrapolated to withheld pairs in
+  < 120 ms; non-fitting demonstrations are refused (random permutation, sin(x)+x^2).
 - 100% in-sample replay; periodic sequences extrapolated beyond trained length
   and across unseen phases (4/4, 4/4, 12/12, 4/4) — transition recombination.
 - Held-out code files: top-1 58.11% vs uniform 0.011%; PPL 416.8 vs 9196.

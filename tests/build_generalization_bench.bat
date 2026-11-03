@@ -78,12 +78,28 @@ if %ERRORLEVEL% NEQ 0 (
 echo [*] Running rule-generalization benchmark...
 "%BUILD_DIR%\bench_rule_generalization.exe"
 set "RC_RG=%ERRORLEVEL%"
+echo [*] Compiling induction-relation benchmark...
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 ^
+    /I"%ROOT_DIR%\second_brain" ^
+    "%ROOT_DIR%\tests\bench_induction.cpp" ^
+    "%BUILD_DIR%\popcnt_brain.lib" ^
+    /Fe:"%BUILD_DIR%\bench_induction.exe" /Fo:"%BUILD_DIR%\obj_gen\\" ^
+    /link psapi.lib
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] induction benchmark compilation failed.
+    exit /b 1
+)
+
 echo [*] Running claim-falsification benchmark...
 "%BUILD_DIR%\bench_claim_falsify.exe"
 set "RC_CF=%ERRORLEVEL%"
+echo [*] Running induction-relation benchmark...
+"%BUILD_DIR%\bench_induction.exe"
+set "RC_IND=%ERRORLEVEL%"
 
 if not "%RC_FN%"=="0" exit /b %RC_FN%
 if not "%RC_ZS%"=="0" exit /b %RC_ZS%
 if not "%RC_RG%"=="0" exit /b %RC_RG%
 if not "%RC_CF%"=="0" exit /b %RC_CF%
+if not "%RC_IND%"=="0" exit /b %RC_IND%
 exit /b 0
