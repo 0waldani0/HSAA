@@ -64,6 +64,11 @@ tests/
   bench_unseen_function.cpp    interpolation vs extrapolation vs unseen functional family
   bench_zeroshot_falsify.cpp   proves synthesis is corpus-independent (untrained brain test)
   bench_rule_generalization.cpp periodic sequences vs abstract rules (successor/addition)
+  bench_claim_falsify.cpp     probes shipped claims on untrained / differing-corpus brains
+  note: second_brain/measur/README.md cites Python scripts (regress_par.py, sweep_slots.py,
+        corpus_regression.py) that are NOT in this tree; only __pycache__ remains. The
+        native acceptance_harness reproduces the 175876-transition split/seed but not
+        the published accuracy/coverage/draft numbers (see docs\CLAIM_PROOF_MATRIX.md)
   bench_vsa_hot_swap.cpp       vector scan / hot-swap benchmark
   test_ptq_validation.cpp      PTQ host tiling/rank rejection guards
   test_hssa_m1.cpp             HSSA M1 adversarial

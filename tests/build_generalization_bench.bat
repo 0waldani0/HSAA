@@ -63,11 +63,27 @@ set "RC_FN=%ERRORLEVEL%"
 echo [*] Running zero-shot falsification benchmark...
 "%BUILD_DIR%\bench_zeroshot_falsify.exe"
 set "RC_ZS=%ERRORLEVEL%"
+echo [*] Compiling claim-falsification benchmark...
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 ^
+    /I"%ROOT_DIR%\second_brain" ^
+    "%ROOT_DIR%\tests\bench_claim_falsify.cpp" ^
+    "%BUILD_DIR%\popcnt_brain.lib" ^
+    /Fe:"%BUILD_DIR%\bench_claim_falsify.exe" /Fo:"%BUILD_DIR%\obj_gen\\" ^
+    /link psapi.lib
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] claim-falsification compilation failed.
+    exit /b 1
+)
+
 echo [*] Running rule-generalization benchmark...
 "%BUILD_DIR%\bench_rule_generalization.exe"
 set "RC_RG=%ERRORLEVEL%"
+echo [*] Running claim-falsification benchmark...
+"%BUILD_DIR%\bench_claim_falsify.exe"
+set "RC_CF=%ERRORLEVEL%"
 
 if not "%RC_FN%"=="0" exit /b %RC_FN%
 if not "%RC_ZS%"=="0" exit /b %RC_ZS%
 if not "%RC_RG%"=="0" exit /b %RC_RG%
+if not "%RC_CF%"=="0" exit /b %RC_CF%
 exit /b 0
