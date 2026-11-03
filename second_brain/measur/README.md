@@ -27,47 +27,36 @@ machine.
 
 ## The measured results (the shipped engine)
 
-Corpus `bpe_train.txt` / `bpe_holdout.txt`, 6 epochs, seed 424242; the
-coverage is measured over the engine's own 175,876 held-out positions.
+Re-measured on this host (i7-11800H, 32 GB RAM; commit under test recorded in
+docs/CLAIM_PROOF_MATRIX.md) with the native `acceptance_harness` (includes the
+shipped engine source; trains on `data/bpe_train.txt`, scores
+`data/bpe_holdout.txt`; seed 424242, 6 epochs, vocab 4166, 40,000 train
+sentences / 576,806 transitions, 12,000 hold-out sentences / 175,876 transitions):
 
-| configuration | accuracy | coverage | E[accepted(1..3)] |
-|---|---|---|---|
-| plain (no backoff) | 28.3876% | -- | 0.2839 / 0.4597 / 0.5896 |
-| weight 64, k=32 | 34.5084% | 58.9347% | 0.3451 / 0.5616 / 0.7226 |
-| weight 256, k=32 | 35.6478% | 58.9347% | 0.3565 / 0.5790 / 0.7434 |
-| **weight 1024, k=32 (shipped)** | **36.5382%** | **58.9347%** | **0.3654 / 0.5919 / 0.7591** |
-| weight 4096, k=32 | 35.7252% | 58.9347% | 0.3573 / 0.5655 / 0.7107 |
-| weight 1024, k=4 | 36.0322% | 48.4768% | 0.3603 / 0.5767 / 0.7305 |
-| weight 1024, k=64 | 36.5246% | 60.5006% | 0.3652 / 0.5920 / 0.7598 |
-| weight 1024, k=256 | 36.4097% | 62.0949% | 0.3641 / 0.5900 / 0.7567 |
-| weight 1024, k=1024 | 36.4097% | 62.4724% | 0.3641 / 0.5900 / 0.7567 |
-
-The count-weight sweep peaks at 1024 and the shortlist size peaks at k=32:
-a bigger k raises the coverage (58.93% -> 62.47%) but LOWERS the accuracy
-(36.5382% -> 36.4097%), because the extra candidates are wrong more often
-than right.
-
-The Python baselines on the same files:
-
-| chain | on the trigram positions (163,876) | on the engine's positions (175,876) |
+| metric | old published | re-measured |
 |---|---|---|
-| trigram | 27.717% | 27.468% |
-| bigram fallback | 6.449% | 6.153% |
-| unigram fallback | 1.335% | 1.244% |
-| **causal chain total** | **35.502%** | **34.865%** |
-| the non-causal skip level (uses the future gold token) | 12.733% | -- |
-| the reference chain that included it | 46.899% | -- |
+| holdout accuracy | 36.5382% | **38.3202%** |
+| shortlist coverage | 58.9347% | **60.9998%** |
+| E[accepted] k=1 / 2 / 3 | 0.3654 / 0.5919 / 0.7591 | **0.3832 / 0.6278 / 0.8097** |
+| k=4 .. 12 draft acceptance | 0.9541 / 1.0728 / 1.1727 / 1.2581 / 1.3322 / 1.3970 / 1.4533 / 1.5022 / 1.5440 | same scale, +1.7 straight across |
+| draft cost | 10,395 ns/token | **1,770 ns/token** |
+| train time (6 epochs) | n/a | 6,714 ms |
+| conditional accuracy depth 1 / 5 / 12 | n/a | 0.383 / 0.822 / 0.853 |
+| pages over 16 slots | 21,946 | **0 (zero)** |
 
-The mixture (36.5382%) beats the causal chain on the engine's own population
-by 1.673 points. The word-level chain: trigram 15.413%, bigram 8.425%,
-unigram 14.625%, causal total 38.462% (the non-causal skip level 6.185%, the
-old reference total 30.022%).
+The old published table cannot be reproduced from this tree: the scripts that
+produced it (`regress_par.py`, `sweep_slots.py`, `baselines_word_causal.py`,
+`corpus_regression.py`) are absent; only `__pycache__` remnants remain and the
+native harness measures a different path than the published count-mixed lane.
+Either the shipped engine changed after those numbers were taken, or the
+published table measures code that is not shipped. Both need the author's
+answer; until then, treat the old numbers as historical, not current.
 
-The reference corpus (`corpus_regression.py`): 91.600 / 91.455 / 91.648%
-(12 epochs seed 424242, 12 epochs seed 1337, 6 epochs seed 424242), the
-guard's floor is 91.455% with 705 live-replay errors.
+## The word-level (same-domain) split, in ONE population — NOT REPRODUCIBLE
 
-## The word-level (same-domain) split, in ONE population
+(Measured with `baselines_word_causal.py` / `sweep_slots.py`, both absent from
+this tree. Kept as historical numbers; do not quote them as current.)
+
 
 The word-level comparison was invalid until it was re-measured: 38.462% was
 measured on the TRIGRAM positions, while the engine scores the positions from
@@ -87,7 +76,11 @@ up **above** the count chain: +1.90 points over the trigram-window chain and
 +4.13 over the chain that gets the engine's own context. Reproduce with
 `python baselines_word_causal.py` and `python sweep_slots.py --word --word2`.
 
-## The co-location limit (16 bottleneck slots per page), swept
+## The co-location limit (16 bottleneck slots per page), swept — NOT REPRODUCIBLE
+
+(Measured with `sweep_slots.py`, absent from this tree; the native harness reports
+zero over-capacity pages. Kept as historical numbers; do not quote as current.)
+
 
 A micro-expert page holds D_BOTTLENECK bottleneck neurons and the STE writes
 into them without eviction. On the subword held-out telemetry (576,806 write

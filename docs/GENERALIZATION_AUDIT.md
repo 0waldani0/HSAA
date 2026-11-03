@@ -67,8 +67,8 @@ so families with different scales are comparable.
 | midpoints, known family `sin(x)+0.25x^2` | 6.5e-08 | 0.029% | 0.0004 | interpolation contract passes |
 | cubic `x^3-2x`, never fitted, low curvature | 2.3e-05 | 0.382% | 0.0113 | passes the 1e-3 gate |
 | quintic `x^5-3x+2`, never fitted, high curvature | 1.42e-02 | 1.699% | 0.3080 | **617x worse than the cubic** |
-| extrapolation `x=2.25..4.25`, known family | 0.369 | 22.47% | 1.1097 | **3.9x worse than a straight line** |
-| extrapolation, quintic | 3.37e+05 | 87.71% | 1253.1 | catastrophic |
+| extrapolation `x=2.25..4.25`, known family | 0.0955 | 11.43% | 0.6199 | **= a least-squares straight line** (measured engine == linear fit, MSE 9.553e-02 both) |
+| extrapolation, quintic | 4.15e+05 | 97.37% | 1350.2 | catastrophic |
 | known model queried against a different law | 43.8 | 94.36% | 17.72 | no law transfer |
 
 Reading:
@@ -76,9 +76,12 @@ Reading:
 - The failure axis is **curvature and sampling**, not novelty. A never-fitted
   cubic is recovered to 0.38% NRMSE; the quintic at the same 17 points is 617x
   worse. Both are "unseen"; only one is representable at this sample density.
-- Outside the sampled range there is no extrapolation: the engine's 22.5% NRMSE
-  is **worse than a least-squares straight line** through the same samples
-  (11.4%). On the quintic it is 87.7%. The estimator clamps to the boundary.
+- Outside the sampled range the original kernel estimator clamped to the boundary
+  (22.5% NRMSE, worse than a straight line). **Fixed in `popcnt_brain.cpp`**: queries
+  strictly outside the hull now fall back to a least-squares straight line fitted on the
+  raw samples, which is the honest floor for extrapolation. Measured: NRMSE 11.43% ==
+  the linear baseline exactly. On the quintic this is 97.4% (still no extrapolation, just
+  a less wrong answer). The 1D limitation is explicit: x_dim == 1 only.
 - Given only `f1`, querying `f2` returns `f1` (94.4% NRMSE against `f2`). The
   engine does not invent a different law; it has no mechanism to.
 - There is **no symbolic output anywhere**: the public API returns numeric `y`
@@ -170,7 +173,7 @@ Claims with no executable proof behind them:
 - **Memorisation vs generalisation:** 80.14% -> 58.11% top-1, PPL 15.0 -> 416.8
   on unseen files. Genuine in-domain generalisation, 22 pp below in-sample.
 - **Unseen formulas:** no. No symbolic output, no law induction, no
-  extrapolation beyond the sampled range (worse than a straight line); a
+  extrapolation beyond the sampled range (matches a straight line, not a curve); a
   never-fitted cubic is fine, an under-sampled quintic is 617x worse - the limit
   is representation, not novelty.
 - **Unseen algorithms:** no. The synthesizer is a template engine that produces

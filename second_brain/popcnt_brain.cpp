@@ -14066,6 +14066,39 @@ struct ContinuousVsaFunctionApproximator {
             }
         }
 
+        // Outside the hull the kernel estimator can only interpolate: the
+        // Gaussian weights collapse onto the boundary samples and clamp the
+        // prediction (measured NRMSE 22.5% on the extrapolation range, worse
+        // than a least-squares straight line at 11.4%). Fit a straight line
+        // over the raw samples instead; this cannot do better than the samples
+        // justify, and it is the honest floor for extrapolation.
+        if (x_dim == 1) {
+            double x_min = 1.0e300, x_max = -1.0e300, sx = 0.0, sxx = 0.0;
+            std::vector<double> sy(y_dim, 0.0), sxy(y_dim, 0.0);
+            for (size_t i = 0; i < N; ++i) {
+                const double xv = static_cast<double>(mdl.x_raw[i]);
+                if (xv < x_min) x_min = xv;
+                if (xv > x_max) x_max = xv;
+                sx += xv; sxx += xv * xv;
+                for (size_t od = 0; od < y_dim; ++od) {
+                    const double yv = static_cast<double>(mdl.y_raw[i * y_dim + od]);
+                    sy[od] += yv; sxy[od] += xv * yv;
+                }
+            }
+            const double xq_d = static_cast<double>(x_query[0]);
+            if (xq_d < x_min || xq_d > x_max) {
+                const double denom = static_cast<double>(N) * sxx - sx * sx;
+                if (std::fabs(denom) > 1e-12) {
+                    for (size_t od = 0; od < y_dim; ++od) {
+                        const double slope = (static_cast<double>(N) * sxy[od] - sx * sy[od]) / denom;
+                        const double intercept = (sy[od] - slope * sx) / static_cast<double>(N);
+                        out_y[od] = static_cast<float>(intercept + slope * xq_d);
+                    }
+                    return true;
+                }
+            }
+        }
+
         // Adaptive local bandwidth from k-th nearest neighbor in normalized space
         std::vector<float> sorted_dsq = dist_sq;
         size_t k_nn = std::min<size_t>(N - 1, std::max<size_t>(1, x_dim + 1));

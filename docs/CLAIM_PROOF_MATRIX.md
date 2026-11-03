@@ -44,7 +44,7 @@ reference-corpus guard (91.6% / 91.455% / 91.648%) is not reproducible at all.
 | **F8.1 "OOD open-ended extrapolation"** | New probe `tests/bench_claim_falsify.cpp` on the exact T16.2 prompt `"Тензорный фотонный модуль формирует"`: **untrained brain: 1 token, gate fails**; trained on the F-corpus: 6 tokens, gate passes. Output: `"фотонный тензор и ускоряет плотный трансформер"` — a collage of corpus sentences | The test discriminates *trained vs untrained* state; it does not prove "open-ended" or out-of-distribution semantics. Weakly supported, overstated |
 | Template-free relation inference | New probe: `brain_infer_template_free_relation` on the exact T16.5 sentence returns `тепловой_шум` (ok=1) from an **untrained brain and an equally from the trained one** | **VACUOUS — the shipped test does not detect learning at all** |
 | 4096-D float32 cosine resolves micro-gradients where Hamming does not | Suite T16.6 passes (monotonic epsilon resolution) | Supported as an *embedding property*; it is corpus-independent by construction and evidences no learning |
-| "Non-linear function learning" (LOESS + holo trace) | Bench (`bench_unseen_function.cpp`) | Interpolation proven (NRMSE 0.029%); extrapolation disproven; `holo_operator_trace` never read |
+| "Non-linear function learning" (LOESS + holo trace) | Bench (`bench_unseen_function.cpp`) | Interpolation proven (NRMSE 0.029%); out-of-hull queries now fall back to a least-squares straight line and exactly match the linear baseline (NRMSE 11.43%); `holo_operator_trace` is never read |
 
 ## 3. Zero-shot and attention claims (README 10)
 
