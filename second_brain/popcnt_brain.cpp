@@ -19939,10 +19939,18 @@ POPCNT_BRAIN_API int brain_synthesize_algorithm_zeroshot(
         return 0;
     }
     out_code[0] = '\0';
+    // Template composition reads no brain state, so it runs before the lock.
     std::string synth_code;
     bool verified = false;
     if (!ZeroShotProgramSynthesizer::synthesize_and_verify(spec_prompt, synth_code, &verified) || !verified) {
         return 0;
+    }
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    // The token count needs a tokenizer. Create the engine lazily like
+    // brain_generate does instead of dereferencing a null llm_engine on an
+    // untrained brain.
+    if (!brain->llm_engine) {
+        brain->llm_engine = std::make_unique<PopCountGenerativeLLM>();
     }
     if (out_exec_verified) *out_exec_verified = verified;
     std::snprintf(out_code, max_len, "%s", synth_code.c_str());

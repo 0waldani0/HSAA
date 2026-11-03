@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
 
     std::printf("corpus: train_code_bytes=%zu heldout_code_bytes=%zu heldout_files=%zu heldout_prose_bytes=%zu\n",
                 train_text.size(), heldout_code_text.size(), heldout_files, heldout_text.size());
-    if (train_text.empty() || heldout_text.empty()) {
+    if (train_text.empty() || heldout_text.empty() || heldout_code_text.empty()) {
         std::printf("RESULT: SKIPPED (missing corpus)\n");
         return 2;
     }
@@ -123,14 +123,27 @@ int main(int argc, char** argv) {
     std::printf("fit: selected_temperature=%.2f fit_mean_nll=%.4f\n", best_t, best_nll);
 
     struct Named { const char* name; const std::string* text; };
+    // In-sample probe: a 10% slice taken from the middle of the training text
+    // (50-60% offset), so it is disjoint from the temperature-fitting slice
+    // (last 10%). Same evaluator and same temperature as the held-out splits.
+    const std::string train_probe = train_text.substr(
+        train_text.size() / 2, std::max<size_t>(1024, train_text.size() / 10));
     const Named splits[] = {
+        {"in_sample_train_slice", &train_probe},
         {"heldout_code_in_domain", &heldout_code_text},
         {"heldout_prose_cross_domain", &heldout_text},
     };
+    double seen_ppl = 0.0, seen_top1 = 0.0, unseen_ppl = 0.0, unseen_top1 = 0.0;
+    int splits_failed = 0;
     for (const Named& s : splits) {
         BrainHeldoutEval ev;
         std::memset(&ev, 0, sizeof(ev));
         const int ok = brain_eval_heldout_perplexity(brain, s.text->c_str(), best_t, &ev) ? 1 : 0;
+        if (!ok || ev.tokens_scored == 0) {
+            ++splits_failed;
+            std::printf("%s: ok=%d no_predictions\n", s.name, ok);
+            continue;
+        }
         const double total = (double)(ev.tokens_scored + ev.oov_tokens);
         const double oov_rate = (total > 0.0) ? (100.0 * (double)ev.oov_tokens / total) : 0.0;
         std::printf("%s: ok=%d temperature=%.2f tokens=%lld oov=%lld oov_rate=%.2f%%\n",
@@ -138,6 +151,19 @@ int main(int argc, char** argv) {
                     (long long)ev.oov_tokens, oov_rate);
         std::printf("%s: mean_nll=%.4f perplexity=%.3f uniform=%.3f top1=%.3f%%\n",
                     s.name, ev.mean_nll, ev.perplexity, ev.uniform_ppl, ev.top1_accuracy);
+        if (std::strcmp(s.name, "in_sample_train_slice") == 0) {
+            seen_ppl = ev.perplexity;
+            seen_top1 = ev.top1_accuracy;
+        } else if (std::strcmp(s.name, "heldout_code_in_domain") == 0) {
+            unseen_ppl = ev.perplexity;
+            unseen_top1 = ev.top1_accuracy;
+        }
+    }
+    if (splits_failed == 0) {
+        std::printf("gap: seen_top1=%.3f%% unseen_top1=%.3f%% drop=%.2fpp seen_ppl=%.3f unseen_ppl=%.3f ppl_ratio=%.1fx\n",
+                    seen_top1, unseen_top1, seen_top1 - unseen_top1,
+                    seen_ppl, unseen_ppl,
+                    (seen_ppl > 0.0) ? (unseen_ppl / seen_ppl) : 0.0);
     }
 
     // Uncalibrated control: T=1 shows what the head produces without the
@@ -149,7 +175,7 @@ int main(int argc, char** argv) {
                     raw.mean_nll, raw.perplexity, raw.top1_accuracy);
     }
 
-    std::printf("RESULT: MEASURED\n");
+    std::printf("RESULT: %s\n", (splits_failed == 0) ? "MEASURED" : "FAILED (split evaluation)");
     brain_destroy(brain);
-    return 0;
+    return (splits_failed == 0) ? 0 : 1;
 }
