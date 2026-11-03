@@ -115,17 +115,45 @@ C API dereferenced a null `llm_engine` after a successful composition
 (`popcnt_brain.cpp`). The wrapper now composes before taking `brain_mutex`,
 creates the engine lazily, and holds the lock only for tokenization.
 
-## 4. What the rest of the code actually proves
+## 4. Rule induction: the generator recombines observed transitions
 
-The inventory of all 23 harnesses found these coverage gaps:
+Five one-token prediction tasks, compiled binary, `greedy` decoding, one
+brain per task. Two of them are positive controls (the continuation rule is a
+local periodicity fully covered by training transitions); two remove one
+determinate pair whose constituents all appear in training.
 
-- **No test** of extrapolation outside the training range - now covered here.
-- **No test** of a different functional family - now covered here.
+| Task | Rule tested | In-sample | Unseen phase/length | Verdict |
+|---|---|---|---|---|
+| ALT2 `a b a b...` | 2-cycle continuation | 4/4 | 4/4 at length 12-15 | GENERALIZES |
+| ALT3 `p q r p q r...` | 3-cycle continuation | 4/4 | 4/4 at length 12-15 | GENERALIZES |
+| CYCLE5 `1 2 3 4 5 ...` | 5-cycle continuation | 5/5 | 12/12 unseen phase at trained lengths; 4/4 at length 20-23 | GENERALIZES |
+| SUCCESSOR `a->b ... j->a` | successor relation, pairs e->f and h->i withheld | 8/8 | 0/2 | MEMORISES_ONLY |
+| ADDITION `1..4` | arity-2 addition, pairs 2+3 and 3+4 withheld | 14/14 | 0/2 | MEMORISES_ONLY |
+
+Interpretation, backed by the mechanism and the corpus, not by a guess:
+
+- The engine wins the cycle tasks because every transition the test queries
+  (a->b, b->a, ..., 5->1) appeared many times in training. It recombines a
+  **transition distribution**; it extrapolates over length and phase, which a
+  finite-order n-gram/backoff model does not strictly forbid.
+- The engine fails the withheld-pair tasks because the required transition
+  never occurred, even though the relation is fully determined by the
+  demonstrated pairs and the required result tokens appear in other pairs.
+- This is the precise boundary: **composition over observed transitions, no
+  abstraction over unseen relations**. It is not a scaling or sample-density
+  effect; the training set already contained both operands and both outputs.
+
+## 5. What the rest of the code actually proves
+
+The inventory of all 23 harnesses, plus this audit, covers:
+
+- **Extrapolation** outside the training range - covered here.
+- **Different functional families** - covered here.
+- **Rule generalisation in the generator** - covered here; abstract
+  relation induction is absent, transition recombination works.
 - **No test** of unseen-key recall in the VSA/associative path: every recall
   test uses stored keys, 1-bit flips, or fuzzy spellings. (Random-probe
   rejection is measured: 0.000% false positives at the 0.40 gate.)
-- **No test** of inductive law discovery - still absent, because the code has no
-  such mechanism.
 
 Claims with no executable proof behind them:
 
@@ -137,7 +165,7 @@ Claims with no executable proof behind them:
 | "Off-grid spectral solver recovers parameters" | `tests/test_unified_engine.cpp:309` | sandbox compares against the same LOESS evaluator that produced the fit (circular) |
 | "Template-free relation inference" | `second_brain/README.md:424` | subject substring match + sketch dot; single-subject sentences only |
 
-## 5. Verdict
+## 6. Verdict
 
 - **Memorisation vs generalisation:** 80.14% -> 58.11% top-1, PPL 15.0 -> 416.8
   on unseen files. Genuine in-domain generalisation, 22 pp below in-sample.
@@ -148,10 +176,15 @@ Claims with no executable proof behind them:
 - **Unseen algorithms:** no. The synthesizer is a template engine that produces
   identical output with zero training, with the shipped corpus, and outside its
   keyword set it either emits nothing or an unrelated template.
+- **Rule induction:** the generator continues periodic sequences it has never
+  seen at longer lengths and unseen phases (12/12 and 4/4), and reproduces
+  trained transitions perfectly (100%). It induces no new relation: withheld
+  successor and addition pairs score 0/2 despite full determination by the
+  demonstrated examples.
 - **What is genuinely useful:** in-domain code completion/ranking at 58% top-1
-  on unseen files, sub-1e-4 MSE interpolation of a smooth function inside its
-  sampled range, 5 us associative lookup with a calibrated rejection gate, and
-  a deterministic code-template generator.
+  on unseen files, periodic-sequence continuation, sub-1e-4 MSE interpolation
+  of a smooth function inside its sampled range, 5 us associative lookup with a
+  calibrated rejection gate, and a deterministic code-template generator.
 
-Any paper or README claim beyond those four needs a new mechanism, not a new
+Any paper or README claim beyond those five needs a new mechanism, not a new
 benchmark.

@@ -63,6 +63,7 @@ tests/
   bench_mechanism_ternary_vsa.cpp ternary projection accuracy/memory/speed + resonance gate
   bench_unseen_function.cpp    interpolation vs extrapolation vs unseen functional family
   bench_zeroshot_falsify.cpp   proves synthesis is corpus-independent (untrained brain test)
+  bench_rule_generalization.cpp periodic sequences vs abstract rules (successor/addition)
   bench_vsa_hot_swap.cpp       vector scan / hot-swap benchmark
   test_ptq_validation.cpp      PTQ host tiling/rank rejection guards
   test_hssa_m1.cpp             HSSA M1 adversarial

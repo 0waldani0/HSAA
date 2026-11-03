@@ -45,13 +45,29 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+echo [*] Compiling rule-generalization benchmark...
+cl.exe /nologo /std:c++20 /O2 /Oi /Ot /arch:AVX512 /openmp /EHsc /utf-8 /wd4068 ^
+    /I"%ROOT_DIR%\second_brain" ^
+    "%ROOT_DIR%\tests\bench_rule_generalization.cpp" ^
+    "%BUILD_DIR%\popcnt_brain.lib" ^
+    /Fe:"%BUILD_DIR%\bench_rule_generalization.exe" /Fo:"%BUILD_DIR%\obj_gen\\" ^
+    /link psapi.lib
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] rule-generalization compilation failed.
+    exit /b 1
+)
+
 echo [*] Running unseen-function benchmark...
 "%BUILD_DIR%\bench_unseen_function.exe"
 set "RC_FN=%ERRORLEVEL%"
 echo [*] Running zero-shot falsification benchmark...
 "%BUILD_DIR%\bench_zeroshot_falsify.exe"
 set "RC_ZS=%ERRORLEVEL%"
+echo [*] Running rule-generalization benchmark...
+"%BUILD_DIR%\bench_rule_generalization.exe"
+set "RC_RG=%ERRORLEVEL%"
 
 if not "%RC_FN%"=="0" exit /b %RC_FN%
 if not "%RC_ZS%"=="0" exit /b %RC_ZS%
+if not "%RC_RG%"=="0" exit /b %RC_RG%
 exit /b 0
