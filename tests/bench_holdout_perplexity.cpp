@@ -149,8 +149,11 @@ int main(int argc, char** argv) {
         std::printf("%s: ok=%d temperature=%.2f tokens=%lld oov=%lld oov_rate=%.2f%%\n",
                     s.name, ok, best_t, (long long)ev.tokens_scored,
                     (long long)ev.oov_tokens, oov_rate);
-        std::printf("%s: mean_nll=%.4f perplexity=%.3f uniform=%.3f top1=%.3f%%\n",
-                    s.name, ev.mean_nll, ev.perplexity, ev.uniform_ppl, ev.top1_accuracy);
+        std::printf("%s: mean_nll=%.4f perplexity=%.3f uniform=%.3f top1=%.3f%% ngram=%.3f%% copy=%.3f%% role=%.3f%% system=%.3f%% head_top5=%.3f%% union3=%.3f%% union4=%.3f%% target_seen=%.3f%%\n",
+                    s.name, ev.mean_nll, ev.perplexity, ev.uniform_ppl, ev.top1_accuracy,
+                    ev.top1_accuracy_ngram, ev.top1_accuracy_copy, ev.top1_accuracy_role,
+                    ev.top1_accuracy_system, ev.top5_head_pct, ev.top1_accuracy_union,
+                    ev.union4_ceiling, ev.target_seen_pct);
         if (std::strcmp(s.name, "in_sample_train_slice") == 0) {
             seen_ppl = ev.perplexity;
             seen_top1 = ev.top1_accuracy;

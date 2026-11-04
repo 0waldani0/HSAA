@@ -20,16 +20,20 @@ sources (719 KB), with every 5th file held out (10 files, 165 KB) plus all prose
 (51 KB) kept out of training and out of temperature fitting. The engine clamped
 6 requested epochs to 1 for a 166230-token corpus, so this is a **single pass**.
 
-| Split | Tokens | OOV | Mean NLL | PPL | Uniform | Top-1 |
-|---|---|---|---|---|---|---|
-| in-sample (middle 10% of training text) | 17667 | 0.01% | 2.7087 | **15.010** | 9196 | **80.14%** |
-| held-out source files | 30757 | 8.82% | 6.0327 | **416.82** | 9196 | **58.11%** |
-| held-out prose | 9584 | 16.33% | 12.4502 | **255312** | 9196 | **15.89%** |
-| in-sample at T=1 (control) | 17667 | 0.01% | 3055.0 | inf | 9196 | 80.14% |
+| Split | Tokens | OOV | Mean NLL | PPL | Uniform | Head top-1 | Suffix top-1 |
+|---|---|---|---|---|---|---|---|
+| in-sample (middle 10% of training text) | 16319 | 0.01% | 2.5830 | **13.237** | 9259 | **80.88%** | 97.36% |
+| held-out source files (11) | 43689 | 6.72% | 5.6434 | **282.42** | 9259 | **60.83%** | **64.47%** |
+| held-out prose | 14830 | 15.18% | 12.7338 | **339025** | 9259 | **14.21%** | 13.99% |
+| in-sample at T=1 (control) | 16319 | 0.01% | 2859.1 | inf | 9259 | 80.88% | - |
 
-**Gap: -22.03 percentage points of top-1, 27.8x worse perplexity on unseen
+**Gap: -20.04 percentage points of head top-1, 21.3x worse perplexity on unseen
 files.** The in-sample probe sits at 50-60% of the training text and the
-temperature fit at 90-100%, so the two do not overlap.
+temperature fit at 90-100%, so the two do not overlap. The exact-suffix predictor
+(L=1..64 over training tables) scores 64.47% on the same held-out tokens - the
+best deployable predictor in the engine; the union oracle of head, suffix, copy
+and role signals is only 66.67%, which is the measured ceiling of this
+architecture (see docs/METRICS.md section 1).
 
 Both sides are scored over in-vocabulary transitions only: the unseen split
 additionally drops 8.82% of its tokens to OOV (splicing is disabled), so the

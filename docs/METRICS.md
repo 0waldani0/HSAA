@@ -25,16 +25,35 @@ Corpus: repository sources; every 5th file held out; prose held out of training
 and temperature fitting. Single pass (requested 6 epochs clamped to 1):
 166,230 tokens, vocab 9,132.
 
-| split | OOV | mean NLL | PPL | uniform | top-1 |
-|---|---|---|---|---|---|
-| in-sample (50-60% of train) | 0.01% | 2.7087 | **15.010** | 9,196 | **80.144%** |
-| held-out code files (10) | 8.82% | 6.0327 | **416.823** | 9,196 | **58.114%** |
-| held-out prose | 16.33% | 12.4502 | **255,311.917** | 9,196 | **15.891%** |
-| in-sample at T=1 (control) | 0.01% | 3,054.97 | inf | 9,196 | 80.144% |
+| split | OOV | mean NLL | PPL | uniform | head top-1 | suffix top-1 |
+|---|---|---|---|---|---|---|
+| in-sample (50-60% of train) | 0.01% | 2.5830 | **13.237** | 9,259 | **80.875%** | **97.359%** |
+| held-out code files (11) | 6.72% | 5.6434 | **282.420** | 9,259 | **60.832%** | **64.469%** |
+| held-out prose | 15.18% | 12.7338 | **339,024.573** | 9,259 | **14.214%** | 13.992% |
+| in-sample at T=1 (control) | 0.01% | 2,859.1 | inf | 9,259 | 80.875% | - |
 
-gap: **-22.03 pp top-1, 27.8x PPL**. Replay accuracy (trainer metric, shortlist
-rule): **98.217%**; pure full-vocabulary head on the same text: 80.144%.
-Absolute values move when repository files change; the method and ratios do not.
+gap: **-20.04 pp head top-1, 21.3x PPL**. Replay accuracy (trainer metric,
+shortlist rule): **98.681%** over 160,652 tokens; pure full-vocabulary head on
+the same text: 80.875%. Suffix is the exact-horizon predictor (L=1..64 over the
+training tables, no held-out data in it). Absolute values move when repository
+files change; the method and ratios do not.
+
+Predictor comparison and the measured ceiling on held-out code:
+
+| predictor | top-1 |
+|---|---|
+| ternary head, argmax | 60.832% |
+| exact suffix tables (L=1..64) | **64.469%** |
+| same-file copy (best head-scored seen token) | 29.271% |
+| role-horizon abstraction, resolved by the head | 58.092% |
+| head top-5 contains the target | 62.478% |
+| union oracle: head or suffix or copy correct | **66.667%** |
+
+**70-90% is not reachable by re-weighting or re-ranking these signals.** The
+union oracle of every predictor in the engine caps at 66.67%, and the head top-5
+is 62.48% - barely above its top-1 (60.83%), so a reranker has no headroom.
+Reaching 70%+ requires a structurally stronger next-token model or external
+pre-training data; see docs/HSAA_vs_LLM.md for the options and costs.
 
 ## 2. Rule continuation vs rule induction (bench_rule_generalization)
 

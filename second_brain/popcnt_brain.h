@@ -213,6 +213,15 @@ typedef struct {
     double  mean_nll;         // mean negative log-likelihood (nats)
     double  perplexity;       // exp(mean_nll)
     double  top1_accuracy;    // exact next-token hit rate of the same scores
+    double  top1_accuracy_ngram;   // exact suffix L=1..16, top-count continuation
+    double  top1_accuracy_system;  // best deployable predictor (exact suffix table)
+    double  top1_accuracy_union;   // diagnostic ceiling: either source correct
+    double  top1_accuracy_candhead; // ngram candidate set re-ranked by the head
+    double  top5_head_pct;        // diagnostic: target inside the head top-5
+    double  target_seen_pct;      // diagnostic: target occurred earlier in the file
+    double  top1_accuracy_role;   // role-horizon candidate resolved by the head
+    double  top1_accuracy_copy;   // best head-scored token seen earlier in the file
+    double  union4_ceiling;       // diagnostic: head or ngram or copy correct
     double  temperature;      // temperature the caller supplied
     double  uniform_ppl;      // vocabulary-size baseline
 } BrainHeldoutEval;
