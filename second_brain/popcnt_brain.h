@@ -222,6 +222,10 @@ typedef struct {
     double  top1_accuracy_role;   // role-horizon candidate resolved by the head
     double  top1_accuracy_copy;   // best head-scored token seen earlier in the file
     double  union4_ceiling;       // diagnostic: head or ngram or copy correct
+    double  mean_nll_mix;         // head/suffix mixture NLL at the fitted lambda
+    double  perplexity_mix;       // exp(mean_nll_mix), INF on overflow
+    double  top1_accuracy_mix;    // mixture argmax over {head, suffix} candidates
+    double  lambda;               // suffix weight used for the mixture fields
     double  temperature;      // temperature the caller supplied
     double  uniform_ppl;      // vocabulary-size baseline
 } BrainHeldoutEval;
@@ -234,6 +238,18 @@ POPCNT_BRAIN_API int brain_eval_heldout_perplexity(
     PopCountBrain* brain,
     const char* text,
     double temperature,
+    BrainHeldoutEval* out_eval
+);
+
+// Same evaluator with an explicit linear mixture of the ternary head and the
+// exact-suffix table: P = (1 - lambda) * P_head + lambda * P_suffix. Fits
+// nothing itself; the caller supplies lambda (fit it on training text).
+// lambda == 0 reproduces brain_eval_heldout_perplexity exactly.
+POPCNT_BRAIN_API int brain_eval_heldout_mixture(
+    PopCountBrain* brain,
+    const char* text,
+    double temperature,
+    double lambda,
     BrainHeldoutEval* out_eval
 );
 

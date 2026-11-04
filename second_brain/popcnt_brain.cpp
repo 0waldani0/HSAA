@@ -9877,6 +9877,11 @@ struct PopCountGenerativeLLM {
     // the trained sublinear net. OOV tokens are dropped by the frozen tokenizer
     // and reported separately so an evaluation corpus cannot extend the model.
     bool eval_heldout_perplexity(const char* text, double temperature, BrainHeldoutEval* out) {
+        return eval_heldout_core(text, temperature, 0.0, out);
+    }
+
+    bool eval_heldout_core(const char* text, double temperature, double lambda,
+                           BrainHeldoutEval* out) {
         if (!text || !out || !sublinear_net) return false;
         std::memset(out, 0, sizeof(*out));
         const int64_t vocab = static_cast<int64_t>(sublinear_net->vocab_size);
@@ -9906,6 +9911,8 @@ struct PopCountGenerativeLLM {
         int64_t role_hits = 0;
         int64_t copy_hits = 0;
         int64_t union4_hits = 0;
+        int64_t mix_hits = 0;
+        double mix_nll = 0.0;
         uint64_t ngram_keys[MAX_HORIZON + 1];
         std::vector<int> eval_role_seq;
         uint64_t role_keys[MAX_ROLE_HORIZON + 1];
@@ -9934,8 +9941,10 @@ struct PopCountGenerativeLLM {
                 for (int32_t s : scores) {
                     sum += std::exp(static_cast<double>(s) / T - mx);
                 }
-                nll += (mx + std::log(sum))
+                const double logZ = mx + std::log(sum);
+                const double log_head_target = logZ
                      - (static_cast<double>(scores[static_cast<size_t>(target)]) / T);
+                nll += log_head_target;
                 const auto best_it = std::max_element(scores.begin(), scores.end());
                 int head_pred = 0;
                 if (best_it != scores.end()) {
@@ -9976,6 +9985,43 @@ struct PopCountGenerativeLLM {
                     ? ngram_pred : head_pred;
                 if (system_pred == target) ++system_hits;
                 if (ngram_pred == target || head_pred == target) ++union_hits;
+
+                // Mixture of head and exact-suffix probabilities. The suffix part is
+                // the empirical continuation distribution at the longest matched
+                // horizon; lambda is supplied by the caller and fitted on train text.
+                double p_ngram_target = 0.0;
+                double p_ngram_head = 0.0;
+                double p_ngram_best = 0.0;
+                if (ngram_match_L > 0) {
+                    auto it_m = horizon_tables[ngram_match_L].find(ngram_keys[ngram_match_L]);
+                    if (it_m != horizon_tables[ngram_match_L].end()) {
+                        uint32_t total_m = 0;
+                        for (const auto& e : it_m->second) total_m += e.count;
+                        const uint32_t denom_m = std::max<uint32_t>(1, total_m);
+                        for (const auto& e : it_m->second) {
+                            const double p = static_cast<double>(e.count) / denom_m;
+                            if (e.tok == target) p_ngram_target = p;
+                            if (e.tok == head_pred) p_ngram_head = p;
+                            if (e.tok == ngram_pred) p_ngram_best = p;
+                        }
+                    }
+                }
+                const double lw = std::clamp(lambda, 0.0, 1.0);
+                const double p_head_target = std::exp(-log_head_target);
+                const double p_mix_target = (1.0 - lw) * p_head_target + lw * p_ngram_target;
+                if (p_mix_target > 0.0) mix_nll -= std::log(p_mix_target);
+                else mix_nll += 700.0;
+                {
+                    const double p_head_best = std::exp(static_cast<double>(scores[static_cast<size_t>(head_pred)]) / T - logZ);
+                    const double mix_head = (1.0 - lw) * p_head_best + lw * p_ngram_head;
+                    double mix_ngram = -1.0;
+                    if (ngram_pred >= 0 && ngram_pred < static_cast<int>(scores.size())) {
+                        const double p_head_ngram = std::exp(static_cast<double>(scores[static_cast<size_t>(ngram_pred)]) / T - logZ);
+                        mix_ngram = (1.0 - lw) * p_head_ngram + lw * p_ngram_best;
+                    }
+                    const int mix_pred = (mix_ngram > mix_head) ? ngram_pred : head_pred;
+                    if (mix_pred == target) ++mix_hits;
+                }
 
                 // Policy B: take the union of every matched-horizon continuation and
                 // choose among it with the head logits.
@@ -10086,6 +10132,11 @@ struct PopCountGenerativeLLM {
         out->top1_accuracy_role = 100.0 * static_cast<double>(role_hits) / static_cast<double>(scored);
         out->top1_accuracy_copy = 100.0 * static_cast<double>(copy_hits) / static_cast<double>(scored);
         out->union4_ceiling = 100.0 * static_cast<double>(union4_hits) / static_cast<double>(scored);
+        out->mean_nll_mix = mix_nll / static_cast<double>(scored);
+        out->perplexity_mix = (out->mean_nll_mix < 700.0) ? std::exp(out->mean_nll_mix)
+                                                         : std::numeric_limits<double>::infinity();
+        out->top1_accuracy_mix = 100.0 * static_cast<double>(mix_hits) / static_cast<double>(scored);
+        out->lambda = std::clamp(lambda, 0.0, 1.0);
         return true;
     }
 
@@ -14217,9 +14268,11 @@ struct ContinuousVsaFunctionApproximator {
         // Outside the hull the kernel estimator can only interpolate: the
         // Gaussian weights collapse onto the boundary samples and clamp the
         // prediction (measured NRMSE 22.5% on the extrapolation range, worse
-        // than a least-squares straight line at 11.4%). Fit a straight line
-        // over the raw samples instead; this cannot do better than the samples
-        // justify, and it is the honest floor for extrapolation.
+        // than a least-squares straight line at 11.4%). A degree-1 fit over the
+        // raw samples is the measured best here: a degree-2 fit selected by
+        // leave-one-out scored 86.7% NRMSE on the same range (LOO inside the
+        // hull rewards curvature that extrapolation cannot support), so it was
+        // rejected. The line is the honest floor for extrapolation.
         if (x_dim == 1) {
             double x_min = 1.0e300, x_max = -1.0e300, sx = 0.0, sxx = 0.0;
             std::vector<double> sy(y_dim, 0.0), sxy(y_dim, 0.0);
@@ -18877,6 +18930,20 @@ POPCNT_BRAIN_API int brain_eval_heldout_perplexity(
     std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
     if (!brain->llm_engine) return 0;
     return brain->llm_engine->eval_heldout_perplexity(text, temperature, out_eval) ? 1 : 0;
+}
+
+POPCNT_BRAIN_API int brain_eval_heldout_mixture(
+    PopCountBrain* brain,
+    const char* text,
+    double temperature,
+    double lambda,
+    BrainHeldoutEval* out_eval
+) {
+    if (!brain || !text || text[0] == '\0' || !out_eval) return 0;
+    std::memset(out_eval, 0, sizeof(*out_eval));
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (!brain->llm_engine) return 0;
+    return brain->llm_engine->eval_heldout_core(text, temperature, lambda, out_eval) ? 1 : 0;
 }
 
 POPCNT_BRAIN_API int brain_generate(

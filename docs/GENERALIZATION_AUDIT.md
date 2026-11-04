@@ -16,41 +16,44 @@ Hardware: Intel i7-11800H, 32 GB RAM, no GPU. MSVC 2022, `/O2 /arch:AVX512`.
 ## 1. Text: memorisation vs generalisation
 
 Training corpus: all repository `src/`, `include/`, `second_brain/` and `tests/`
-sources (719 KB), with every 5th file held out (10 files, 165 KB) plus all prose
-(51 KB) kept out of training and out of temperature fitting. The engine clamped
-6 requested epochs to 1 for a 166230-token corpus, so this is a **single pass**.
+sources (703 KB), with every 5th file held out (11 files, 211 KB) plus all prose
+(79 KB) kept out of training and out of temperature fitting. The engine clamped
+6 requested epochs to 1 for a 160,859-token corpus (vocab 9,206, evaluation
+vocab 9,270), so this is a **single pass**.
 
-| Split | Tokens | OOV | Mean NLL | PPL | Uniform | Head top-1 | Suffix top-1 |
-|---|---|---|---|---|---|---|---|
-| in-sample (middle 10% of training text) | 16319 | 0.01% | 2.5830 | **13.237** | 9259 | **80.88%** | 97.36% |
-| held-out source files (11) | 43689 | 6.72% | 5.6434 | **282.42** | 9259 | **60.83%** | **64.47%** |
-| held-out prose | 14830 | 15.18% | 12.7338 | **339025** | 9259 | **14.21%** | 13.99% |
-| in-sample at T=1 (control) | 16319 | 0.01% | 2859.1 | inf | 9259 | 80.88% | - |
+| Split | Tokens | OOV | PPL (head) | PPL (mix) | Head top-1 | Mix top-1 |
+|---|---|---|---|---|---|---|
+| in-sample (middle 10% of training text) | 16348 | 0.01% | **13.22** | 1.17 | **80.90%** | 97.38% |
+| held-out source files (11) | 43689 | 6.72% | **281.96** | **35.28** | **60.84%** | **64.77%** |
+| held-out prose | 15077 | 15.19% | **345,661** | 166,800 | **14.08%** | 14.11% |
+| in-sample at T=1 (control) | 16348 | 0.01% | inf (NLL 2859) | - | 80.90% | - |
 
-**Gap: -20.04 percentage points of head top-1, 21.3x worse perplexity on unseen
+**Gap: -20.06 percentage points of head top-1, 21.3x worse perplexity on unseen
 files.** The in-sample probe sits at 50-60% of the training text and the
-temperature fit at 90-100%, so the two do not overlap. The exact-suffix predictor
-(L=1..64 over training tables) scores 64.47% on the same held-out tokens - the
-best deployable predictor in the engine; the union oracle of head, suffix, copy
-and role signals is only 66.67%, which is the measured ceiling of this
-architecture (see docs/METRICS.md section 1).
+temperature/lambda fit at 90-100%, so the two do not overlap.
+
+The mixture is `P = 0.25 * P_head + 0.75 * P_suffix`, with lambda fitted on the
+training tail only. It cuts held-out PPL 8x (282 -> 35.3) but adds only 0.3 pp
+top-1 (64.47 -> 64.77): calibration fixes the probability assigned to the truth,
+not the argmax. The exact-suffix predictor is L=1..64 over the training tables;
+the union oracle of head, suffix, copy and role signals is 66.68% - the measured
+ceiling of this architecture (docs/METRICS.md section 1).
 
 Both sides are scored over in-vocabulary transitions only: the unseen split
-additionally drops 8.82% of its tokens to OOV (splicing is disabled), so the
-gap is if anything understated - the hardest unseen tokens are never scored.
+additionally drops 6.72% of its tokens to OOV (splicing is disabled), so the gap
+is if anything understated - the hardest unseen tokens are never scored.
 
-Three further readings:
+Further readings:
 
-- Against chance (1/9196 = 0.0109%), 58.11% top-1 on unseen files is real
-  in-domain generalisation, and PPL is 22.1x better than uniform.
-- Cross-domain prose ranks above chance (15.89%) but has PPL 27.8x **worse**
-  than uniform: the distribution is over-confident outside its training
-  domain. It does not transfer.
-- The trainer's own `replay_accuracy` is 98.22% on seen text, while the pure
-  full-vocabulary head scores 80.14%. The difference is the shipped
-  shortlist/backoff decision rule, not the learned distribution: the rule fixes
-  seen continuations, the softmax does not put 98% mass on them.
-- At T=1 the distribution is so peaked that mean NLL is 3055 and PPL overflows
+- Against chance (1/9270 = 0.0108%), 60.84% head top-1 on unseen files is real
+  in-domain generalisation; head PPL is 32.9x better than uniform, mix PPL 263x.
+- Cross-domain prose ranks above chance (14.08%) but still has mix PPL 18x
+  **worse** than uniform: even after calibration the distribution does not
+  transfer.
+- The trainer's own `replay_accuracy` is 98.68% on seen text, while the pure
+  full-vocabulary head scores 80.90%. The difference is the shipped
+  shortlist/backoff decision rule, not the learned distribution.
+- At T=1 the distribution is so peaked that mean NLL is 2859 and PPL overflows
   double. A finite PPL only exists after temperature scaling; that is a property
   of the model, not of the evaluation.
 

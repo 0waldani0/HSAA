@@ -23,35 +23,38 @@ build.bat test
 
 Corpus: repository sources; every 5th file held out; prose held out of training
 and temperature fitting. Single pass (requested 6 epochs clamped to 1):
-166,230 tokens, vocab 9,132.
+160,859 tokens, train vocab 9,206, evaluation vocab 9,270.
 
-| split | OOV | mean NLL | PPL | uniform | head top-1 | suffix top-1 |
+| split | OOV | PPL head | PPL mix | head top-1 | suffix top-1 | mix top-1 |
 |---|---|---|---|---|---|---|
-| in-sample (50-60% of train) | 0.01% | 2.5830 | **13.237** | 9,259 | **80.875%** | **97.359%** |
-| held-out code files (11) | 6.72% | 5.6434 | **282.420** | 9,259 | **60.832%** | **64.469%** |
-| held-out prose | 15.18% | 12.7338 | **339,024.573** | 9,259 | **14.214%** | 13.992% |
-| in-sample at T=1 (control) | 0.01% | 2,859.1 | inf | 9,259 | 80.875% | - |
+| in-sample (50-60% of train) | 0.01% | **13.22** | 1.17 | **80.90%** | 97.37% | 97.38% |
+| held-out code files (11) | 6.72% | **281.96** | **35.28** | **60.84%** | 64.47% | **64.77%** |
+| held-out prose | 15.19% | **345,661** | 166,800 | **14.08%** | 13.87% | 14.11% |
+| in-sample at T=1 (control) | 0.01% | inf (NLL 2859) | - | 80.90% | - | - |
 
-gap: **-20.04 pp head top-1, 21.3x PPL**. Replay accuracy (trainer metric,
-shortlist rule): **98.681%** over 160,652 tokens; pure full-vocabulary head on
-the same text: 80.875%. Suffix is the exact-horizon predictor (L=1..64 over the
-training tables, no held-out data in it). Absolute values move when repository
+gap: **-20.06 pp head top-1, 21.3x head PPL**. Replay accuracy (trainer
+metric, shortlist rule): **98.682%** over 160,859 tokens; pure full-vocabulary
+head on the same text: 80.90%. Suffix is the exact-horizon predictor (L=1..64
+over the training tables, no held-out data in it). Mixture is
+`0.25 * head + 0.75 * suffix`, lambda fitted on the training tail only - it
+cuts PPL 8x but adds only 0.3 pp top-1. Absolute values move when repository
 files change; the method and ratios do not.
 
 Predictor comparison and the measured ceiling on held-out code:
 
 | predictor | top-1 |
 |---|---|
-| ternary head, argmax | 60.832% |
-| exact suffix tables (L=1..64) | **64.469%** |
-| same-file copy (best head-scored seen token) | 29.271% |
-| role-horizon abstraction, resolved by the head | 58.092% |
-| head top-5 contains the target | 62.478% |
-| union oracle: head or suffix or copy correct | **66.667%** |
+| ternary head, argmax | 60.84% |
+| exact suffix tables (L=1..64) | 64.47% |
+| mixture head+suffix, lambda 0.75 (PPL 35.28) | **64.77%** |
+| same-file copy (best head-scored seen token) | 29.27% |
+| role-horizon abstraction, resolved by the head | 58.09% |
+| head top-5 contains the target | 62.49% |
+| union oracle: head or suffix or copy correct | **66.68%** |
 
 **70-90% is not reachable by re-weighting or re-ranking these signals.** The
-union oracle of every predictor in the engine caps at 66.67%, and the head top-5
-is 62.48% - barely above its top-1 (60.83%), so a reranker has no headroom.
+union oracle of every predictor in the engine caps at 66.68%, and the head top-5
+is 62.49% - barely above its top-1 (60.84%), so a reranker has no headroom.
 Reaching 70%+ requires a structurally stronger next-token model or external
 pre-training data; see docs/HSAA_vs_LLM.md for the options and costs.
 
@@ -78,6 +81,7 @@ Five tasks, greedy one-token decoding, fresh brain per task.
 | cubic `x^3-2x`, never fitted | 2.30e-05 | 0.382% | low curvature |
 | quintic `x^5-3x+2`, never fitted | 1.42e-02 | 1.699% | 617x worse than cubic |
 | extrapolation 2.25..4.25, known family | 9.553e-02 | 11.432% | **= least-squares line exactly** (out-of-hull fallback, fixed) |
+| quadratic out-of-hull fit selected by LOO (rejected) | 5.497 | 86.715% | measured worse than the line; removed |
 | extrapolation, quintic | 4.151e+05 | 97.373% | catastrophic |
 | known model vs a different law | 43.83 | 94.363% | no transfer |
 

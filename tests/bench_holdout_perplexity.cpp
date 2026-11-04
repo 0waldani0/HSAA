@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
     // NLL (finite and monotone in the true PPL even when exp() would overflow).
     const size_t split = train_text.size() - train_text.size() / 10;
     const std::string fit_text = train_text.substr(split);
+
     const double grid[] = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0,
                            128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0};
     double best_t = 1.0;
@@ -121,6 +122,23 @@ int main(int argc, char** argv) {
         if (ev.mean_nll < best_nll) { best_nll = ev.mean_nll; best_t = t; }
     }
     std::printf("fit: selected_temperature=%.2f fit_mean_nll=%.4f\n", best_t, best_nll);
+
+    // The suffix weight is fitted on the same training tail by mixture NLL,
+    // independently of the held-out split.
+    const std::string lambda_text = fit_text.size() > 8192
+        ? fit_text.substr(fit_text.size() - 8192) : fit_text;
+    const double lambdas[] = {0.0, 0.25, 0.5, 0.75, 1.0};
+    double best_lambda = 0.0;
+    double best_mix_nll = 1.0e300;
+    for (double lw : lambdas) {
+        BrainHeldoutEval lev;
+        std::memset(&lev, 0, sizeof(lev));
+        if (!brain_eval_heldout_mixture(brain, lambda_text.c_str(), best_t, lw, &lev)) continue;
+        std::printf("lambda_fit: lambda=%.2f mix_nll=%.4f mix_ppl=%.3f mix_top1=%.3f%%\n",
+                    lw, lev.mean_nll_mix, lev.perplexity_mix, lev.top1_accuracy_mix);
+        if (lev.mean_nll_mix < best_mix_nll) { best_mix_nll = lev.mean_nll_mix; best_lambda = lw; }
+    }
+    std::printf("lambda_fit: best_lambda=%.2f (train tail only)\n", best_lambda);
 
     struct Named { const char* name; const std::string* text; };
     // In-sample probe: a 10% slice taken from the middle of the training text
@@ -138,7 +156,7 @@ int main(int argc, char** argv) {
     for (const Named& s : splits) {
         BrainHeldoutEval ev;
         std::memset(&ev, 0, sizeof(ev));
-        const int ok = brain_eval_heldout_perplexity(brain, s.text->c_str(), best_t, &ev) ? 1 : 0;
+        const int ok = brain_eval_heldout_mixture(brain, s.text->c_str(), best_t, best_lambda, &ev) ? 1 : 0;
         if (!ok || ev.tokens_scored == 0) {
             ++splits_failed;
             std::printf("%s: ok=%d no_predictions\n", s.name, ok);
@@ -149,11 +167,10 @@ int main(int argc, char** argv) {
         std::printf("%s: ok=%d temperature=%.2f tokens=%lld oov=%lld oov_rate=%.2f%%\n",
                     s.name, ok, best_t, (long long)ev.tokens_scored,
                     (long long)ev.oov_tokens, oov_rate);
-        std::printf("%s: mean_nll=%.4f perplexity=%.3f uniform=%.3f top1=%.3f%% ngram=%.3f%% copy=%.3f%% role=%.3f%% system=%.3f%% head_top5=%.3f%% union3=%.3f%% union4=%.3f%% target_seen=%.3f%%\n",
+        std::printf("%s: mean_nll=%.4f perplexity=%.3f uniform=%.3f top1=%.3f%% ngram=%.3f%% system=%.3f%% mix_ppl=%.3f mix_top1=%.3f%% lambda=%.2f head_top5=%.3f%% union4=%.3f%%\n",
                     s.name, ev.mean_nll, ev.perplexity, ev.uniform_ppl, ev.top1_accuracy,
-                    ev.top1_accuracy_ngram, ev.top1_accuracy_copy, ev.top1_accuracy_role,
-                    ev.top1_accuracy_system, ev.top5_head_pct, ev.top1_accuracy_union,
-                    ev.union4_ceiling, ev.target_seen_pct);
+                    ev.top1_accuracy_ngram, ev.top1_accuracy_system, ev.perplexity_mix,
+                    ev.top1_accuracy_mix, ev.lambda, ev.top5_head_pct, ev.union4_ceiling);
         if (std::strcmp(s.name, "in_sample_train_slice") == 0) {
             seen_ppl = ev.perplexity;
             seen_top1 = ev.top1_accuracy;

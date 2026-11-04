@@ -155,7 +155,9 @@ int main() {
                 "extrapolation=%s, symbolic_formula_output=ABSENT (numeric API only)\n",
                 contract ? "PASS" : "FAIL",
                 curvature_controls ? "CONFIRMED" : "NOT_CONFIRMED",
-                (extrap.mse < extrap_lin.mse * 0.99) ? "BEATS_LEAST_SQUARES_LINE" : "MATCHES_LEAST_SQUARES_LINE");
+                (extrap.mse < extrap_lin.mse * 0.99) ? "BEATS_LEAST_SQUARES_LINE"
+                : (extrap.mse <= extrap_lin.mse * 1.05) ? "MATCHES_LEAST_SQUARES_LINE"
+                : "WORSE_THAN_LEAST_SQUARES_LINE");
 
     brain_destroy(brain);
     std::printf("RESULT: %s\n", contract ? "MEASURED" : "FAILED (interpolation regression)");
