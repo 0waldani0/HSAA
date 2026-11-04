@@ -399,6 +399,55 @@ POPCNT_BRAIN_API int brain_eval_induced_relation(
     float* out_y
 );
 
+// Caller-provided ground truth for CEGIS. Returns 1 and writes one float to
+// out_y, or 0 if the oracle has no answer for this point (the point is then
+// skipped during verification).
+typedef int (*BrainInducedOracle)(
+    const float* x_query,
+    size_t x_dim,
+    float* out_y,
+    void* user
+);
+
+typedef struct BrainCegisRelationReport {
+    int iterations;        // refinement rounds performed
+    int counterexamples;   // counterexamples injected from the oracle
+    int last_checked;      // grid points the oracle answered in the last round
+    int last_mismatches;   // mismatches of the last candidate over that grid
+    int converged;         // 1 if a program matched the oracle on the whole grid
+    int nodes;             // nodes of the accepted program
+    int max_iters;         // caller bound, echoed for reporting
+    double elapsed_ms;     // wall time of the whole synthesis
+} BrainCegisRelationReport;
+
+// Counterexample-guided synthesis over the declared finite input lattice
+// [domain_lo[d], domain_hi[d]] with grid_steps[d] samples per dimension.
+// Each round: induce the smallest DSL program consistent with all
+// demonstrations, verify it against the caller's oracle on the whole lattice,
+// inject the first mismatch and repeat. Returns 1 only if the final program
+// matches the oracle everywhere on the lattice; on success the formula is
+// written to out_formula and the program is installed under relation_name
+// for brain_eval_induced_relation. This is finite-domain CEGIS, not general
+// program synthesis: the DSL is variables, integer constants 0..10 and
+// + - * / mod, and an inexpressible oracle is reported as failure.
+POPCNT_BRAIN_API int brain_synthesize_relation_cegis(
+    PopCountBrain* brain,
+    const char* relation_name,
+    const float* seed_x,
+    const float* seed_y,
+    size_t seed_count,
+    size_t x_dim,
+    const float* domain_lo,
+    const float* domain_hi,
+    const int* grid_steps,
+    int max_iters,
+    BrainInducedOracle oracle,
+    void* oracle_user,
+    char* out_formula,
+    size_t max_formula_len,
+    BrainCegisRelationReport* out_report
+);
+
 // Infer the target entity for query_subject from an unstructured text corpus
 // that contains implicit relational co-occurrences without any fixed syntactic
 // template, using 4096-D continuous relational displacement vectors and VSA

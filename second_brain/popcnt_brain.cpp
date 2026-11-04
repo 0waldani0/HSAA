@@ -14419,6 +14419,105 @@ bool induce(const float* xs, const float* ys, size_t n, size_t x_dim,
     return true;
 }
 
+typedef int (*InducedOracleFn)(const float* x, size_t x_dim, float* out_y, void* user);
+
+struct CegisOutcome {
+    InducedProgram prog;
+    int iterations = 0;
+    int counterexamples = 0;
+    int last_checked = 0;
+    int last_mismatches = 0;
+    bool converged = false;
+    double elapsed_ms = 0.0;
+};
+
+// True counterexample-guided loop. The oracle is the caller's ground truth;
+// the candidate is the smallest DSL program consistent with all examples seen
+// so far. Each iteration verifies the candidate on the declared finite grid,
+// injects the first mismatch as a new demonstration, and re-induces. This is
+// genuine CEGIS over a declared finite domain - not theorem proving, and it
+// inherits every DSL limitation of the expression enumerator.
+bool synthesize_cegis(const float* seed_x, const float* seed_y, size_t seed_count,
+                      size_t x_dim, const float* dom_lo, const float* dom_hi,
+                      const int* grid_steps, int max_iters,
+                      InducedOracleFn oracle, void* user,
+                      CegisOutcome* out) {
+    if (!seed_x || !seed_y || seed_count == 0 || x_dim == 0 || !dom_lo || !dom_hi ||
+        !grid_steps || !oracle || !out) return false;
+    max_iters = std::max(1, std::min(max_iters, 32));
+
+    std::vector<float> xs(seed_x, seed_x + seed_count * x_dim);
+    std::vector<float> ys(seed_y, seed_y + seed_count);
+
+    std::vector<std::vector<float>> axes(x_dim);
+    size_t total = 1;
+    for (size_t d = 0; d < x_dim; ++d) {
+        const int steps = std::max(2, grid_steps[d]);
+        if (dom_hi[d] < dom_lo[d]) return false;
+        total *= static_cast<size_t>(steps);
+        if (total > 200000) return false;
+        std::vector<float>& ax = axes[d];
+        ax.reserve(static_cast<size_t>(steps));
+        for (int i = 0; i < steps; ++i) {
+            const double t = static_cast<double>(i) / static_cast<double>(steps - 1);
+            ax.push_back(static_cast<float>(static_cast<double>(dom_lo[d]) +
+                t * (static_cast<double>(dom_hi[d]) - static_cast<double>(dom_lo[d]))));
+        }
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int iter = 0; iter < max_iters; ++iter) {
+        out->iterations = iter + 1;
+        InducedProgram candidate;
+        if (!induce(xs.data(), ys.data(), ys.size(), x_dim, 9, &candidate)) return false;
+
+        std::vector<float> point(x_dim, 0.0f);
+        int checked = 0, mismatches = 0;
+        bool injected = false;
+        std::vector<float> cex_x(x_dim, 0.0f);
+        float cex_y = 0.0f;
+
+        // Full grid scan; inject only the first mismatch per iteration.
+        for (size_t flat = 0; flat < total; ++flat) {
+            size_t rem = flat;
+            for (size_t d = 0; d < x_dim; ++d) {
+                const size_t n = axes[d].size();
+                point[d] = axes[d][rem % n];
+                rem /= n;
+            }
+            float gold = 0.0f;
+            if (oracle(point.data(), x_dim, &gold, user) != 1) continue;
+            ++checked;
+            double got = 0.0;
+            bool ok = eval_postfix(candidate.postfix, point.data(), x_dim, got);
+            if (!ok || std::fabs(got - static_cast<double>(gold)) > kExactTol) {
+                ++mismatches;
+                if (!injected) {
+                    cex_x = point;
+                    cex_y = gold;
+                    injected = true;
+                }
+            }
+        }
+        out->last_checked = checked;
+        out->last_mismatches = mismatches;
+        if (!injected) {
+            out->prog = std::move(candidate);
+            out->converged = true;
+            out->elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            return true;
+        }
+        for (size_t d = 0; d < x_dim; ++d) xs.push_back(cex_x[d]);
+        ys.push_back(cex_y);
+        ++out->counterexamples;
+        if (ys.size() > 128) break;  // bounded demonstration set
+    }
+    out->elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    return false;
+}
+
 }  // namespace induced_impl
 
 struct PopCountBrain {
@@ -19608,6 +19707,70 @@ POPCNT_BRAIN_API int brain_eval_induced_relation(
     double v = 0.0;
     if (!induced_impl::eval_postfix(it->second.postfix, x_query, x_dim, v)) return 0;
     *out_y = static_cast<float>(v);
+    return 1;
+}
+
+namespace {
+struct CegisOracleContext {
+    BrainInducedOracle fn;
+    void* user;
+};
+int cegis_oracle_trampoline(const float* x, size_t dim, float* y, void* ctx) {
+    const CegisOracleContext* c = static_cast<const CegisOracleContext*>(ctx);
+    return c->fn(x, dim, y, c->user);
+}
+}  // namespace
+
+POPCNT_BRAIN_API int brain_synthesize_relation_cegis(
+    PopCountBrain* brain,
+    const char* relation_name,
+    const float* seed_x,
+    const float* seed_y,
+    size_t seed_count,
+    size_t x_dim,
+    const float* domain_lo,
+    const float* domain_hi,
+    const int* grid_steps,
+    int max_iters,
+    BrainInducedOracle oracle,
+    void* oracle_user,
+    char* out_formula,
+    size_t max_formula_len,
+    BrainCegisRelationReport* out_report
+) {
+    if (out_formula && max_formula_len > 0) out_formula[0] = '\0';
+    if (out_report) {
+        std::memset(out_report, 0, sizeof(*out_report));
+        out_report->max_iters = max_iters;
+    }
+    if (!brain || !relation_name || !seed_x || !seed_y || seed_count == 0 ||
+        x_dim == 0 || !domain_lo || !domain_hi || !grid_steps || !oracle) {
+        return 0;
+    }
+    CegisOracleContext ctx{oracle, oracle_user};
+    induced_impl::CegisOutcome outcome;
+    const bool converged = induced_impl::synthesize_cegis(
+        seed_x, seed_y, seed_count, x_dim, domain_lo, domain_hi, grid_steps,
+        max_iters, &cegis_oracle_trampoline, &ctx, &outcome);
+
+    if (out_report) {
+        out_report->iterations = outcome.iterations;
+        out_report->counterexamples = outcome.counterexamples;
+        out_report->last_checked = outcome.last_checked;
+        out_report->last_mismatches = outcome.last_mismatches;
+        out_report->converged = converged ? 1 : 0;
+        out_report->nodes = outcome.prog.nodes;
+        out_report->elapsed_ms = outcome.elapsed_ms;
+    }
+    if (!converged) return 0;
+
+    std::lock_guard<std::recursive_mutex> lock(brain->brain_mutex);
+    if (out_formula && max_formula_len > 0) {
+        std::snprintf(out_formula, max_formula_len, "%s", outcome.prog.formula.c_str());
+    }
+    std::string key = hsaa_assoc::normalize(relation_name);
+    if (key.empty()) key = relation_name;
+    brain->induced_relations[key] = std::move(outcome.prog);
     return 1;
 }
 

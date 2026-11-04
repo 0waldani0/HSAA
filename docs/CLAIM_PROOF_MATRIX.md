@@ -62,7 +62,7 @@ Claims that still do not have executable support, ranked by severity:
    accuracy, +2.07 pp coverage, 5.9x draft cost, 0 pages over capacity vs the
    documented 21,946). The numbers the project quotes for its count-mixed
    backoff are stale or measured on a path that is unavailable here.
-2. **"Template-free relation inference" is a test that passes without any
+2. **"Template-free relation inference" is VACUOUS: it passes without any
    training** — it measures a subject substring match, not learning.
 3. **The RoPE/attention 2-hop claim is prompt retrieval**, identical across
    independently trained corpora.

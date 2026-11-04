@@ -176,6 +176,25 @@ Measured (`tests/bench_induction.cpp`, this host):
 The negative controls are the important part: nothing was "learned" on random
 or inexpressible data - the API returns 0 rather than a fabricated law.
 
+### 5.1 CEGIS: counterexample-guided refinement on top of the induction
+
+`brain_synthesize_relation_cegis` (same commit family) closes the loop that the
+inductor alone cannot: seed demonstrations -> smallest consistent program ->
+verify against the caller's oracle on a declared finite lattice -> inject the
+first counterexample -> re-induce. Measured (`tests/bench_cegis.cpp`):
+
+| spec | result | rounds | counterexamples | time |
+|---|---|---|---|---|
+| addition on 0..9 x 0..9, **one** seed (0,0)->0 | converges to `(x0 + x1)`; public-API exhaustive check 100/100 | 3 | 2 | 422 ms |
+| successor mod 10 on 0..9, one seed 0->1 | converges to `mod((x0 + 1), 10)`; the boundary point x=9 refuted the initial `(x0 + 1)` | 6 | 5 | 624 ms |
+| sin(x)*1000 rounded on 0..15 | **refused** (no exact candidate for the seeds) | 1 | 0 | - |
+
+The successor case is the structural proof this mechanism adds something: the
+first candidate is `(x0 + 1)`, the oracle at x=9 returns 10 vs the true 0, the
+counterexample is injected, and the next candidate is the modular law. This is
+finite-domain CEGIS over a small DSL, not general program synthesis; an oracle
+outside the DSL is refused rather than approximated.
+
 ## 6. What the rest of the code actually proves
 
 The inventory of all 23 harnesses, plus this audit, covers:
@@ -192,11 +211,11 @@ Claims with no executable proof behind them:
 
 | Claim | Where | What the code actually does |
 |---|---|---|
-| "Zero-shot synthesis of unseen composite algorithms" | `second_brain/README.md:440`, `tests/test_llm_text_code_gen.cpp:1258` | fixed substring-selected template; verified above |
-| "OOD open-ended extrapolation (F8.1)" | `PROJECT.md:39` | only proof is `>=3` tokens and no adjacent duplicate words (`test_llm_text_code_gen.cpp:1123`) |
+| "Zero-shot synthesis of unseen composite algorithms" | `second_brain/README.md:440`, `tests/test_llm_text_code_gen.cpp:1258` | **FALSE**: fixed substring-selected template; verified above |
+| "OOD open-ended extrapolation (F8.1)" | `PROJECT.md:39` | **UNPROVEN**: only proof is `>=3` tokens and no adjacent duplicate words (`test_llm_text_code_gen.cpp:1123`) |
 | "Non-linear function learning" | `PROJECT.md:40` | stores samples and runs LOESS; per-sample 4096-D phases only scale the kernel, while the accumulated `holo_operator_trace` (`popcnt_brain.cpp:14007`) is never read |
 | "Off-grid spectral solver recovers parameters" | `tests/test_unified_engine.cpp:309` | sandbox compares against the same LOESS evaluator that produced the fit (circular) |
-| "Template-free relation inference" | `second_brain/README.md:424` | subject substring match + sketch dot; single-subject sentences only |
+| "Template-free relation inference" | `second_brain/README.md:424` | **VACUOUS**: subject substring match + sketch dot; single-subject sentences only |
 
 ## 7. Verdict
 

@@ -66,6 +66,9 @@ tests/
   bench_rule_generalization.cpp periodic sequences vs abstract rules (successor/addition)
   bench_claim_falsify.cpp     probes shipped claims on untrained / differing-corpus brains
   bench_induction.cpp         finite DSL induction (addition, mod successor, mul, negative controls)
+  bench_cegis.cpp             CEGIS on the induction DSL (seeds + oracle + counterexamples)
+  check_claims.py             docs gate: falsified/unproven claims must carry a verdict marker
+  (docs/METRICS.md)           single source of truth for every measured number
   note: second_brain/measur/README.md cites Python scripts (regress_par.py, sweep_slots.py,
         corpus_regression.py) that are NOT in this tree; only __pycache__ remains. The
         native acceptance_harness reproduces the 175876-transition split/seed but not
